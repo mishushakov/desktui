@@ -40,6 +40,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
+# Ubuntu's own firefox and chromium-browser packages are empty shells whose only job
+# is to install a snap, and snapd does not run in a container: apt reports success and
+# the desktop is left with no browser at all. Mozilla's repository ships a real deb.
+# The pin is the part that matters -- the transitional package is versioned 1:1snap1
+# with an epoch, so it wins on version number alone, and without a priority above the
+# archive's 500 apt keeps handing back the stub.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        ca-certificates \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && wget -qO /etc/apt/keyrings/packages.mozilla.org.asc \
+        https://packages.mozilla.org/apt/repo-signing-key.gpg \
+    && echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' \
+        > /etc/apt/sources.list.d/mozilla.list \
+    && printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+        > /etc/apt/preferences.d/mozilla \
+    && apt-get update && apt-get install -y --no-install-recommends firefox \
+    && rm -rf /var/lib/apt/lists/*
+
+# Installing a browser is not the same as being able to find one, and two separate
+# lookups have to succeed. The panel's launcher asks exo for the WebBrowser helper,
+# which Debian defaults to sensible-browser; sensible-browser walks the x-www-browser
+# alternative, which Mozilla's deb does not register. So the launcher fails with EIO --
+# "Input/output error" -- rather than anything that names a missing package. Name the
+# helper outright, and register the alternative for everything that goes the other way
+# round, xdg-open and any application opening a link of its own.
+RUN sed -i 's/^WebBrowser=.*/WebBrowser=firefox/' /etc/xdg/xfce4/helpers.rc \
+    && update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/firefox 200
+
+# The container starts with no profile, so every run is a first run, and Firefox's
+# first run is a modal sitting on top of whatever page was asked for. Enterprise policy
+# is the supported way to answer it in advance, and /etc/firefox/policies is read
+# before a profile exists -- which is the point, since anything written into a profile
+# would be too late for the window that opens with it.
+#
+# What the four settings answer: the terms-of-use and data-collection notice, the
+# about:welcome content behind it, the about:welcome tab a first launch opens on its
+# own, and the offer to become the default browser, which is not a question worth
+# asking in a container holding exactly one.
+COPY firefox-policies.json /etc/firefox/policies/policies.json
+
 # A desktop should not run as root: some XFCE components object, and a container
 # that is trivially rootless may as well be.
 RUN useradd --create-home --shell /bin/bash desktop

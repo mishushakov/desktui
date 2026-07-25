@@ -1,0 +1,10 @@
+{
+  "policies": {
+    "OverrideFirstRunPage": "",
+    "DontCheckDefaultBrowser": true,
+    "Preferences": {
+      "browser.aboutwelcome.enabled": { "Value": false, "Status": "locked" },
+      "datareporting.policy.dataSubmissionPolicyBypassNotification": { "Value": true, "Status": "locked" }
+    }
+  }
+}
