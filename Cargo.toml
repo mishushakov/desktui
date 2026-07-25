@@ -3,6 +3,10 @@ name = "desktui"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A remote desktop client for your terminal"
+repository = "https://github.com/mishushakov/desktui"
+keywords = ["ghostty", "kitty", "remote-desktop", "tui", "vnc-client"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0"
