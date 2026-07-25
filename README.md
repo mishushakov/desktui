@@ -11,6 +11,8 @@ desktui --print-caps          # what does this terminal support?
 desktui --test-pattern        # check the pipeline without a server
 ```
 
+https://github.com/user-attachments/assets/f897d7f1-bd6d-41dc-af56-a9d50dfba15e
+
 No server handy? `make desktop` starts one in Docker and `make run` connects to it.
 
 ## Features
