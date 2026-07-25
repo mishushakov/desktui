@@ -186,46 +186,6 @@ the spec says Tight does not use JPEG at all unless a quality level is given, so
 nothing is the only way to ask for a lossless picture. Setting `--quality` turns JPEG
 on — what you want on a link too slow for lossless, and not otherwise.
 
-## Checked against noVNC
-
-The protocol half was reviewed line by line against [noVNC's `rfb.js`](https://github.com/novnc/noVNC/blob/master/core/rfb.js),
-the most battle-tested client there is. The `SetDesktopSize` bytes, the
-single-screen layout with the server's own id and flags preserved, the wheel button
-bits, and the request-after-update pacing all agree. Five differences were bugs on
-this side and are fixed: view-only no longer reshapes the shared desktop, only one
-resize request is ever in flight, `ServerCutText` reads its length as signed (a
-negative one means the extended clipboard extension, and read as unsigned it becomes
-four billion), pointer motion is rate limited with a trailing flush so a click never
-lands at a stale position, and an implausible framebuffer size is refused rather than
-handed to an allocator that aborts on failure.
-
-One more difference was a bug of timing rather than protocol: the next update
-request was queued on the render tick instead of being sent the moment an update
-finished, which left the server idle for up to a whole frame interval. noVNC sends it
-from the message handler, and now so does this.
-
-A second pass over the areas the first one skipped found two more, both fixed:
-focus reporting (mode `1004`) was never enabled, so the terminal never reported focus
-loss and the code that releases held keys was unreachable — a modifier held while
-switching away stayed held on the remote; and a paste containing non-Latin-1
-characters dropped them, shortening the text, where noVNC substitutes `?` and keeps
-its shape.
-
-Everything that pass judged worth having has since been implemented: **lock-key
-sync**, **continuous updates** with **fence**, and the **quality and compression
-hints**. See *Extensions it negotiates* above.
-
-### Still missing, in rough order of what you would notice
-
-| | what it is | worth it? |
-|---|---|---|
-| **`QEMUExtendedKeyEvent`** (-258) | raw scancodes, for keys X11 keysyms cannot express and layouts that disagree | maybe — a terminal reports far less than a browser does anyway |
-| **`DesktopName`** (-307) | the server renaming the desktop mid-session; ours shows the name from connect time only | cosmetic |
-| **Extended clipboard** (-1063) | large transfers, other formats, and clipboard *requests* rather than pushes | no — we correctly refuse it, and RFB's Latin-1 text covers the terminal case |
-| **`ExtendedMouseButtons`** (-316) | back and forward buttons | no — terminals report three buttons |
-| **XVP** (-309) | remote shutdown, reboot, reset | no |
-| **Cursor pseudo-encodings** (-239, -1006) | local cursor rendering | listed below |
-
 ## Not done yet
 
 - **Local cursor rendering.** The `Cursor` pseudo-encoding is not requested, so the
