@@ -9,7 +9,9 @@
 //! one buffer per frame and submitted here, so ordering is never in question.
 
 use std::io::{self, Write};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::thread::JoinHandle;
 use std::time::Duration;
 

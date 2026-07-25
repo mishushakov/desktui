@@ -54,7 +54,11 @@ pub fn draw_help(out: &mut Vec<u8>, metrics: &Metrics, prefix: char) {
         "  v          toggle view-only".to_string(),
         "  c          toggle statistics".to_string(),
         "  h ?        this help".to_string(),
-        format!("  Ctrl+{}     send a literal Ctrl+{}", prefix.to_ascii_uppercase(), prefix.to_ascii_uppercase()),
+        format!(
+            "  Ctrl+{}     send a literal Ctrl+{}",
+            prefix.to_ascii_uppercase(),
+            prefix.to_ascii_uppercase()
+        ),
         String::new(),
         "any other key dismisses this".to_string(),
     ];
@@ -166,9 +170,10 @@ mod tests {
         for part in text.split("\x1b[").skip(1) {
             if let Some(coords) = part.strip_suffix('H').or_else(|| part.split('H').next())
                 && let Some((r, _)) = coords.split_once(';')
-                    && let Ok(row) = r.parse::<u16>() {
-                        assert!(row < m.rows, "overlay wrote to row {row}");
-                    }
+                && let Ok(row) = r.parse::<u16>()
+            {
+                assert!(row < m.rows, "overlay wrote to row {row}");
+            }
         }
     }
 }

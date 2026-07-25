@@ -131,9 +131,12 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                             | MouseEventKind::Down(_)
                             | MouseEventKind::Up(_)
                     ) {
-                        pattern.set_cursor(renderer.layout().terminal_px_to_src(tx, ty).map(
-                            |(x, y)| (u32::from(x), u32::from(y)),
-                        ));
+                        pattern.set_cursor(
+                            renderer
+                                .layout()
+                                .terminal_px_to_src(tx, ty)
+                                .map(|(x, y)| (u32::from(x), u32::from(y))),
+                        );
                     }
                 }
                 Event::Resize(_, _) => {

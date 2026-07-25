@@ -18,12 +18,12 @@
 pub mod server;
 
 use std::io::{Read, Write};
-use std::sync::{Condvar, LazyLock};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::{Condvar, LazyLock};
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_vnctui");
@@ -294,7 +294,10 @@ pub fn count(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || haystack.len() < needle.len() {
         return 0;
     }
-    haystack.windows(needle.len()).filter(|w| *w == needle).count()
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
 }
 
 /// Escapes made readable, for assertion messages.

@@ -304,9 +304,7 @@ impl Decoder {
                 index += 1;
             }
             offset -= 1;
-            let byte = *data
-                .get(index as usize)
-                .ok_or(VncError::InvalidImageData)?;
+            let byte = *data.get(index as usize).ok_or(VncError::InvalidImageData)?;
             let entry = palette_entry(&self.palette, ((byte >> offset) & 0x01) as usize, 3)?;
             let true_color = self.to_true_color(format, entry);
             image[dp..dp + 4].copy_from_slice(&true_color);

@@ -280,8 +280,15 @@ impl VncClient {
     {
         Ok(Self {
             inner: Arc::new(Mutex::new(
-                VncInner::new(stream, shared, pixel_format, encodings, quality, compression)
-                    .await?,
+                VncInner::new(
+                    stream,
+                    shared,
+                    pixel_format,
+                    encodings,
+                    quality,
+                    compression,
+                )
+                .await?,
             )),
         })
     }
@@ -658,7 +665,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(matches!(events.last(), Some(VncEvent::FramebufferUpdateEnd)));
+        assert!(matches!(
+            events.last(),
+            Some(VncEvent::FramebufferUpdateEnd)
+        ));
     }
 
     #[tokio::test]

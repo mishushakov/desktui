@@ -129,8 +129,18 @@ impl TestPattern {
 
         if let Some((cx, cy)) = self.cursor {
             let arms = [
-                Rect::new(cx.saturating_sub(CROSSHAIR_ARM), cy, CROSSHAIR_ARM * 2 + 1, 1),
-                Rect::new(cx, cy.saturating_sub(CROSSHAIR_ARM), 1, CROSSHAIR_ARM * 2 + 1),
+                Rect::new(
+                    cx.saturating_sub(CROSSHAIR_ARM),
+                    cy,
+                    CROSSHAIR_ARM * 2 + 1,
+                    1,
+                ),
+                Rect::new(
+                    cx,
+                    cy.saturating_sub(CROSSHAIR_ARM),
+                    1,
+                    CROSSHAIR_ARM * 2 + 1,
+                ),
             ];
             for arm in arms {
                 if let Some(drawn) = fb.fill(arm, CROSSHAIR) {
@@ -351,7 +361,10 @@ mod tests {
             .filter(|(a, b)| a != b)
             .count();
         // Only the box at its clamped position should differ.
-        assert!(differing <= (BOX_SIZE * BOX_SIZE * 4) as usize, "{differing}");
+        assert!(
+            differing <= (BOX_SIZE * BOX_SIZE * 4) as usize,
+            "{differing}"
+        );
     }
 
     #[test]

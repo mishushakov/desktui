@@ -148,8 +148,14 @@ impl Framebuffer {
     /// that keeps the untouched half intact.
     pub fn copy_rect(&mut self, dst: Rect, src_x: u32, src_y: u32) -> Option<Rect> {
         // Both ends have to fit, so shrink the request until they do.
-        let w = dst.w.min(self.w.saturating_sub(dst.x)).min(self.w.saturating_sub(src_x));
-        let h = dst.h.min(self.h.saturating_sub(dst.y)).min(self.h.saturating_sub(src_y));
+        let w = dst
+            .w
+            .min(self.w.saturating_sub(dst.x))
+            .min(self.w.saturating_sub(src_x));
+        let h = dst
+            .h
+            .min(self.h.saturating_sub(dst.y))
+            .min(self.h.saturating_sub(src_y));
         if w == 0 || h == 0 {
             return None;
         }
@@ -329,7 +335,11 @@ mod tests {
         assert_eq!((fb.width(), fb.height()), (4, 3));
         assert_eq!(bgra(&fb, 0, 0), [11, 12, 13, 0xff]);
         assert_eq!(bgra(&fb, 1, 0), [21, 22, 23, 0xff]);
-        assert_eq!(bgra(&fb, 0, 1), [31, 32, 33, 0xff], "the stride changed too");
+        assert_eq!(
+            bgra(&fb, 0, 1),
+            [31, 32, 33, 0xff],
+            "the stride changed too"
+        );
         // And the new area is opaque black rather than whatever the allocator had.
         assert_eq!(bgra(&fb, 3, 2), [0, 0, 0, 0xff]);
         assert_eq!(bgra(&fb, 2, 0), [0, 0, 0, 0xff]);
@@ -351,7 +361,11 @@ mod tests {
         let mut fb = Framebuffer::new(2, 2);
         fb.fill(fb.rect(), [7, 7, 7]);
         fb.resize(2, 2);
-        assert_eq!(bgra(&fb, 1, 1), [7, 7, 7, 0xff], "content must not be dropped");
+        assert_eq!(
+            bgra(&fb, 1, 1),
+            [7, 7, 7, 0xff],
+            "content must not be dropped"
+        );
     }
 
     #[test]

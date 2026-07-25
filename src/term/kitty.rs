@@ -146,10 +146,7 @@ impl KittyEncoder {
         let _ = write!(out, "\x1b[{};{}H", row as u32 + 1, col as u32 + 1);
         self.b64.clear();
         BASE64.encode_string(name.as_bytes(), &mut self.b64);
-        let _ = write!(
-            out,
-            "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},s={w},v={h};"
-        );
+        let _ = write!(out, "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},s={w},v={h};");
         out.extend_from_slice(self.b64.as_bytes());
         out.extend_from_slice(b"\x1b\\");
     }
@@ -221,7 +218,10 @@ mod tests {
         // Below text, so overlays remain readable over the remote screen.
         assert!(keys.contains("z=-1"), "{keys}");
         assert!(keys.contains("s=4,v=1"), "{keys}");
-        assert!(!keys.contains("m="), "a single chunk must not carry m: {keys}");
+        assert!(
+            !keys.contains("m="),
+            "a single chunk must not carry m: {keys}"
+        );
         assert_eq!(BASE64.decode(payload).unwrap(), rgb);
     }
 
@@ -230,7 +230,11 @@ mod tests {
         let mut enc = KittyEncoder::new(false);
         let mut out = Vec::new();
         enc.place_rgb(&mut out, place(IMAGE_ID_BASE, 7, 3, 1, 1), &[1, 2, 3]);
-        assert!(out.starts_with(b"\x1b[4;8H"), "{:?}", String::from_utf8_lossy(&out));
+        assert!(
+            out.starts_with(b"\x1b[4;8H"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     #[test]
@@ -241,7 +245,11 @@ mod tests {
         let w = 64;
         let h = 64;
         let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
-        enc.place_rgb(&mut out, place(IMAGE_ID_BASE, 0, 0, w as u32, h as u32), &rgb);
+        enc.place_rgb(
+            &mut out,
+            place(IMAGE_ID_BASE, 0, 0, w as u32, h as u32),
+            &rgb,
+        );
 
         let (keys, payload, count) = split(&out);
         assert_eq!(count, 4);

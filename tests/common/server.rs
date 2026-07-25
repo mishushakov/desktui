@@ -36,13 +36,33 @@ pub enum Resize {
 pub enum Request {
     SetPixelFormat,
     SetEncodings(Vec<i32>),
-    FramebufferUpdate { incremental: bool },
-    Key { keysym: u32, down: bool },
-    Pointer { x: u16, y: u16, buttons: u8 },
+    FramebufferUpdate {
+        incremental: bool,
+    },
+    Key {
+        keysym: u32,
+        down: bool,
+    },
+    Pointer {
+        x: u16,
+        y: u16,
+        buttons: u8,
+    },
     CutText(String),
-    SetDesktopSize { width: u16, height: u16, screen_ids: Vec<u32> },
-    EnableContinuousUpdates { enable: bool, width: u16, height: u16 },
-    Fence { flags: u32, payload: Vec<u8> },
+    SetDesktopSize {
+        width: u16,
+        height: u16,
+        screen_ids: Vec<u32>,
+    },
+    EnableContinuousUpdates {
+        enable: bool,
+        width: u16,
+        height: u16,
+    },
+    Fence {
+        flags: u32,
+        payload: Vec<u8>,
+    },
 }
 
 /// Extensions the fake server offers, beyond the resize behaviour.
@@ -73,12 +93,7 @@ impl FakeServer {
     }
 
     /// As [`Self::start`], with extensions enabled.
-    pub fn start_with(
-        width: u16,
-        height: u16,
-        resize: Resize,
-        extensions: Extensions,
-    ) -> Self {
+    pub fn start_with(width: u16, height: u16, resize: Resize, extensions: Extensions) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -153,7 +168,10 @@ fn serve(
     stream.write_all(&[1, 1])?;
     let mut chosen = [0u8; 1];
     stream.read_exact(&mut chosen)?;
-    assert_eq!(chosen[0], 1, "client picked a security type we did not offer");
+    assert_eq!(
+        chosen[0], 1,
+        "client picked a security type we did not offer"
+    );
     stream.write_all(&0u32.to_be_bytes())?;
 
     // ClientInit, then ServerInit.
@@ -310,9 +328,7 @@ fn serve(
                 for _ in 0..count {
                     let mut screen = [0u8; 16];
                     stream.read_exact(&mut screen)?;
-                    screen_ids.push(u32::from_be_bytes(
-                        screen[0..4].try_into().unwrap(),
-                    ));
+                    screen_ids.push(u32::from_be_bytes(screen[0..4].try_into().unwrap()));
                 }
                 record(
                     &requests,

@@ -34,8 +34,7 @@ where
                     let rfbversion = VncVersion::read(&mut connector.stream).await?;
                     trace!(
                         "Our version {:?}, server version {:?}",
-                        connector.rfb_version,
-                        rfbversion
+                        connector.rfb_version, rfbversion
                     );
                     let rfbversion = if connector.rfb_version < rfbversion {
                         connector.rfb_version

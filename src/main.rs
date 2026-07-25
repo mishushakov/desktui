@@ -91,9 +91,10 @@ fn resolve_password(args: &Args) -> Result<Option<String>> {
         return Ok(Some(line));
     }
     if let Ok(password) = std::env::var("VNC_PASSWORD")
-        && !password.is_empty() {
-            return Ok(Some(password));
-        }
+        && !password.is_empty()
+    {
+        return Ok(Some(password));
+    }
     Ok(None)
 }
 
@@ -168,7 +169,10 @@ fn print_caps(caps: &caps::Caps, metrics: &Metrics) {
     );
     println!();
     println!("geometry");
-    println!("  grid                 {} x {} cells", metrics.cols, metrics.rows);
+    println!(
+        "  grid                 {} x {} cells",
+        metrics.cols, metrics.rows
+    );
     println!("  ioctl pixel area     {} x {}", metrics.px_w, metrics.px_h);
     match caps.text_area_px {
         Some((w, h)) => println!("  CSI 14 t             {w} x {h}"),
@@ -189,24 +193,26 @@ fn print_caps(caps: &caps::Caps, metrics: &Metrics) {
     // the other reports points, everything downstream is off by the scale factor.
     let mut warned = false;
     if let Some((w, h)) = caps.text_area_px
-        && (w, h) != (metrics.px_w, metrics.px_h) {
-            println!();
-            println!(
-                "warning: ioctl says {}x{} but CSI 14 t says {w}x{h}",
-                metrics.px_w, metrics.px_h
-            );
-            warned = true;
-        }
+        && (w, h) != (metrics.px_w, metrics.px_h)
+    {
+        println!();
+        println!(
+            "warning: ioctl says {}x{} but CSI 14 t says {w}x{h}",
+            metrics.px_w, metrics.px_h
+        );
+        warned = true;
+    }
     if let Some((w, h)) = caps.cell_px
-        && (w, h) != (metrics.cell_w, metrics.cell_h) {
-            if !warned {
-                println!();
-            }
-            println!(
-                "warning: derived cell size {}x{} disagrees with CSI 16 t's {w}x{h}",
-                metrics.cell_w, metrics.cell_h
-            );
+        && (w, h) != (metrics.cell_w, metrics.cell_h)
+    {
+        if !warned {
+            println!();
         }
+        println!(
+            "warning: derived cell size {}x{} disagrees with CSI 16 t's {w}x{h}",
+            metrics.cell_w, metrics.cell_h
+        );
+    }
 }
 
 /// Logging goes to a file or nowhere. Anything written to stdout would land in

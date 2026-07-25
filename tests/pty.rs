@@ -16,7 +16,11 @@ fn probes_before_touching_the_screen() {
     assert!(term.wait_for(b"\x1b[c", Duration::from_secs(10)));
     let probe = term.output();
 
-    assert!(contains(&probe, b"a=q"), "no graphics query: {}", show(&probe));
+    assert!(
+        contains(&probe, b"a=q"),
+        "no graphics query: {}",
+        show(&probe)
+    );
     assert!(contains(&probe, b"\x1b[14t"), "no pixel-size query");
     assert!(contains(&probe, b"\x1b[?1016$p"), "no pixel-mouse query");
     assert!(contains(&probe, b"\x1b[?2026$p"), "no sync-output query");
@@ -59,12 +63,24 @@ fn renders_frames_and_restores_the_terminal() {
     assert!(contains(&frames, b"\x1b[?7l"), "autowrap left on");
     assert!(contains(&frames, b"\x1b[?1003h"), "motion reporting off");
     assert!(contains(&frames, b"\x1b[?1016h"), "pixel mouse not enabled");
-    assert!(contains(&frames, b"\x1b[>11u"), "kitty keyboard not enabled");
-    assert!(contains(&frames, b"\x1b[?2026h"), "frames are not synchronised");
+    assert!(
+        contains(&frames, b"\x1b[>11u"),
+        "kitty keyboard not enabled"
+    );
+    assert!(
+        contains(&frames, b"\x1b[?2026h"),
+        "frames are not synchronised"
+    );
     assert!(contains(&frames, b"z=-1"), "images must sit below text");
     assert!(contains(&frames, b"o=z"), "payload should be compressed");
-    assert!(contains(&frames, b"C=1"), "placements must not move the cursor");
-    assert!(contains(&frames, b"q=2"), "the terminal must not reply per tile");
+    assert!(
+        contains(&frames, b"C=1"),
+        "placements must not move the cursor"
+    );
+    assert!(
+        contains(&frames, b"q=2"),
+        "the terminal must not reply per tile"
+    );
 
     // Status line on the bottom row of a 50-row terminal.
     assert!(
@@ -90,7 +106,9 @@ fn renders_frames_and_restores_the_terminal() {
     );
 
     term.send(b"q");
-    let status = term.wait(Duration::from_secs(10)).expect("did not exit after q");
+    let status = term
+        .wait(Duration::from_secs(10))
+        .expect("did not exit after q");
     assert!(status.success(), "exited with {status:?}");
 
     let teardown = term.output();
@@ -98,8 +116,14 @@ fn renders_frames_and_restores_the_terminal() {
         contains(&teardown, b"\x1b_Ga=d,d=A"),
         "images were not deleted on exit"
     );
-    assert!(contains(&teardown, b"\x1b[?1049l"), "alternate screen not left");
-    assert!(contains(&teardown, b"\x1b[?1003l"), "mouse reporting left on");
+    assert!(
+        contains(&teardown, b"\x1b[?1049l"),
+        "alternate screen not left"
+    );
+    assert!(
+        contains(&teardown, b"\x1b[?1003l"),
+        "mouse reporting left on"
+    );
     assert!(contains(&teardown, b"\x1b[?1016l"), "pixel mouse left on");
     assert!(contains(&teardown, b"\x1b[<u"), "keyboard flags not popped");
     assert!(contains(&teardown, b"\x1b[?25h"), "cursor left hidden");
@@ -178,7 +202,10 @@ fn print_caps_reports_both_geometry_sources_and_flags_a_mismatch() {
     assert!(text.contains("kitty graphics       yes"), "{text}");
     assert!(text.contains("pixel mouse (1016)   yes"), "{text}");
     assert!(text.contains("800 x 480"), "ioctl geometry missing: {text}");
-    assert!(text.contains("1600 x 960"), "CSI 14 t geometry missing: {text}");
+    assert!(
+        text.contains("1600 x 960"),
+        "CSI 14 t geometry missing: {text}"
+    );
     assert!(
         text.contains("warning"),
         "a disagreement between the two must be called out: {text}"
@@ -246,7 +273,6 @@ fn a_terminal_that_stops_reading_does_not_wedge_the_client() {
         "client did not exit while the terminal was not reading"
     );
 }
-
 
 #[test]
 fn pixels_travel_through_shared_memory_when_the_terminal_offers_it() {
@@ -334,7 +360,10 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
     for (cols, rows, px, py) in [(120u16, 36u16, 960u16, 612u16), (200, 50, 1600, 850)] {
         term.resize(cols, rows, px, py);
         assert!(
-            term.wait_for(format!("\x1b[{rows};1H").as_bytes(), Duration::from_secs(10)),
+            term.wait_for(
+                format!("\x1b[{rows};1H").as_bytes(),
+                Duration::from_secs(10)
+            ),
             "status line never reached row {rows}: {}",
             show(&term.output())
         );

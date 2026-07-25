@@ -115,9 +115,10 @@ impl ShmPool {
             Ok(()) => {
                 self.pending.push_back((cname, Instant::now()));
                 if self.pending.len() > MAX_PENDING
-                    && let Some((name, _)) = self.pending.pop_front() {
-                        unlink(&name);
-                    }
+                    && let Some((name, _)) = self.pending.pop_front()
+                {
+                    unlink(&name);
+                }
                 Ok(name)
             }
             Err(err) => {

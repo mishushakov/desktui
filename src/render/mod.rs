@@ -66,7 +66,12 @@ impl Rect {
     pub fn expand(&self, pad: u32) -> Rect {
         let x = self.x.saturating_sub(pad);
         let y = self.y.saturating_sub(pad);
-        Rect::new(x, y, self.w + (self.x - x) + pad, self.h + (self.y - y) + pad)
+        Rect::new(
+            x,
+            y,
+            self.w + (self.x - x) + pad,
+            self.h + (self.y - y) + pad,
+        )
     }
 }
 
@@ -123,7 +128,8 @@ impl Layout {
         } else if src_w == 0 || src_h == 0 {
             (Rect::new(0, 0, 0, 0), 0, 0, 1.0)
         } else {
-            let fit = (f64::from(area_w) / f64::from(src_w)).min(f64::from(area_h) / f64::from(src_h));
+            let fit =
+                (f64::from(area_w) / f64::from(src_w)).min(f64::from(area_h) / f64::from(src_h));
             let scale = match mode {
                 // Whole-number scaling only, and never below 1: if the remote
                 // desktop is larger than the terminal there is no integer
@@ -304,8 +310,10 @@ impl TileGrid {
         let th = u32::from(self.tile_rows) * self.cell_h;
         let x0 = (r.x / tw) as u16;
         let y0 = (r.y / th) as u16;
-        let x1 = ((r.right().saturating_sub(1)) / tw).min(u32::from(self.nx.saturating_sub(1))) as u16;
-        let y1 = ((r.bottom().saturating_sub(1)) / th).min(u32::from(self.ny.saturating_sub(1))) as u16;
+        let x1 =
+            ((r.right().saturating_sub(1)) / tw).min(u32::from(self.nx.saturating_sub(1))) as u16;
+        let y1 =
+            ((r.bottom().saturating_sub(1)) / th).min(u32::from(self.ny.saturating_sub(1))) as u16;
         (x0, y0, x1, y1)
     }
 }
@@ -455,10 +463,11 @@ impl Renderer {
             for tx in x0..=x1 {
                 let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
                 if let Some(slot) = self.dirty.get_mut(idx)
-                    && !*slot {
-                        *slot = true;
-                        self.dirty_count += 1;
-                    }
+                    && !*slot
+                {
+                    *slot = true;
+                    self.dirty_count += 1;
+                }
             }
         }
     }
@@ -528,9 +537,8 @@ impl Renderer {
                 if cursor.pixels[src + 3] == 0 {
                     continue;
                 }
-                let dst = (((row - tile.y) as usize) * (tile.w as usize)
-                    + (col - tile.x) as usize)
-                    * 3;
+                let dst =
+                    (((row - tile.y) as usize) * (tile.w as usize) + (col - tile.x) as usize) * 3;
                 out[dst] = cursor.pixels[src + 2];
                 out[dst + 1] = cursor.pixels[src + 1];
                 out[dst + 2] = cursor.pixels[src];
@@ -888,7 +896,9 @@ mod tests {
         let ox = u32::from(l.origin_col) * l.cell_w;
         let oy = u32::from(l.origin_row) * l.cell_h;
         assert_eq!(l.terminal_px_to_src(ox, oy), Some((0, 0)));
-        let (sx, sy) = l.terminal_px_to_src(ox + l.dst_w - 1, oy + l.dst_h - 1).unwrap();
+        let (sx, sy) = l
+            .terminal_px_to_src(ox + l.dst_w - 1, oy + l.dst_h - 1)
+            .unwrap();
         assert!(sx >= 1918 && sy >= 1078, "{sx},{sy}");
         // The letterbox above the image is not part of the desktop.
         if oy > 0 {
@@ -978,7 +988,10 @@ mod tests {
 
         let mut out = Vec::new();
         let stats = r.compose(&fb, &mut out);
-        assert!(stats.tiles > 0, "a cursor with a shape has to produce a frame");
+        assert!(
+            stats.tiles > 0,
+            "a cursor with a shape has to produce a frame"
+        );
     }
 
     #[test]
@@ -1058,7 +1071,10 @@ mod tests {
             pixels: Vec::new(),
         }));
         r.move_cursor(Some((10, 10)));
-        assert!(r.cursor_rect().is_none(), "nothing to draw, so nothing drawn");
+        assert!(
+            r.cursor_rect().is_none(),
+            "nothing to draw, so nothing drawn"
+        );
     }
 
     #[test]
@@ -1098,7 +1114,10 @@ mod tests {
         let (bw, bh) = bigger.image_area();
         let cleanup = r.relayout(Layout::compute(&bigger, ScaleMode::Native, bw, bh, (0, 0)));
         let text = String::from_utf8(cleanup).unwrap();
-        assert!(text.contains("\x1b[2J"), "the screen was not erased: {text:?}");
+        assert!(
+            text.contains("\x1b[2J"),
+            "the screen was not erased: {text:?}"
+        );
         assert!(
             text.contains("a=d,d=A"),
             "the old placements were not dropped: {text:?}"
@@ -1123,7 +1142,10 @@ mod tests {
         let small = Layout::compute(&m, ScaleMode::Fit, 64, 64, (0, 0));
         let cleanup = r.relayout(small);
         let text = String::from_utf8(cleanup).unwrap();
-        assert!(text.contains("a=d,d=A"), "expected a delete-all, got {text:?}");
+        assert!(
+            text.contains("a=d,d=A"),
+            "expected a delete-all, got {text:?}"
+        );
         assert!(r.has_work(), "a relayout must redraw everything");
     }
 
@@ -1164,7 +1186,10 @@ mod tests {
     #[test]
     fn rect_helpers_behave_at_the_edges() {
         let a = Rect::new(0, 0, 10, 10);
-        assert_eq!(a.intersect(&Rect::new(5, 5, 10, 10)), Some(Rect::new(5, 5, 5, 5)));
+        assert_eq!(
+            a.intersect(&Rect::new(5, 5, 10, 10)),
+            Some(Rect::new(5, 5, 5, 5))
+        );
         assert_eq!(a.intersect(&Rect::new(10, 0, 5, 5)), None);
         assert_eq!(Rect::new(0, 0, 2, 2).expand(3), Rect::new(0, 0, 5, 5));
         assert_eq!(Rect::new(5, 5, 2, 2).expand(3), Rect::new(2, 2, 8, 8));

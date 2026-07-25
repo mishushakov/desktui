@@ -141,13 +141,7 @@ fn read_until_da1(timeout: Duration) -> Result<Vec<u8>> {
         }
 
         // SAFETY: writing into a local buffer, length bounded by its size.
-        let got = unsafe {
-            libc::read(
-                libc::STDIN_FILENO,
-                chunk.as_mut_ptr().cast(),
-                chunk.len(),
-            )
-        };
+        let got = unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
         if got <= 0 {
             break;
         }

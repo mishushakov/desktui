@@ -17,8 +17,14 @@ pub(super) enum ClientMsg {
     /// Raw encoding numbers appended to `SetEncodings`, for hints that are a number
     /// and nothing else: quality and compression levels.
     SetEncodingsRaw(Vec<i32>),
-    EnableContinuousUpdates { enable: bool, rect: Rect },
-    Fence { flags: u32, payload: Vec<u8> },
+    EnableContinuousUpdates {
+        enable: bool,
+        rect: Rect,
+    },
+    Fence {
+        flags: u32,
+        payload: Vec<u8>,
+    },
 }
 
 impl ClientMsg {
@@ -69,7 +75,10 @@ impl ClientMsg {
                 writer.write_all(&payload).await?;
                 Ok(())
             }
-            ClientMsg::Fence { flags, payload: body } => {
+            ClientMsg::Fence {
+                flags,
+                payload: body,
+            } => {
                 // +--------------+--------------+--------------+
                 // | 1            | U8 [248]     | message-type |
                 // | 3            |              | padding      |
@@ -80,7 +89,11 @@ impl ClientMsg {
                 //
                 // The payload is capped at 64 bytes by the spec, and echoing more
                 // than we were sent would be a protocol error of our own making.
-                let body = if body.len() > 64 { &body[..64] } else { &body[..] };
+                let body = if body.len() > 64 {
+                    &body[..64]
+                } else {
+                    &body[..]
+                };
                 let mut payload = vec![248_u8, 0, 0, 0];
                 payload.extend_from_slice(&flags.to_be_bytes());
                 payload.push(body.len() as u8);
@@ -392,7 +405,10 @@ pub(super) enum ServerMsg {
     /// The server has stopped pushing updates. Also its way of saying the extension
     /// exists, the first time it arrives.
     EndOfContinuousUpdates,
-    ServerFence { flags: u32, payload: Vec<u8> },
+    ServerFence {
+        flags: u32,
+        payload: Vec<u8>,
+    },
 }
 
 impl ServerMsg {

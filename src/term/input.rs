@@ -326,10 +326,11 @@ impl InputMapper {
                 // Too soon since the last report: remember where the pointer got
                 // to and let the next tick send it.
                 if let Some(last) = self.last_motion
-                    && last.elapsed() < MOTION_INTERVAL {
-                        self.pending_motion = Some((x, y));
-                        return Vec::new();
-                    }
+                    && last.elapsed() < MOTION_INTERVAL
+                {
+                    self.pending_motion = Some((x, y));
+                    return Vec::new();
+                }
                 self.last_motion = Some(Instant::now());
             }
             MouseEventKind::ScrollUp
@@ -375,9 +376,10 @@ impl InputMapper {
     pub fn flush_motion(&mut self) -> Option<ClientMouseEvent> {
         let (x, y) = self.pending_motion?;
         if let Some(last) = self.last_motion
-            && last.elapsed() < MOTION_INTERVAL {
-                return None;
-            }
+            && last.elapsed() < MOTION_INTERVAL
+        {
+            return None;
+        }
         self.pending_motion = None;
         self.last_motion = Some(Instant::now());
         self.last_position = Some((x, y));
@@ -524,13 +526,21 @@ mod tests {
     #[test]
     fn modifiers_are_synthesised_only_when_the_terminal_cannot_report_them() {
         let mut input = InputMapper::new('a', false, true);
-        let KeyOutcome::Keys(events) =
-            input.on_key(key(KeyCode::Char('c'), KeyEventKind::Press, KeyModifiers::SHIFT))
-        else {
+        let KeyOutcome::Keys(events) = input.on_key(key(
+            KeyCode::Char('c'),
+            KeyEventKind::Press,
+            KeyModifiers::SHIFT,
+        )) else {
             panic!("expected key events");
         };
         // Shift down, c down, c up. Shift stays down until it is reported gone.
-        assert_eq!(events[0], ClientKeyEvent { keycode: bitmask::SHIFT, down: true });
+        assert_eq!(
+            events[0],
+            ClientKeyEvent {
+                keycode: bitmask::SHIFT,
+                down: true
+            }
+        );
         assert_eq!(events[1].keycode, 0x63);
         assert!(!events[2].down);
 
@@ -559,11 +569,19 @@ mod tests {
         )) else {
             panic!("expected key events");
         };
-        assert_eq!(events, vec![ClientKeyEvent { keycode: 0xffe3, down: true }]);
+        assert_eq!(
+            events,
+            vec![ClientKeyEvent {
+                keycode: 0xffe3,
+                down: true
+            }]
+        );
 
-        let KeyOutcome::Keys(events) =
-            input.on_key(key(KeyCode::Char('c'), KeyEventKind::Press, KeyModifiers::CONTROL))
-        else {
+        let KeyOutcome::Keys(events) = input.on_key(key(
+            KeyCode::Char('c'),
+            KeyEventKind::Press,
+            KeyModifiers::CONTROL,
+        )) else {
             panic!("expected key events");
         };
         assert_eq!(
@@ -581,7 +599,10 @@ mod tests {
         // This is what keeps a swallowed prefix chord from leaking a stray release
         // and leaving a modifier stuck on the remote.
         let mut input = InputMapper::new('a', true, true);
-        assert_eq!(input.on_key(release(KeyCode::Char('z'))), KeyOutcome::Ignored);
+        assert_eq!(
+            input.on_key(release(KeyCode::Char('z'))),
+            KeyOutcome::Ignored
+        );
         assert_eq!(
             input.on_key(release(KeyCode::Modifier(
                 crossterm::event::ModifierKeyCode::LeftControl
@@ -593,10 +614,16 @@ mod tests {
     #[test]
     fn the_prefix_arms_and_the_next_key_is_a_command() {
         let mut input = InputMapper::new('a', true, true);
-        assert_eq!(input.on_key(ctrl('a', KeyEventKind::Press)), KeyOutcome::Ignored);
+        assert_eq!(
+            input.on_key(ctrl('a', KeyEventKind::Press)),
+            KeyOutcome::Ignored
+        );
         assert!(input.is_armed());
         // The release of the chord is swallowed too.
-        assert_eq!(input.on_key(ctrl('a', KeyEventKind::Release)), KeyOutcome::Ignored);
+        assert_eq!(
+            input.on_key(ctrl('a', KeyEventKind::Release)),
+            KeyOutcome::Ignored
+        );
         assert!(input.is_armed());
         assert_eq!(
             input.on_key(press(KeyCode::Char('q'))),
@@ -615,7 +642,13 @@ mod tests {
         );
         let events = input.literal_prefix();
         assert_eq!(events.len(), 4);
-        assert_eq!(events[0], ClientKeyEvent { keycode: bitmask::CONTROL, down: true });
+        assert_eq!(
+            events[0],
+            ClientKeyEvent {
+                keycode: bitmask::CONTROL,
+                down: true
+            }
+        );
         assert_eq!(events[1].keycode, 0x61);
         assert!(!events[3].down);
         // And nothing is left held afterwards.
@@ -644,7 +677,10 @@ mod tests {
             Some(Command::Mode(ScaleMode::OneToOne))
         );
         assert_eq!(command_for(KeyCode::Left), Some(Command::Pan(-1, 0)));
-        assert_eq!(command_for(KeyCode::Char('v')), Some(Command::ToggleViewOnly));
+        assert_eq!(
+            command_for(KeyCode::Char('v')),
+            Some(Command::ToggleViewOnly)
+        );
     }
 
     #[test]
@@ -788,7 +824,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        assert_eq!(input.on_mouse(at(10), &layout, &m).len(), 1, "first move goes");
+        assert_eq!(
+            input.on_mouse(at(10), &layout, &m).len(),
+            1,
+            "first move goes"
+        );
         assert!(
             input.on_mouse(at(11), &layout, &m).is_empty(),
             "a move straight after must be held back"
@@ -819,12 +859,23 @@ mod tests {
         };
 
         input.on_mouse(ev(MouseEventKind::Moved, 30), &layout, &m);
-        assert!(input.on_mouse(ev(MouseEventKind::Moved, 44), &layout, &m).is_empty());
+        assert!(
+            input
+                .on_mouse(ev(MouseEventKind::Moved, 44), &layout, &m)
+                .is_empty()
+        );
 
         let events = input.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 44), &layout, &m);
-        assert_eq!(events.len(), 2, "the held position, then the click: {events:?}");
+        assert_eq!(
+            events.len(),
+            2,
+            "the held position, then the click: {events:?}"
+        );
         assert_eq!((events[0].position_x, events[0].buttons), (44, 0));
-        assert_eq!((events[1].position_x, events[1].buttons), (44, button::LEFT));
+        assert_eq!(
+            (events[1].position_x, events[1].buttons),
+            (44, button::LEFT)
+        );
     }
 
     #[test]
