@@ -11,6 +11,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # --no-install-recommends, then name what a desktop actually needs. The recommends
 # chain for xfce4 pulls in a display manager, a screensaver and a power manager,
 # none of which mean anything in a container.
+#
+# The last two are here because dropping the recommends breaks the icons, and the
+# failure does not look like a missing package: you get a panel of mismatched sizes
+# rather than an error. elementary-xfce-icon-theme is the theme xfce4-settings
+# already asks for by default on Ubuntu, and nothing pulls it in; without it the
+# lookup falls through to hicolor, which holds application icons at fixed sizes and
+# nothing else. librsvg2-common carries the gdk-pixbuf SVG loader, which the tail of
+# the chain needs -- elementary-xfce inherits from Adwaita, and Adwaita is 720 SVGs
+# to 51 PNGs. GTK only rescales an icon when the caller asks it to, so a lookup that
+# lands on the wrong file renders at that file's own size.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tigervnc-standalone-server \
         tigervnc-tools \
@@ -25,7 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         x11-utils \
         x11-xserver-utils \
         fonts-dejavu-core \
-        adwaita-icon-theme \
+        elementary-xfce-icon-theme \
+        librsvg2-common \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
