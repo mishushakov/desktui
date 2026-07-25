@@ -243,3 +243,7 @@ VNC_PASSWORD=… desktui localhost::5901
 
 `--log-file` is the only way to get diagnostics; anything written to stdout would
 land in the middle of a graphics escape sequence.
+
+> [!NOTE]
+> This was made over a weekend using Claude Code and Opus 5 with xhigh, to test
+> frontier model capabilities.
