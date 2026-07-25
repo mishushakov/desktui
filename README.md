@@ -186,6 +186,33 @@ pushes frames instead of answering a request each time. That saves one network r
 trip per frame, which matters on a high-latency link and is nearly free locally. It
 is not a prerequisite for video.
 
+## Extensions it negotiates
+
+Beyond the encodings, three extensions earn their keep.
+
+**Continuous updates** (-313), with **Fence** (-312). The server pushes frames instead
+of answering a request each time, saving a round trip per frame — the difference
+between 20 fps and 40 on a 25 ms link. The server admits the extension exists by
+answering `SetEncodings` with `EndOfContinuousUpdates`; from then on no requests go out
+at all, and a fence is echoed back with the request bit cleared and any flag we do not
+implement stripped. TigerVNC negotiates this, so `make test-live` covers it against a
+real server rather than only a cooperative fake.
+
+**Lock-key state** (`QEMULedEvent`, -261). A remote caps lock that disagrees with the
+local keyboard turns every keystroke into the wrong case, and nothing in the keystroke
+itself reveals it. The server reports its lock state, and when that disagrees with what
+the terminal says, a lock-key tap goes out *before* the keystroke. The remembered state
+is cleared at that moment: the correction takes a round trip to be reflected, and
+acting on the stale value would toggle it straight back. Local state comes from the
+Kitty keyboard protocol; without it we report "unknown" and leave the remote alone,
+because an unset bit would otherwise read as "off".
+
+**Quality and compression hints** (-32..-23, -256..-247), via `--quality` and
+`--compression`. Both default to *unset*, and for quality that is the important case:
+the spec says Tight does not use JPEG at all unless a quality level is given, so saying
+nothing is the only way to ask for a lossless picture. Setting `--quality` turns JPEG
+on — what you want on a link too slow for lossless, and not otherwise.
+
 ## Development
 
 ```
@@ -231,30 +258,3 @@ VNC_PASSWORD=… desktui localhost::5901
 
 `--log-file` is the only way to get diagnostics; anything written to stdout would
 land in the middle of a graphics escape sequence.
-
-## Extensions it negotiates
-
-Beyond the encodings, three extensions earn their keep.
-
-**Continuous updates** (-313), with **Fence** (-312). The server pushes frames instead
-of answering a request each time, saving a round trip per frame — the difference
-between 20 fps and 40 on a 25 ms link. The server admits the extension exists by
-answering `SetEncodings` with `EndOfContinuousUpdates`; from then on no requests go out
-at all, and a fence is echoed back with the request bit cleared and any flag we do not
-implement stripped. TigerVNC negotiates this, so `make test-live` covers it against a
-real server rather than only a cooperative fake.
-
-**Lock-key state** (`QEMULedEvent`, -261). A remote caps lock that disagrees with the
-local keyboard turns every keystroke into the wrong case, and nothing in the keystroke
-itself reveals it. The server reports its lock state, and when that disagrees with what
-the terminal says, a lock-key tap goes out *before* the keystroke. The remembered state
-is cleared at that moment: the correction takes a round trip to be reflected, and
-acting on the stale value would toggle it straight back. Local state comes from the
-Kitty keyboard protocol; without it we report "unknown" and leave the remote alone,
-because an unset bit would otherwise read as "off".
-
-**Quality and compression hints** (-32..-23, -256..-247), via `--quality` and
-`--compression`. Both default to *unset*, and for quality that is the important case:
-the spec says Tight does not use JPEG at all unless a quality level is given, so saying
-nothing is the only way to ask for a lossless picture. Setting `--quality` turns JPEG
-on — what you want on a link too slow for lossless, and not otherwise.
