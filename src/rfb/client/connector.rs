@@ -120,12 +120,11 @@ where
                                 // the server sends the SecurityResult message, but does not send an
                                 // error message before closing the connection.
                                 return Err(VncError::WrongPassword);
-                            } else {
-                                let _ = connector.stream.read_u32().await?;
-                                let mut err_msg = String::new();
-                                connector.stream.read_to_string(&mut err_msg).await?;
-                                return Err(VncError::General(err_msg));
                             }
+                            let _ = connector.stream.read_u32().await?;
+                            let mut err_msg = String::new();
+                            connector.stream.read_to_string(&mut err_msg).await?;
+                            return Err(VncError::General(err_msg));
                         }
                     }
                     info!("auth done, client connected");
