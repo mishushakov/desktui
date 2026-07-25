@@ -1,0 +1,1013 @@
+//! A live VNC session.
+//!
+//! One loop selects over three sources: events decoded from the server, input
+//! from the terminal, and a render tick. Everything on screen is composed in the
+//! tick and handed to the writer thread as a single frame.
+
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use crossterm::event::{Event, EventStream};
+use futures::StreamExt;
+use tokio::net::TcpStream;
+use tokio::time::{MissedTickBehavior, interval};
+
+use crate::app::{FpsMeter, describe, human_bytes};
+use crate::cli::{Args, ScaleMode};
+use crate::render::framebuffer::Framebuffer;
+use crate::render::{FrameStats, Layout, Rect, Renderer};
+use crate::rfb::{
+    PixelFormat, ResizeStatus, Screen, ScreenInfo, ScreenLayout, VncClient, VncConnector,
+    VncEncoding, VncError, VncEvent, X11Event,
+};
+use crate::term::caps::Caps;
+use crate::term::input::{Command, InputMapper, KeyOutcome};
+use crate::term::writer::{Busy, FrameWriter};
+use crate::term::{Metrics, TerminalGuard, kitty};
+use crate::ui::status;
+
+/// How long to wait for the TCP connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A server that has gone quiet for this long gets its update request repeated.
+/// Some servers drop one under load, and without this the session would simply
+/// stop redrawing.
+const UPDATE_WATCHDOG: Duration = Duration::from_secs(1);
+
+/// Terminal resizes arrive in a stream while a window is dragged. Waiting this
+/// long after the last one keeps us from asking the server to resize dozens of
+/// times.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How long a note stays in the status line.
+const NOTE_LINGER: Duration = Duration::from_secs(4);
+
+/// Floor on the gap between two update requests, so a server that answers an
+/// incremental request instantly cannot spin us at full speed.
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
+
+/// First pause before a reconnect attempt, doubling up to the cap.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
+
+/// The largest remote framebuffer we will allocate for, in bytes.
+///
+/// 512 MB is four bytes per pixel across roughly 11k by 11k, far past any real
+/// desktop and far below the 17 GB the protocol's 16-bit dimensions permit.
+const MAX_FRAMEBUFFER_BYTES: u64 = 512 << 20;
+
+/// Would this size fit in a framebuffer we are willing to allocate?
+fn framebuffer_size_is_plausible(size: (u16, u16)) -> bool {
+    u64::from(size.0) * u64::from(size.1) * 4 <= MAX_FRAMEBUFFER_BYTES
+}
+
+/// Where the negotiation over the remote desktop's size has got to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resize {
+    /// No layout rectangle has arrived yet, so we do not know whether the server
+    /// can resize.
+    Probing,
+    /// The server never sent a layout rectangle in reply to a non-incremental
+    /// request, which per the spec means it does not support resizing.
+    Unsupported,
+    /// A request is outstanding.
+    Waiting { want: (u16, u16) },
+    /// The remote desktop is exactly the size we asked for.
+    Native,
+    /// The server said no.
+    Refused(ResizeStatus),
+    /// We did not ask. Reshaping the remote desktop changes it for every other
+    /// client connected to it, which is not something a view-only session should
+    /// do -- noVNC takes the same position.
+    Suppressed,
+}
+
+impl Resize {
+    fn note(&self) -> Option<String> {
+        match self {
+            Resize::Unsupported => Some("server cannot resize; scaling instead".into()),
+            Resize::Refused(status) => Some(format!("{}; scaling instead", status.describe())),
+            Resize::Suppressed => Some("view-only: not resizing the remote desktop".into()),
+            _ => None,
+        }
+    }
+}
+
+pub async fn run(
+    args: &Args,
+    caps: &Caps,
+    guard: &TerminalGuard,
+    addr: &str,
+    password: Option<String>,
+) -> Result<()> {
+    // The first connection is made before the alternate screen, so that a
+    // password prompt is somewhere the user can see it. Later attempts reuse the
+    // password and need no prompt.
+    let (client, password) = connect(addr, password).await?;
+    guard.begin_full_screen()?;
+
+    let mut next = Some(client);
+    let mut backoff = RECONNECT_BACKOFF;
+
+    loop {
+        let client = match next.take() {
+            Some(client) => {
+                backoff = RECONNECT_BACKOFF;
+                client
+            }
+            None => match try_connect(addr, password.clone()).await {
+                Ok(client) => {
+                    backoff = RECONNECT_BACKOFF;
+                    client
+                }
+                Err(err) => {
+                    notice(&format!(
+                        " reconnecting to {addr} in {}s -- {err}",
+                        backoff.as_secs().max(1)
+                    ));
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    continue;
+                }
+            },
+        };
+
+        let mut session = Session::new(args, caps, client).await?;
+        let result = session.run(args).await;
+        // Let go of anything held on the remote before leaving, so a modifier does
+        // not stay stuck in whatever had focus over there.
+        session.release_input().await;
+        session.client.close().await;
+        drop(session);
+
+        match result {
+            // A clean exit is the user quitting.
+            Ok(()) => return Ok(()),
+            Err(err) if args.reconnect => {
+                notice(&format!(" lost the session ({err}); reconnecting"));
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Write a line straight to the terminal, between sessions.
+///
+/// Safe only here: the session and its writer thread are gone by this point, so
+/// there is nothing to interleave with.
+fn notice(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    // Bottom of the screen, without needing to know how tall it is.
+    let _ = write!(out, "\x1b[999;1H\x1b[7m\x1b[K{text}\x1b[0m");
+    let _ = out.flush();
+}
+
+/// Open the connection, prompting for a password only if the server asks for one
+/// and none was supplied.
+async fn connect(addr: &str, password: Option<String>) -> Result<(VncClient, Option<String>)> {
+    match try_connect(addr, password.clone()).await {
+        Ok(client) => Ok((client, password)),
+        Err(VncError::NoPassword) => {
+            let password = crate::prompt_password(addr)?;
+            let client = try_connect(addr, Some(password.clone()))
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            Ok((client, Some(password)))
+        }
+        Err(err) => Err(anyhow::anyhow!("{err}")).with_context(|| format!("connecting to {addr}")),
+    }
+}
+
+async fn try_connect(addr: &str, password: Option<String>) -> Result<VncClient, VncError> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| VncError::General(format!("timed out connecting to {addr}")))?
+        .map_err(VncError::IoError)?;
+    // Input latency is the whole point; do not let Nagle sit on a click.
+    stream.set_nodelay(true).map_err(VncError::IoError)?;
+
+    VncConnector::new(stream)
+        .set_auth_method(async move { password.ok_or(VncError::NoPassword) })
+        // Order is preference order. Tight first: it is what every modern server
+        // does best, and its JPEG rectangles are the cheapest way to move a busy
+        // screen. Cursor is deliberately absent, which leaves the server to draw
+        // the pointer into the framebuffer where it belongs until local cursor
+        // rendering exists.
+        .add_encoding(VncEncoding::Tight)
+        .add_encoding(VncEncoding::Zrle)
+        .add_encoding(VncEncoding::CopyRect)
+        .add_encoding(VncEncoding::Raw)
+        .add_encoding(VncEncoding::ExtendedDesktopSizePseudo)
+        .add_encoding(VncEncoding::DesktopSizePseudo)
+        .add_encoding(VncEncoding::LastRectPseudo)
+        .allow_shared(true)
+        // BGRA is what an x86 server produces natively, so this is the format
+        // that costs neither side a swizzle on the wire. The pack to RGB happens
+        // once per tile at the end of the pipeline.
+        .set_pixel_format(PixelFormat::bgra())
+        .build()?
+        .try_start()
+        .await?
+        .finish()
+}
+
+struct Session {
+    client: VncClient,
+    fb: Framebuffer,
+    renderer: Renderer,
+    writer: FrameWriter,
+    metrics: Metrics,
+    caps: Caps,
+    input: InputMapper,
+    server_name: String,
+
+    mode: ScaleMode,
+    pan: (u32, u32),
+    remote: (u16, u16),
+    screens: Vec<ScreenInfo>,
+    resize: Resize,
+    /// The size of the last request actually sent.
+    ///
+    /// Servers may accept a request and then snap to a mode of their own. Asking
+    /// again whenever the granted size differs from the wanted one would loop for
+    /// ever, so a repeat only follows a change in what *we* want.
+    requested_size: Option<(u16, u16)>,
+
+    awaiting_update: bool,
+    requested_at: Instant,
+    rtt: Duration,
+
+    view_only: bool,
+    no_clipboard: bool,
+    show_help: bool,
+    show_stats: bool,
+    note: Option<(String, Instant)>,
+
+    fps: FpsMeter,
+    last_stats: FrameStats,
+    dropped: u64,
+    pending_metrics: Option<Instant>,
+    quit: bool,
+}
+
+impl Session {
+    async fn new(args: &Args, caps: &Caps, client: VncClient) -> Result<Self> {
+        let metrics = Metrics::query()?;
+        let remote = client.resolution().await;
+        let server_name = client.name().await;
+
+        let fb = Framebuffer::new(u32::from(remote.0), u32::from(remote.1));
+        let layout = Layout::compute(
+            &metrics,
+            args.scale,
+            u32::from(remote.0),
+            u32::from(remote.1),
+            (0, 0),
+        );
+
+        Ok(Self {
+            client,
+            fb,
+            renderer: Renderer::new(layout, true, args.transfer.resolve(caps)),
+            writer: FrameWriter::spawn(),
+            metrics,
+            caps: caps.clone(),
+            input: InputMapper::new(args.prefix_char(), caps.kitty_keyboard, caps.pixel_mouse),
+            server_name,
+            mode: args.scale,
+            pan: (0, 0),
+            remote,
+            screens: Vec::new(),
+            resize: Resize::Probing,
+            requested_size: None,
+            awaiting_update: true, // the engine asks for the first frame itself
+            requested_at: Instant::now(),
+            rtt: Duration::ZERO,
+            view_only: args.view_only,
+            no_clipboard: args.no_clipboard,
+            show_help: false,
+            show_stats: false,
+            note: None,
+            fps: FpsMeter::new(),
+            last_stats: FrameStats::default(),
+            dropped: 0,
+            pending_metrics: None,
+            quit: false,
+        })
+    }
+
+    async fn run(&mut self, args: &Args) -> Result<()> {
+        let mut terminal = EventStream::new();
+        let mut ticker = interval(Duration::from_micros(1_000_000 / u64::from(args.fps)));
+        // Falling behind should drop frames, not queue them up to be raced
+        // through later.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        while !self.quit {
+            tokio::select! {
+                event = self.client.recv_event() => match event {
+                    Ok(event) => self.on_vnc(event).await?,
+                    Err(err) => {
+                        anyhow::bail!("the session ended: {err}");
+                    }
+                },
+                Some(event) = terminal.next() => {
+                    let event = event.context("failed to read terminal input")?;
+                    self.on_terminal(event).await?;
+                }
+                _ = ticker.tick() => self.on_tick().await?,
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_vnc(&mut self, event: VncEvent) -> Result<()> {
+        match event {
+            VncEvent::RawImage(rect, data) => {
+                if let Some(damage) = self.fb.apply_bgra(convert(rect), &data) {
+                    self.renderer.mark(damage);
+                }
+            }
+            VncEvent::JpegImage(rect, data) => match decode_jpeg(&data) {
+                Ok((w, h, rgb)) => {
+                    // Trust the rectangle header for placement, but the JPEG for
+                    // its own dimensions.
+                    let rect = Rect::new(u32::from(rect.x), u32::from(rect.y), w, h);
+                    if let Some(damage) = self.fb.apply_rgb(rect, &rgb) {
+                        self.renderer.mark(damage);
+                    }
+                }
+                Err(err) => tracing::warn!("dropping an undecodable JPEG rectangle: {err}"),
+            },
+            VncEvent::Copy(dst, src) => {
+                if let Some(damage) =
+                    self.fb
+                        .copy_rect(convert(dst), u32::from(src.x), u32::from(src.y))
+                {
+                    self.renderer.mark(damage);
+                }
+            }
+            VncEvent::SetResolution(screen) => self.on_remote_size(screen, None),
+            VncEvent::DesktopLayout(layout) => self.on_layout(layout).await?,
+            VncEvent::FramebufferUpdateEnd => {
+                self.awaiting_update = false;
+                self.rtt = self.requested_at.elapsed();
+                // The first update is also the answer to our capability probe: a
+                // server that supports resizing must have included a layout
+                // rectangle in it.
+                if self.resize == Resize::Probing {
+                    self.resize = Resize::Unsupported;
+                    if let Some(note) = self.resize.note() {
+                        self.set_note(note);
+                    }
+                    self.fall_back_from_native();
+                }
+                // Ask for the next update now, not on the next render tick. The
+                // server can then encode the following frame while we are still
+                // drawing this one; waiting for the tick leaves it idle for up to a
+                // whole frame interval, which roughly halves the rate a moving
+                // picture can reach.
+                self.request_update().await?;
+            }
+            VncEvent::Text(text) => {
+                if !self.no_clipboard {
+                    self.copy_to_local_clipboard(&text);
+                }
+            }
+            VncEvent::Bell => {
+                // A bell is the one thing worth passing straight through.
+                let mut buf = self.writer.take_buffer();
+                buf.push(0x07);
+                let _ = self.writer.submit_blocking(buf);
+            }
+            VncEvent::SetPixelFormat(pf) => {
+                tracing::debug!("server pixel format: {pf:?}");
+            }
+            // Requested only once local cursor rendering exists; until then the
+            // server draws the pointer into the framebuffer itself.
+            VncEvent::SetCursor(..) => {}
+            VncEvent::Error(err) => anyhow::bail!("the server connection failed: {err}"),
+        }
+        Ok(())
+    }
+
+    /// Adopt a new remote framebuffer size.
+    fn on_remote_size(&mut self, screen: Screen, note: Option<String>) {
+        let size = (screen.width, screen.height);
+        if size == self.remote || size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        // A size is four bytes of allocation per pixel, and the protocol allows
+        // 65535 in each direction -- seventeen gigabytes. Rust aborts the process
+        // on a failed allocation, so an absurd size has to be refused here rather
+        // than discovered by the allocator.
+        if !framebuffer_size_is_plausible(size) {
+            tracing::warn!(
+                "ignoring an implausible framebuffer size of {}x{}",
+                size.0,
+                size.1
+            );
+            self.set_note(format!(
+                "server reported an implausible size of {}x{}; ignored",
+                size.0, size.1
+            ));
+            return;
+        }
+        tracing::info!("remote framebuffer is now {}x{}", size.0, size.1);
+        self.remote = size;
+        self.fb
+            .resize(u32::from(size.0), u32::from(size.1));
+        self.pan = (0, 0);
+        self.relayout();
+        if let Some(note) = note {
+            self.set_note(note);
+        }
+    }
+
+    async fn on_layout(&mut self, layout: ScreenLayout) -> Result<()> {
+        // Keep the screen ids: the server uses them to tell a moved screen from a
+        // new one, and a request that invents its own would be rejected.
+        if !layout.screens.is_empty() {
+            self.screens = layout.screens.clone();
+        }
+
+        let was_probing = self.resize == Resize::Probing;
+        if layout.is_reply_to_us() {
+            match layout.status {
+                ResizeStatus::Success => {
+                    self.resize = Resize::Native;
+                    self.on_remote_size(layout.screen, None);
+                    // The terminal may have been resized again while the request
+                    // was in flight, so check we are still in sync. A no-op unless
+                    // our own target actually moved.
+                    self.request_native_size(false).await?;
+                }
+                // The server passed the request on and cannot say yet, so keep
+                // waiting: a later layout may report success.
+                ResizeStatus::Forwarded => {
+                    self.set_note("resize request forwarded".into());
+                }
+                status => {
+                    self.resize = Resize::Refused(status);
+                    if let Some(note) = self.resize.note() {
+                        self.set_note(note);
+                    }
+                    self.fall_back_from_native();
+                }
+            }
+        } else {
+            // Someone else changed it, or this is the initial report.
+            self.on_remote_size(layout.screen, None);
+            if was_probing {
+                self.resize = Resize::Unsupported; // provisional, refined below
+            }
+        }
+
+        if was_probing {
+            // A layout rectangle at all means SetDesktopSize is available.
+            self.resize = match self.resize {
+                Resize::Native => Resize::Native,
+                _ => Resize::Unsupported,
+            };
+            if self.mode == ScaleMode::Native {
+                self.resize = Resize::Probing;
+                self.request_native_size(false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The pixel size we want the remote desktop to be.
+    ///
+    /// Rounded down to even numbers: some servers snap to modes with even
+    /// dimensions, and asking for something they will only approximate wastes a
+    /// round trip.
+    fn target_size(&self) -> (u16, u16) {
+        let (w, h) = self.metrics.image_area();
+        (
+            (w.min(u32::from(u16::MAX)) as u16) & !1,
+            (h.min(u32::from(u16::MAX)) as u16) & !1,
+        )
+    }
+
+    /// Ask the server to match the terminal exactly.
+    async fn request_native_size(&mut self, force: bool) -> Result<()> {
+        // A view-only session must not reshape the remote desktop: it is shared
+        // with whoever else is connected to it.
+        if self.view_only {
+            if self.mode == ScaleMode::Native {
+                self.resize = Resize::Suppressed;
+                if let Some(note) = self.resize.note() {
+                    self.set_note(note);
+                }
+                self.fall_back_from_native();
+            }
+            return Ok(());
+        }
+
+        let want = self.target_size();
+        if want.0 == 0 || want.1 == 0 {
+            return Ok(());
+        }
+        if want == self.remote {
+            self.resize = Resize::Native;
+            self.relayout();
+            return Ok(());
+        }
+        if !force {
+            // One request at a time. A terminal resize arriving while one is
+            // outstanding gets picked up by the re-check after the reply lands.
+            if matches!(self.resize, Resize::Waiting { .. }) {
+                return Ok(());
+            }
+            // We already asked for exactly this and were given something else:
+            // the server snapped to a mode of its own, and asking again would
+            // loop for ever.
+            if self.requested_size == Some(want) {
+                return Ok(());
+            }
+        }
+
+        // Carry the server's own screen ids and flags over. With no layout to go
+        // by there is nothing legal to send, so wait for one.
+        let screens = if self.screens.is_empty() {
+            return Ok(());
+        } else {
+            let mut screens = self.screens.clone();
+            let first = &mut screens[0];
+            first.x = 0;
+            first.y = 0;
+            first.width = want.0;
+            first.height = want.1;
+            // A multi-head remote cannot be squeezed into one terminal window, so
+            // ask for a single screen and let the others go.
+            screens.truncate(1);
+            screens
+        };
+
+        tracing::info!("asking the server for {}x{}", want.0, want.1);
+        self.resize = Resize::Waiting { want };
+        self.requested_size = Some(want);
+        self.requested_at = Instant::now();
+        self.client
+            .input(X11Event::SetDesktopSize {
+                width: want.0,
+                height: want.1,
+                screens,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+
+    /// Native mapping is not available, so pick the best mapping that is.
+    fn fall_back_from_native(&mut self) {
+        if self.mode == ScaleMode::Native {
+            let (area_w, area_h) = self.metrics.image_area();
+            // A desktop that already fits needs no scaling at all; only a larger
+            // one has to be resampled.
+            self.mode = if u32::from(self.remote.0) <= area_w && u32::from(self.remote.1) <= area_h {
+                ScaleMode::OneToOne
+            } else {
+                ScaleMode::Fit
+            };
+            self.relayout();
+        }
+    }
+
+    async fn on_terminal(&mut self, event: Event) -> Result<()> {
+        match event {
+            Event::Key(key) => match self.input.on_key(key) {
+                KeyOutcome::Ignored => {}
+                KeyOutcome::Keys(keys) => {
+                    if !self.view_only {
+                        for key in keys {
+                            self.send(X11Event::KeyEvent(key)).await?;
+                        }
+                    }
+                }
+                KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
+            },
+            Event::Mouse(mouse) => {
+                if !self.view_only {
+                    let events = {
+                        let layout = *self.renderer.layout();
+                        self.input.on_mouse(mouse, &layout, &self.metrics)
+                    };
+                    for event in events {
+                        self.send(X11Event::PointerEvent(event)).await?;
+                    }
+                }
+            }
+            Event::Paste(text) => {
+                if !self.view_only && !self.no_clipboard {
+                    // RFB clipboard traffic is Latin-1, so anything outside it has
+                    // to go rather than be mangled into something else.
+                    let latin1: String = text.chars().filter(|c| (*c as u32) < 0x100).collect();
+                    self.send(X11Event::CopyText(latin1)).await?;
+                    self.set_note("pasted to the remote clipboard".into());
+                }
+            }
+            Event::Resize(..) => {
+                // Coalesce: a window drag produces a stream of these.
+                self.pending_metrics = Some(Instant::now());
+            }
+            Event::FocusLost => {
+                // Whatever is held here is not held there.
+                self.release_input().await;
+            }
+            Event::FocusGained => {}
+        }
+        Ok(())
+    }
+
+    async fn on_command(&mut self, cmd: Command) -> Result<()> {
+        match cmd {
+            Command::Quit => self.quit = true,
+            Command::SendPrefix => {
+                if !self.view_only {
+                    for key in self.input.literal_prefix() {
+                        self.send(X11Event::KeyEvent(key)).await?;
+                    }
+                }
+            }
+            Command::FullRefresh => {
+                self.renderer.mark_all();
+                self.send(X11Event::FullRefresh).await?;
+                self.awaiting_update = true;
+                self.requested_at = Instant::now();
+                self.set_note("full refresh requested".into());
+            }
+            Command::Renegotiate => {
+                self.mode = ScaleMode::Native;
+                self.resize = Resize::Probing;
+                self.requested_size = None;
+                self.request_native_size(true).await?;
+                self.set_note("renegotiating the remote size".into());
+            }
+            Command::Mode(mode) => {
+                self.mode = mode;
+                self.pan = (0, 0);
+                if mode == ScaleMode::Native {
+                    self.requested_size = None;
+                    self.request_native_size(true).await?;
+                } else {
+                    self.relayout();
+                }
+                self.set_note(format!("mapping: {}", describe(self.renderer.layout())));
+            }
+            Command::Pan(dx, dy) => {
+                let layout = *self.renderer.layout();
+                let (max_x, max_y) = layout.pan_limits();
+                if max_x == 0 && max_y == 0 {
+                    self.set_note("nothing to pan: the whole screen is visible".into());
+                } else {
+                    // A screenful at a time, clamped to what exists.
+                    let step_x = (layout.src.w / 2).max(1) as i64;
+                    let step_y = (layout.src.h / 2).max(1) as i64;
+                    let x = (i64::from(self.pan.0) + i64::from(dx) * step_x)
+                        .clamp(0, i64::from(max_x)) as u32;
+                    let y = (i64::from(self.pan.1) + i64::from(dy) * step_y)
+                        .clamp(0, i64::from(max_y)) as u32;
+                    self.pan = (x, y);
+                    self.relayout();
+                }
+            }
+            Command::ToggleViewOnly => {
+                self.view_only = !self.view_only;
+                if self.view_only {
+                    self.release_input().await;
+                } else if self.mode != ScaleMode::Native && self.resize == Resize::Suppressed {
+                    // Input is allowed again, so the resize we declined can happen.
+                    self.mode = ScaleMode::Native;
+                    self.resize = Resize::Probing;
+                    self.requested_size = None;
+                    self.request_native_size(true).await?;
+                }
+                self.set_note(
+                    if self.view_only {
+                        "view-only"
+                    } else {
+                        "input enabled"
+                    }
+                    .into(),
+                );
+            }
+            Command::ToggleStats => self.show_stats = !self.show_stats,
+            Command::Help => self.show_help = !self.show_help,
+        }
+        Ok(())
+    }
+
+    async fn on_tick(&mut self) -> Result<()> {
+        // A resize has settled: adopt the new geometry, and ask the server to
+        // match it if it is willing to.
+        if let Some(at) = self.pending_metrics
+            && at.elapsed() >= RESIZE_DEBOUNCE {
+                self.pending_metrics = None;
+                self.metrics = Metrics::query()?;
+                self.relayout();
+                if self.mode == ScaleMode::Native
+                    || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
+                {
+                    self.request_native_size(false).await?;
+                }
+            }
+
+        // A pointer that stopped moving mid-rate-limit still has to arrive.
+        if !self.view_only
+            && let Some(pointer) = self.input.flush_motion() {
+                self.send(X11Event::PointerEvent(pointer)).await?;
+            }
+
+        // Normally the request went out the moment the last update finished, so
+        // this only covers the gaps: the very first frame, and a server that has
+        // gone quiet.
+        if !self.awaiting_update {
+            self.request_update().await?;
+        } else if self.requested_at.elapsed() > UPDATE_WATCHDOG {
+            tracing::debug!(
+                "no update for {:?}; asking again",
+                self.requested_at.elapsed()
+            );
+            self.requested_at = Instant::now();
+            self.send(X11Event::Refresh).await?;
+        }
+
+        self.draw()
+    }
+
+    /// Ask for the next incremental update, keeping one in flight at a time.
+    ///
+    /// A floor on the interval guards against a server that answers an incremental
+    /// request immediately with nothing: the protocol says it should hold the
+    /// request until something changes, and a server that does not would otherwise
+    /// have us both spinning at full tilt.
+    async fn request_update(&mut self) -> Result<()> {
+        if self.awaiting_update {
+            return Ok(());
+        }
+        if self.requested_at.elapsed() < MIN_REQUEST_INTERVAL {
+            // Let the render tick pick it up shortly.
+            return Ok(());
+        }
+        self.awaiting_update = true;
+        self.requested_at = Instant::now();
+        self.send(X11Event::Refresh).await
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        let has_work = self.renderer.has_work();
+        if !has_work && self.note.is_none() && !self.show_help {
+            // Still repaint the status line often enough for the clock-like
+            // fields to stay honest, but not every tick.
+            if self.fps.since_last() < Duration::from_millis(500) {
+                return Ok(());
+            }
+        }
+
+        let mut buf = self.writer.take_buffer();
+        if self.caps.sync_output {
+            kitty::begin_sync(&mut buf);
+        }
+        let stats = self.renderer.compose(&self.fb, &mut buf);
+        if stats.tiles > 0 {
+            self.last_stats = stats;
+        }
+        self.draw_status(&mut buf);
+        if self.show_help {
+            status::draw_help(&mut buf, &self.metrics, self.input.prefix());
+        }
+        if self.caps.sync_output {
+            kitty::end_sync(&mut buf);
+        }
+
+        match self.writer.submit(buf) {
+            Ok(()) => {
+                self.renderer.commit();
+                self.fps.tick();
+            }
+            Err(Busy::Full(buf)) => {
+                self.dropped += 1;
+                self.writer.recycle(buf);
+            }
+            Err(Busy::Closed) => anyhow::bail!("the terminal stopped accepting output"),
+        }
+        Ok(())
+    }
+
+    fn draw_status(&mut self, buf: &mut Vec<u8>) {
+        let layout = *self.renderer.layout();
+        let mut left = format!(
+            " {}  {}x{}",
+            if self.server_name.is_empty() {
+                "vnctui"
+            } else {
+                self.server_name.as_str()
+            },
+            self.remote.0,
+            self.remote.1
+        );
+        if !layout.is_pixel_exact() {
+            left.push_str(&format!(" -> {}x{}", layout.dst_w, layout.dst_h));
+        }
+        left.push_str(&format!("  {}", describe(&layout)));
+        if self.view_only {
+            left.push_str("  view-only");
+        }
+        if self.input.is_armed() {
+            left.push_str("  PREFIX");
+        }
+        if let Some((note, at)) = &self.note {
+            if at.elapsed() < NOTE_LINGER {
+                left.push_str("  -- ");
+                left.push_str(note);
+            } else {
+                self.note = None;
+            }
+        }
+
+        let right = if self.show_stats {
+            format!(
+                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>4}ms rtt  {} dropped  Ctrl+{} ? ",
+                self.fps.fps(),
+                self.last_stats.tiles,
+                human_bytes(self.last_stats.bytes),
+                self.rtt.as_millis(),
+                self.dropped,
+                self.input.prefix().to_ascii_uppercase(),
+            )
+        } else {
+            format!(
+                "{:>4}ms  Ctrl+{} ? for help ",
+                self.rtt.as_millis(),
+                self.input.prefix().to_ascii_uppercase()
+            )
+        };
+        status::draw(buf, &self.metrics, &left, &right);
+    }
+
+    fn relayout(&mut self) {
+        let layout = Layout::compute(
+            &self.metrics,
+            self.mode,
+            u32::from(self.remote.0),
+            u32::from(self.remote.1),
+            self.pan,
+        );
+        let cleanup = self.renderer.relayout(layout);
+        if !cleanup.is_empty() {
+            let _ = self.writer.submit_blocking(cleanup);
+        }
+    }
+
+    async fn send(&self, event: X11Event) -> Result<()> {
+        self.client
+            .input(event)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to send input: {err}"))
+    }
+
+    /// Let go of every key and button we told the server about.
+    async fn release_input(&mut self) {
+        for key in self.input.release_all() {
+            let _ = self.client.input(X11Event::KeyEvent(key)).await;
+        }
+        if let Some(pointer) = self.input.release_buttons() {
+            let _ = self.client.input(X11Event::PointerEvent(pointer)).await;
+        }
+    }
+
+    /// Put the server's clipboard on the local one, with OSC 52.
+    fn copy_to_local_clipboard(&mut self, text: &str) {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let mut buf = self.writer.take_buffer();
+        buf.extend_from_slice(b"\x1b]52;c;");
+        buf.extend_from_slice(encoded.as_bytes());
+        buf.extend_from_slice(b"\x07");
+        let _ = self.writer.submit_blocking(buf);
+        self.set_note("remote clipboard copied".into());
+    }
+
+    fn set_note(&mut self, note: String) {
+        tracing::debug!("{note}");
+        self.note = Some((note, Instant::now()));
+    }
+}
+
+fn convert(rect: crate::rfb::Rect) -> Rect {
+    Rect::new(
+        u32::from(rect.x),
+        u32::from(rect.y),
+        u32::from(rect.width),
+        u32::from(rect.height),
+    )
+}
+
+/// Decode a Tight JPEG rectangle to packed RGB.
+///
+/// The output colour space is pinned to RGB so a greyscale JPEG comes back with
+/// three channels like everything else, rather than one.
+fn decode_jpeg(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    use zune_jpeg::JpegDecoder;
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    use zune_jpeg::zune_core::options::DecoderOptions;
+
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    // The decoder wants a seekable reader, which a bare slice is not.
+    let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(data), options);
+    let pixels = decoder
+        .decode()
+        .map_err(|err| anyhow::anyhow!("{err:?}"))
+        .context("JPEG decode failed")?;
+    let info = decoder
+        .info()
+        .context("JPEG carried no dimensions")?;
+    let (w, h) = (u32::from(info.width), u32::from(info.height));
+    anyhow::ensure!(
+        pixels.len() >= (w as usize) * (h as usize) * 3,
+        "JPEG decoded to {} bytes, too few for {w}x{h} RGB",
+        pixels.len()
+    );
+    Ok((w, h, pixels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unsupported_or_refused_resize_explains_itself() {
+        assert!(Resize::Unsupported.note().unwrap().contains("cannot resize"));
+        let refused = Resize::Refused(ResizeStatus::Prohibited);
+        assert!(refused.note().unwrap().contains("prohibited"));
+        // States that are not a dead end say nothing.
+        assert!(Resize::Probing.note().is_none());
+        assert!(Resize::Native.note().is_none());
+        assert!(Resize::Waiting { want: (1, 1) }.note().is_none());
+    }
+
+    #[test]
+    fn an_implausible_framebuffer_size_is_refused() {
+        // The protocol's dimensions are 16-bit, so a server can ask for seventeen
+        // gigabytes of allocation. Rust aborts on a failed allocation, so this has
+        // to be caught before the allocator sees it.
+        assert!(framebuffer_size_is_plausible((1600, 832)));
+        assert!(framebuffer_size_is_plausible((3840, 2160)));
+        assert!(framebuffer_size_is_plausible((8192, 8192)));
+        assert!(!framebuffer_size_is_plausible((65535, 65535)));
+        assert!(!framebuffer_size_is_plausible((65535, 4096)));
+    }
+
+    #[test]
+    fn a_rectangle_widens_from_the_protocol_type() {
+        let rect = convert(crate::rfb::Rect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        });
+        assert_eq!(rect, Rect::new(10, 20, 30, 40));
+    }
+
+    #[test]
+    fn garbage_is_not_mistaken_for_a_jpeg() {
+        assert!(decode_jpeg(&[]).is_err());
+        assert!(decode_jpeg(b"not a jpeg at all").is_err());
+    }
+
+    /// An 8x8 single-component baseline JPEG.
+    ///
+    /// Greyscale on purpose: it is the case that would come back one byte per
+    /// pixel if the output colour space were left to the decoder's judgement, and
+    /// the framebuffer expects three.
+    const GREY_8X8: &[u8] = include_bytes!("../tests/fixtures/grey8x8.jpg");
+
+    #[test]
+    fn a_greyscale_jpeg_still_decodes_to_three_channels() {
+        let (w, h, rgb) = decode_jpeg(GREY_8X8).expect("should decode");
+        assert_eq!((w, h), (8, 8));
+        assert_eq!(
+            rgb.len(),
+            8 * 8 * 3,
+            "expected RGB for every pixel, got {} bytes",
+            rgb.len()
+        );
+        // Every channel of a pixel holds the same value in a greyscale image.
+        assert_eq!(rgb[0], rgb[1]);
+        assert_eq!(rgb[1], rgb[2]);
+    }
+
+    #[test]
+    fn a_truncated_jpeg_is_an_error_not_a_panic() {
+        // A rectangle cut short by a dropped connection must not take the session
+        // with it.
+        for cut in [4, 20, GREY_8X8.len() / 2, GREY_8X8.len() - 1] {
+            let _ = decode_jpeg(&GREY_8X8[..cut]);
+        }
+    }
+}
