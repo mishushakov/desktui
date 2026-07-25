@@ -42,6 +42,15 @@ const ZLIB_LEVEL: Compression = Compression::new(1);
 /// the low ids other programs tend to pick.
 pub const IMAGE_ID_BASE: u32 = 0x7600;
 
+/// Image id for an overlay's backdrop, above every id a tile can take.
+///
+/// Tiles are around 128px square, so even a 4K terminal uses a few hundred of
+/// them and could never reach this. The distance is the point: at equal
+/// z-index the higher id is composited on top, which is the only way an overlay
+/// can cover the remote screen. A cell background cannot, being painted below
+/// the image.
+pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x10000;
+
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
@@ -160,6 +169,47 @@ impl KittyEncoder {
     pub fn delete_all(out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\");
     }
+}
+
+/// Fill a block of cells with one colour, as an image at the tiles' own z-index.
+///
+/// An overlay cannot be given a background with SGR: the remote screen is
+/// composited above the cell background, so a colour set there is never seen and
+/// only the glyphs come out on top. An image of our own, at the same `z=-1` but a
+/// higher id than any tile, is drawn over them instead -- and the text still lands
+/// on top of that.
+///
+/// The source is two pixels square, stretched across the block with `c`/`r`, so
+/// the payload is four pixels however large the box is. `col` and `row` are
+/// one-based, as the cursor is.
+pub fn place_solid(
+    out: &mut Vec<u8>,
+    id: u32,
+    col: usize,
+    row: usize,
+    cols: usize,
+    rows: usize,
+    rgb: (u8, u8, u8),
+) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let pixels = [rgb.0, rgb.1, rgb.2].repeat(4);
+    let mut b64 = String::new();
+    BASE64.encode_string(&pixels, &mut b64);
+
+    let _ = write!(out, "\x1b[{row};{col}H");
+    let _ = write!(
+        out,
+        "\x1b_Ga=T,q=2,C=1,z=-1,f=24,i={id},s=2,v=2,c={cols},r={rows};"
+    );
+    out.extend_from_slice(b64.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
+}
+
+/// Remove one image and free the data behind it.
+pub fn delete_image(out: &mut Vec<u8>, id: u32) {
+    let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
 }
 
 /// Begin a synchronised update: the terminal shows nothing until it ends, so a

@@ -89,6 +89,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     let mut damage: Vec<Rect> = Vec::new();
     let mut fps = FpsMeter::new();
     let mut show_help = false;
+    let mut clear_help = false;
     let mut last_stats = crate::render::FrameStats::default();
     let mut dropped: u64 = 0;
 
@@ -104,14 +105,25 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                 break;
             }
             match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        return Ok(());
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let was_showing = show_help;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('c')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            return Ok(());
+                        }
+                        KeyCode::Char('h') | KeyCode::Char('?') => show_help = !show_help,
+                        _ => show_help = false,
                     }
-                    KeyCode::Char('h') | KeyCode::Char('?') => show_help = !show_help,
-                    _ => show_help = false,
-                },
+                    // The overlay leaves text and a backdrop image behind it, and
+                    // neither is undone by drawing the pattern again.
+                    if was_showing && !show_help {
+                        clear_help = true;
+                        renderer.mark_all();
+                    }
+                }
                 Event::Mouse(m) => {
                     // With mode 1016 in force these are pixel coordinates; when
                     // the terminal does not support it they are cells, so scale
@@ -172,13 +184,17 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         for r in &damage {
             renderer.mark(*r);
         }
-        if !renderer.has_work() && !show_help {
+        if !renderer.has_work() && !show_help && !clear_help {
             continue;
         }
 
         let mut buf = writer.take_buffer();
         if caps.sync_output {
             kitty::begin_sync(&mut buf);
+        }
+        if clear_help {
+            status::clear_help(&mut buf, &metrics, args.prefix_char());
+            clear_help = false;
         }
         let stats = renderer.compose(&fb, &mut buf);
         if stats.tiles > 0 {

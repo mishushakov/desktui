@@ -389,6 +389,60 @@ fn input_reaches_the_server_with_pixel_exact_coordinates() {
 }
 
 #[test]
+fn the_help_overlay_goes_away_on_the_next_key() {
+    // The bug this replaces: only the prefix command toggled the overlay, so the
+    // "any other key dismisses this" it advertises was untrue and the box stayed
+    // on screen for the rest of the session.
+    let (server, mut term) = start(Resize::Accept, (1024, 768));
+    assert!(term.wait_for(b"native 1:1", Duration::from_secs(10)));
+
+    // Ctrl+A then ? raises it.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"?");
+    assert!(
+        term.wait_for(b"any other key dismisses this", Duration::from_secs(10)),
+        "the overlay never appeared"
+    );
+
+    // While it is up it is redrawn every frame, so a tail of the output that no
+    // longer mentions it is the overlay being gone rather than merely not resent.
+    let mark = term.output().len();
+    term.send(b"\x1b[120u");
+    std::thread::sleep(Duration::from_millis(500));
+    let tail = term.output()[mark..].to_vec();
+    assert!(
+        !contains(&tail, b"any other key dismisses this"),
+        "the overlay was still being drawn after a dismissing key"
+    );
+
+    // Stopping the redraw is not the same as taking it off the screen: the image is
+    // composited below the text, so the box survives every repaint until the cells
+    // are blanked. The erase is a run of cursor moves each followed by spaces, and
+    // nothing else in a frame writes a blank straight after a position.
+    assert!(
+        count(&tail, b"H ") >= 10,
+        "the cells the overlay used were never erased, so it is still on screen"
+    );
+
+    // The key that dismisses is swallowed rather than passed on: the overlay
+    // said it dismisses, not that it types.
+    assert!(
+        !server.requests().iter().any(|r| matches!(
+            r,
+            Request::Key {
+                keysym: 0x78,
+                down: true
+            }
+        )),
+        "the dismissing key was forwarded to the server as well"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
 fn a_terminal_without_key_releases_gets_them_synthesised() {
     // Otherwise the remote would hold every key down for ever.
     let server = FakeServer::start(1024, 768, Resize::Accept);

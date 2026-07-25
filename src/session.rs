@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval};
@@ -323,6 +323,9 @@ struct Session {
     view_only: bool,
     no_clipboard: bool,
     show_help: bool,
+    /// The overlay was dismissed and its cells still have to be blanked. Drawing
+    /// the image over them does not do it: the image sits below the text.
+    clear_help: bool,
     show_stats: bool,
     note: Option<(String, Instant)>,
 
@@ -379,6 +382,7 @@ impl Session {
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
             show_help: false,
+            clear_help: false,
             show_stats: false,
             note: None,
             fps: FpsMeter::new(),
@@ -750,6 +754,14 @@ impl Session {
     async fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) => {
+                // The overlay promises that any other key dismisses it, so the key
+                // is caught here rather than interpreted. Presses only: the releases
+                // belonging to the chord that opened the overlay are still to come,
+                // and would otherwise close it before it could be read.
+                if self.show_help && key.kind == KeyEventKind::Press {
+                    self.dismiss_help();
+                    return Ok(());
+                }
                 let locks = self.input.lock_state(&key);
                 match self.input.on_key(key) {
                     KeyOutcome::Ignored => {}
@@ -890,9 +902,28 @@ impl Session {
                 );
             }
             Command::ToggleStats => self.show_stats = !self.show_stats,
-            Command::Help => self.show_help = !self.show_help,
+            Command::Help => {
+                if self.show_help {
+                    self.dismiss_help();
+                } else {
+                    self.show_help = true;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Hide the help overlay and arrange for the cells it used to be blanked.
+    ///
+    /// Clearing the flag is not enough on its own, and neither is damaging the
+    /// image: the overlay is text, and tiles are placed below the text, so the box
+    /// outlives any repaint until the cells themselves are erased. The tiles are
+    /// marked too, for a terminal that treats an erase as dropping the placements
+    /// underneath it.
+    fn dismiss_help(&mut self) {
+        self.show_help = false;
+        self.clear_help = true;
+        self.renderer.mark_all();
     }
 
     async fn on_tick(&mut self) -> Result<()> {
@@ -1078,7 +1109,7 @@ impl Session {
 
     fn draw(&mut self) -> Result<()> {
         let has_work = self.renderer.has_work();
-        if !has_work && self.note.is_none() && !self.show_help {
+        if !has_work && self.note.is_none() && !self.show_help && !self.clear_help {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1089,6 +1120,12 @@ impl Session {
         let mut buf = self.writer.take_buffer();
         if self.caps.sync_output {
             kitty::begin_sync(&mut buf);
+        }
+        // Text first, then images, exactly as a relayout does it: erasing cells may
+        // take the placements under them with it, so the tiles have to go out after.
+        if self.clear_help {
+            status::clear_help(&mut buf, &self.metrics, self.input.prefix());
+            self.clear_help = false;
         }
         let stats = self.renderer.compose(&self.fb, &mut buf);
         if stats.tiles > 0 {
