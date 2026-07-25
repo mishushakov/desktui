@@ -401,7 +401,7 @@ fn the_help_overlay_goes_away_on_the_next_key() {
     std::thread::sleep(Duration::from_millis(50));
     term.send(b"?");
     assert!(
-        term.wait_for(b"any other key dismisses this", Duration::from_secs(10)),
+        term.wait_for(b"Renegotiate the remote size", Duration::from_secs(10)),
         "the overlay never appeared"
     );
 
@@ -412,17 +412,17 @@ fn the_help_overlay_goes_away_on_the_next_key() {
     std::thread::sleep(Duration::from_millis(500));
     let tail = term.output()[mark..].to_vec();
     assert!(
-        !contains(&tail, b"any other key dismisses this"),
+        !contains(&tail, b"Renegotiate the remote size"),
         "the overlay was still being drawn after a dismissing key"
     );
 
-    // Stopping the redraw is not the same as taking it off the screen: the image is
-    // composited below the text, so the box survives every repaint until the cells
-    // are blanked. The erase is a run of cursor moves each followed by spaces, and
-    // nothing else in a frame writes a blank straight after a position.
+    // Stopping the redraw is not the same as taking it off the screen. The glyphs
+    // outlive any repaint of the image below them, and the backdrop outranks every
+    // tile, so both have to be taken off explicitly -- and only the teardown deletes
+    // an image by id, which makes it the thing to look for.
     assert!(
-        count(&tail, b"H ") >= 10,
-        "the cells the overlay used were never erased, so it is still on screen"
+        contains(&tail, b"a=d,d=I,i="),
+        "the overlay was never cleared, so it is still on screen"
     );
 
     // The key that dismisses is swallowed rather than passed on: the overlay

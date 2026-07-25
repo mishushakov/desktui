@@ -57,37 +57,80 @@ pub fn draw(out: &mut Vec<u8>, metrics: &Metrics, left: &str, right: &str) {
 const HELP_SGR: &str = "\x1b[48;2;255;255;255m\x1b[38;2;0;0;0m";
 const HELP_BACKDROP: (u8, u8, u8) = (0xff, 0xff, 0xff);
 
-/// The overlay's contents, without the border around them.
-fn help_lines(prefix: char) -> Vec<String> {
-    let p = format!("Ctrl+{}", prefix.to_ascii_uppercase());
+/// Foregrounds within the box. The background is set once and left alone, so these
+/// only ever change the ink; `22` drops the boldness the title turned on.
+const INK_TITLE: &str = "\x1b[1m\x1b[38;2;17;17;17m";
+const INK_SECTION: &str = "\x1b[22m\x1b[38;2;124;58;237m";
+const INK_LABEL: &str = "\x1b[22m\x1b[38;2;17;17;17m";
+const INK_MUTED: &str = "\x1b[22m\x1b[38;2;136;136;136m";
+
+/// Breathing room inside the box, in cells. There is no border to hold the text
+/// off the edge, so the padding is the only thing that does.
+const PAD_X: usize = 3;
+const PAD_Y: usize = 1;
+
+/// Least space between a label and the shortcut sitting against the right edge.
+const GAP: usize = 6;
+
+/// One line of the overlay.
+enum Row {
+    /// Heading of the whole box: name on the left, how to leave on the right.
+    Title(String, String),
+    /// A group of commands.
+    Section(String),
+    /// A command and the keys that reach it, which are right-aligned.
+    Item(String, String),
+    Blank,
+}
+
+impl Row {
+    /// Columns this row needs, before padding.
+    fn width(&self) -> usize {
+        match self {
+            Row::Blank => 0,
+            Row::Section(text) => text.chars().count(),
+            Row::Title(left, right) | Row::Item(left, right) => {
+                left.chars().count() + GAP + right.chars().count()
+            }
+        }
+    }
+}
+
+/// The overlay's contents, grouped.
+fn help_rows(prefix: char) -> Vec<Row> {
+    let p = format!("ctrl+{}", prefix.to_ascii_lowercase());
+    let item = |label: &str, keys: String| Row::Item(label.to_string(), keys);
     vec![
-        "desktui".to_string(),
-        String::new(),
-        format!("{p} then:"),
-        "  q          quit".to_string(),
-        "  f          request a full screen refresh".to_string(),
-        "  r          renegotiate the remote size".to_string(),
-        "  n s i 1    native / fit / integer / 1:1 scaling".to_string(),
-        "  arrows     pan, when the view is cropped".to_string(),
-        "  v          toggle view-only".to_string(),
-        "  c          toggle statistics".to_string(),
-        "  h ?        this help".to_string(),
-        format!(
-            "  Ctrl+{}     send a literal Ctrl+{}",
-            prefix.to_ascii_uppercase(),
-            prefix.to_ascii_uppercase()
-        ),
-        String::new(),
-        "any other key dismisses this".to_string(),
+        Row::Title("Commands".into(), "any key".into()),
+        Row::Blank,
+        Row::Section("Session".into()),
+        item("Quit", format!("{p} q")),
+        item("Send the prefix through", format!("{p} {p}")),
+        Row::Blank,
+        Row::Section("Screen".into()),
+        item("Refresh in full", format!("{p} f")),
+        item("Renegotiate the remote size", format!("{p} r")),
+        item("Pan, when the view is cropped", format!("{p} arrows")),
+        Row::Blank,
+        Row::Section("Scaling".into()),
+        item("Native", format!("{p} n")),
+        item("Fit", format!("{p} s")),
+        item("Integer", format!("{p} i")),
+        item("One to one", format!("{p} 1")),
+        Row::Blank,
+        Row::Section("View".into()),
+        item("Toggle view-only", format!("{p} v")),
+        item("Toggle statistics", format!("{p} c")),
+        item("This help", format!("{p} h")),
     ]
 }
 
 /// Where the overlay goes: one-based `(row, col, width, height)`, or `None` when
 /// the image area is too small to hold it.
-fn help_box(metrics: &Metrics, lines: &[String]) -> Option<(usize, usize, usize, usize)> {
-    let inner = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let box_w = inner + 4;
-    let box_h = lines.len() + 2;
+fn help_box(metrics: &Metrics, rows: &[Row]) -> Option<(usize, usize, usize, usize)> {
+    let inner = rows.iter().map(Row::width).max().unwrap_or(0);
+    let box_w = inner + PAD_X * 2;
+    let box_h = rows.len() + PAD_Y * 2;
     if box_w > usize::from(metrics.cols) || box_h > usize::from(metrics.image_rows()) {
         return None;
     }
@@ -96,50 +139,69 @@ fn help_box(metrics: &Metrics, lines: &[String]) -> Option<(usize, usize, usize,
     Some((row, col, box_w, box_h))
 }
 
+fn blanks(out: &mut Vec<u8>, n: usize) {
+    out.extend(std::iter::repeat_n(b' ', n));
+}
+
+/// Lay one row out across `inner` columns.
+fn draw_row(out: &mut Vec<u8>, row: &Row, inner: usize) {
+    match row {
+        Row::Blank => blanks(out, inner),
+        Row::Section(text) => {
+            out.extend_from_slice(INK_SECTION.as_bytes());
+            out.extend_from_slice(text.as_bytes());
+            blanks(out, inner.saturating_sub(text.chars().count()));
+        }
+        Row::Title(left, right) => split_row(out, left, right, inner, INK_TITLE),
+        Row::Item(left, right) => split_row(out, left, right, inner, INK_LABEL),
+    }
+}
+
+/// A label on the left, its keys pushed against the right edge, blanks between.
+fn split_row(out: &mut Vec<u8>, left: &str, right: &str, inner: usize, ink: &str) {
+    out.extend_from_slice(ink.as_bytes());
+    out.extend_from_slice(left.as_bytes());
+    let used = left.chars().count() + right.chars().count();
+    blanks(out, inner.saturating_sub(used));
+    if !right.is_empty() {
+        out.extend_from_slice(INK_MUTED.as_bytes());
+        out.extend_from_slice(right.as_bytes());
+    }
+}
+
 /// Draw the help overlay, centred, listing the prefix-key commands.
+///
+/// No border: the box is held off the remote screen by its padding and its own
+/// backdrop, which is a good deal quieter than a rule around the outside.
 pub fn draw_help(out: &mut Vec<u8>, metrics: &Metrics, prefix: char) {
-    let lines = help_lines(prefix);
-    let Some((row, col, box_w, box_h)) = help_box(metrics, &lines) else {
+    let rows = help_rows(prefix);
+    let Some((row0, col0, box_w, box_h)) = help_box(metrics, &rows) else {
         return;
     };
-    let inner = box_w - 4;
+    let inner = box_w - PAD_X * 2;
 
     // The backdrop first, then the text on top of it. It goes out after the tiles
     // for the same frame, which is what puts it above them.
     kitty::place_solid(
         out,
         kitty::OVERLAY_IMAGE_ID,
-        col,
-        row,
+        col0,
+        row0,
         box_w,
         box_h,
         HELP_BACKDROP,
     );
 
     out.extend_from_slice(HELP_SGR.as_bytes());
-    let _ = write!(out, "\x1b[{row};{col}H");
-    out.extend_from_slice("┌".as_bytes());
-    for _ in 0..box_w - 2 {
-        out.extend_from_slice("─".as_bytes());
-    }
-    out.extend_from_slice("┐".as_bytes());
-
-    for (i, line) in lines.iter().enumerate() {
-        let _ = write!(out, "\x1b[{};{}H", row + 1 + i, col);
-        out.extend_from_slice("│ ".as_bytes());
-        out.extend_from_slice(line.as_bytes());
-        for _ in line.chars().count()..inner {
-            out.push(b' ');
+    for i in 0..box_h {
+        let _ = write!(out, "\x1b[{};{}H", row0 + i, col0);
+        blanks(out, PAD_X);
+        match i.checked_sub(PAD_Y).and_then(|r| rows.get(r)) {
+            Some(row) => draw_row(out, row, inner),
+            None => blanks(out, inner),
         }
-        out.extend_from_slice(" │".as_bytes());
+        blanks(out, PAD_X);
     }
-
-    let _ = write!(out, "\x1b[{};{}H", row + box_h - 1, col);
-    out.extend_from_slice("└".as_bytes());
-    for _ in 0..box_w - 2 {
-        out.extend_from_slice("─".as_bytes());
-    }
-    out.extend_from_slice("┘".as_bytes());
     let _ = write!(out, "\x1b[0m");
 }
 
@@ -151,8 +213,8 @@ pub fn draw_help(out: &mut Vec<u8>, metrics: &Metrics, prefix: char) {
 /// on top of them for ever. The cells go back to default attributes, which is what
 /// makes them transparent to the tiles again.
 pub fn clear_help(out: &mut Vec<u8>, metrics: &Metrics, prefix: char) {
-    let lines = help_lines(prefix);
-    let Some((row, col, box_w, box_h)) = help_box(metrics, &lines) else {
+    let rows = help_rows(prefix);
+    let Some((row, col, box_w, box_h)) = help_box(metrics, &rows) else {
         return;
     };
 
@@ -254,7 +316,90 @@ mod tests {
         );
         // The backdrop goes down before the text that sits on it.
         let backdrop = text.find("\x1b_Ga=T").expect("no backdrop");
-        assert!(backdrop < text.find('┌').expect("no border"));
+        assert!(backdrop < text.find("Commands").expect("no title"));
+    }
+
+    /// The overlay as it lands on screen: one string per positioned row, with the
+    /// escapes and the backdrop payload taken out.
+    fn rendered(buf: &[u8]) -> Vec<String> {
+        let text = String::from_utf8(buf.to_vec()).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => match chars.next() {
+                    // CSI: parameters then a letter. `H` starts a fresh row.
+                    Some('[') => {
+                        for c in chars.by_ref() {
+                            if c.is_ascii_alphabetic() {
+                                if c == 'H' {
+                                    lines.push(String::new());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // APC: the backdrop image, terminated by ESC backslash.
+                    Some('_') => {
+                        while let Some(c) = chars.next() {
+                            if c == '\x1b' {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                c => {
+                    if let Some(line) = lines.last_mut() {
+                        line.push(c);
+                    }
+                }
+            }
+        }
+        while lines.first().is_some_and(String::is_empty) {
+            lines.remove(0);
+        }
+        lines
+    }
+
+    #[test]
+    fn help_overlay_is_padded_and_right_aligns_its_shortcuts() {
+        let m = metrics(100, 40);
+        let mut out = Vec::new();
+        draw_help(&mut out, &m, 'a');
+        let lines = rendered(&out);
+
+        assert!(!lines.is_empty(), "nothing was drawn");
+        let width = lines[0].chars().count();
+        assert!(
+            lines.iter().all(|l| l.chars().count() == width),
+            "every row must fill the box, or the backdrop shows through the gaps"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains(['┌', '─', '│', '└'])),
+            "the box is borderless"
+        );
+        // Padded top and bottom, and held off both edges.
+        assert!(lines[0].trim().is_empty(), "no padding above");
+        assert!(lines[lines.len() - 1].trim().is_empty(), "no padding below");
+        for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+            let left = line.len() - line.trim_start().len();
+            let right = line.len() - line.trim_end().len();
+            assert!(left >= PAD_X, "row is not indented: {line:?}");
+            assert!(right >= PAD_X, "row runs into the right edge: {line:?}");
+        }
+        // Every shortcut ends in the same column.
+        let ends: Vec<usize> = lines
+            .iter()
+            .filter(|l| l.contains("ctrl+a"))
+            .map(|l| l.trim_end().chars().count())
+            .collect();
+        assert!(ends.len() > 5, "expected the shortcut list");
+        assert!(
+            ends.iter().all(|e| *e == ends[0]),
+            "shortcuts are not flush right: {ends:?}"
+        );
     }
 
     /// The rows and columns a buffer moved the cursor to, in order.
@@ -327,7 +472,9 @@ mod tests {
 
     #[test]
     fn help_overlay_never_touches_the_status_row() {
-        let m = metrics(100, 20);
+        // Big enough that the overlay actually draws: at 20 rows it does not fit and
+        // the check below would pass by having nothing to look at.
+        let m = metrics(100, 40);
         let mut out = Vec::new();
         draw_help(&mut out, &m, 'a');
         let text = String::from_utf8(out).unwrap();
