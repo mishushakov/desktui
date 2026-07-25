@@ -56,9 +56,6 @@ pub enum Command {
     Pan(i32, i32),
     ToggleViewOnly,
     ToggleStats,
-    /// Hand input back to the local machine, or take it again: the TigerVNC ungrab,
-    /// covering the pointer and the clipboard as well as the keyboard.
-    ToggleGrab,
     Help,
     /// The prefix was pressed twice: send it through to the server.
     SendPrefix,
@@ -98,12 +95,6 @@ pub struct InputMapper {
     /// Modifier state we have synthesised, for terminals that only report a
     /// bitmask.
     synthesised: KeyModifiers,
-    /// Modifier keys the terminal says are down, for the release chord. Only ever
-    /// populated when the keyboard protocol reports modifiers in their own right.
-    chord: KeyModifiers,
-    /// Something other than a modifier was pressed while the chord was held, so it
-    /// was a shortcut meant for the server and not a request to let go.
-    chord_spoiled: bool,
     /// Pointer buttons currently down.
     buttons: u8,
     /// Last position sent, to drop duplicate motion.
@@ -123,8 +114,6 @@ impl InputMapper {
             armed: false,
             held: HashSet::new(),
             synthesised: KeyModifiers::NONE,
-            chord: KeyModifiers::NONE,
-            chord_spoiled: false,
             buttons: 0,
             last_position: None,
             last_motion: None,
@@ -153,22 +142,6 @@ impl InputMapper {
         self.armed
     }
 
-    /// The chord that hands the keyboard back, as TigerVNC spells it.
-    fn release_chord() -> KeyModifiers {
-        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
-    }
-
-    /// Which modifier a modifier key stands for, left and right alike.
-    fn modifier_flag(m: crossterm::event::ModifierKeyCode) -> Option<KeyModifiers> {
-        use crossterm::event::ModifierKeyCode as M;
-        Some(match m {
-            M::LeftShift | M::RightShift => KeyModifiers::SHIFT,
-            M::LeftControl | M::RightControl => KeyModifiers::CONTROL,
-            M::LeftAlt | M::RightAlt => KeyModifiers::ALT,
-            _ => return None,
-        })
-    }
-
     /// Is this the prefix key itself?
     fn is_prefix(&self, ev: &KeyEvent) -> bool {
         matches!(ev.code, KeyCode::Char(c)
@@ -176,54 +149,7 @@ impl InputMapper {
                 && ev.modifiers.contains(KeyModifiers::CONTROL))
     }
 
-    /// Track the release chord, and say whether this event completed it.
-    ///
-    /// It fires when the last of the three modifiers is *let go*, not when it goes
-    /// down. Pressing them is how a great many remote shortcuts start, and firing on
-    /// the way down would eat every one of them; a chord that was followed by a real
-    /// key is a shortcut, and is spoiled rather than acted on.
-    ///
-    /// A terminal that does not report modifier keys in their own right never gets
-    /// here, so it never sees the chord at all.
-    fn track_chord(&mut self, ev: &KeyEvent) -> bool {
-        let KeyCode::Modifier(m) = ev.code else {
-            // Anything else pressed while modifiers are held means they were the
-            // start of a shortcut for the server.
-            if ev.kind == KeyEventKind::Press && !self.chord.is_empty() {
-                self.chord_spoiled = true;
-            }
-            return false;
-        };
-        let Some(flag) = Self::modifier_flag(m) else {
-            return false;
-        };
-
-        match ev.kind {
-            KeyEventKind::Press | KeyEventKind::Repeat => {
-                self.chord.insert(flag);
-                false
-            }
-            KeyEventKind::Release => {
-                let was_complete = self.chord.contains(Self::release_chord());
-                self.chord.remove(flag);
-                let fired = was_complete && !self.chord_spoiled;
-                if fired {
-                    // The other two are still down; do not fire again for them.
-                    self.chord_spoiled = true;
-                }
-                if self.chord.is_empty() {
-                    self.chord_spoiled = false;
-                }
-                fired
-            }
-        }
-    }
-
     pub fn on_key(&mut self, ev: KeyEvent) -> KeyOutcome {
-        if self.track_chord(&ev) {
-            return KeyOutcome::Local(Command::ToggleGrab);
-        }
-
         // While the prefix is armed, nothing reaches the server: the next press
         // is a command, and any release in between belongs to the prefix chord.
         if self.armed {
@@ -547,107 +473,6 @@ mod tests {
 
     fn ctrl(c: char, kind: KeyEventKind) -> KeyEvent {
         key(KeyCode::Char(c), kind, KeyModifiers::CONTROL)
-    }
-
-    /// A modifier key going down or coming up.
-    fn modkey(m: crossterm::event::ModifierKeyCode, kind: KeyEventKind) -> KeyEvent {
-        key(KeyCode::Modifier(m), kind, KeyModifiers::NONE)
-    }
-
-    /// Ctrl, Alt and Shift pressed in that order, all still held.
-    fn hold_chord(mapper: &mut InputMapper) {
-        use crossterm::event::ModifierKeyCode as M;
-        for m in [M::LeftControl, M::LeftAlt, M::LeftShift] {
-            mapper.on_key(modkey(m, KeyEventKind::Press));
-        }
-    }
-
-    #[test]
-    fn the_release_chord_fires_when_the_modifiers_are_let_go() {
-        use crossterm::event::ModifierKeyCode as M;
-        let mut mapper = InputMapper::new('a', true, true);
-        hold_chord(&mut mapper);
-
-        // Nothing yet: holding them is how half the shortcuts on a desktop start.
-        assert_eq!(
-            mapper.on_key(modkey(M::LeftShift, KeyEventKind::Release)),
-            KeyOutcome::Local(Command::ToggleGrab),
-            "letting the chord go is what hands the keyboard back"
-        );
-        // The other two coming up must not fire it a second time.
-        for m in [M::LeftAlt, M::LeftControl] {
-            assert!(
-                !matches!(
-                    mapper.on_key(modkey(m, KeyEventKind::Release)),
-                    KeyOutcome::Local(Command::ToggleGrab)
-                ),
-                "the chord fired twice for one press of it"
-            );
-        }
-    }
-
-    #[test]
-    fn a_shortcut_built_on_the_chord_still_reaches_the_server() {
-        // Ctrl+Alt+Shift+T is a shortcut on plenty of desktops. Firing on the way
-        // down would eat every one of them, so a real key spoils the chord.
-        use crossterm::event::ModifierKeyCode as M;
-        let mut mapper = InputMapper::new('a', true, true);
-        hold_chord(&mut mapper);
-
-        let outcome = mapper.on_key(key(
-            KeyCode::Char('t'),
-            KeyEventKind::Press,
-            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ));
-        assert!(
-            matches!(outcome, KeyOutcome::Keys(_)),
-            "the key must go through, not be swallowed"
-        );
-        for m in [M::LeftShift, M::LeftAlt, M::LeftControl] {
-            assert!(
-                !matches!(
-                    mapper.on_key(modkey(m, KeyEventKind::Release)),
-                    KeyOutcome::Local(Command::ToggleGrab)
-                ),
-                "a chord that was used as a shortcut must not also release"
-            );
-        }
-    }
-
-    #[test]
-    fn two_modifiers_are_not_the_chord() {
-        use crossterm::event::ModifierKeyCode as M;
-        let mut mapper = InputMapper::new('a', true, true);
-        for m in [M::LeftControl, M::LeftShift] {
-            mapper.on_key(modkey(m, KeyEventKind::Press));
-        }
-        for m in [M::LeftShift, M::LeftControl] {
-            assert!(
-                !matches!(
-                    mapper.on_key(modkey(m, KeyEventKind::Release)),
-                    KeyOutcome::Local(Command::ToggleGrab)
-                ),
-                "Ctrl+Shift alone must not hand the keyboard back"
-            );
-        }
-    }
-
-    #[test]
-    fn the_chord_can_be_used_again_after_it_is_spoiled() {
-        use crossterm::event::ModifierKeyCode as M;
-        let mut mapper = InputMapper::new('a', true, true);
-        hold_chord(&mut mapper);
-        mapper.on_key(press(KeyCode::Char('t')));
-        for m in [M::LeftShift, M::LeftAlt, M::LeftControl] {
-            mapper.on_key(modkey(m, KeyEventKind::Release));
-        }
-
-        // Everything is up again, so the next chord starts clean.
-        hold_chord(&mut mapper);
-        assert_eq!(
-            mapper.on_key(modkey(M::LeftShift, KeyEventKind::Release)),
-            KeyOutcome::Local(Command::ToggleGrab)
-        );
     }
 
     fn metrics() -> Metrics {

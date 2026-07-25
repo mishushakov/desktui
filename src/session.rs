@@ -321,10 +321,6 @@ struct Session {
     remote_num_lock: Option<bool>,
 
     view_only: bool,
-    /// Input has been handed back: nothing the keyboard, pointer or clipboard
-    /// produces reaches the remote until it is taken again. The drawn cursor still
-    /// follows the hand, as it does under view-only: it is a local overlay.
-    input_released: bool,
     no_clipboard: bool,
     show_help: bool,
     /// The overlay was dismissed and its cells still have to be blanked. Drawing
@@ -384,7 +380,6 @@ impl Session {
             remote_caps_lock: None,
             remote_num_lock: None,
             view_only: args.view_only,
-            input_released: false,
             no_clipboard: args.no_clipboard,
             show_help: false,
             clear_help: false,
@@ -771,7 +766,7 @@ impl Session {
                 match self.input.on_key(key) {
                     KeyOutcome::Ignored => {}
                     KeyOutcome::Keys(keys) => {
-                        if !self.view_only && !self.input_released {
+                        if !self.view_only {
                             // Before the keystroke, not after: the whole point is that the
                             // remote interprets *this* key with the right lock state.
                             self.sync_lock_keys(locks).await?;
@@ -791,7 +786,7 @@ impl Session {
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
 
-                if !self.view_only && !self.input_released {
+                if !self.view_only {
                     let events = {
                         let layout = *self.renderer.layout();
                         self.input.on_mouse(mouse, &layout, &self.metrics)
@@ -802,7 +797,7 @@ impl Session {
                 }
             }
             Event::Paste(text) => {
-                if !self.view_only && !self.input_released && !self.no_clipboard {
+                if !self.view_only && !self.no_clipboard {
                     // RFB clipboard traffic is Latin-1 only. Substitute rather than
                     // drop: deleting characters silently shortens the text and moves
                     // everything after them, where a question mark leaves the shape
@@ -902,21 +897,6 @@ impl Session {
                         "view-only"
                     } else {
                         "input enabled"
-                    }
-                    .into(),
-                );
-            }
-            Command::ToggleGrab => {
-                self.input_released = !self.input_released;
-                // Either way, let go of whatever the remote thinks is down. Handing
-                // the keyboard back with a modifier still held would leave it held
-                // there for as long as the session lasts.
-                self.release_input().await;
-                self.set_note(
-                    if self.input_released {
-                        "input released -- ctrl+alt+shift to take it back"
-                    } else {
-                        "input taken back"
                     }
                     .into(),
                 );
@@ -1191,11 +1171,6 @@ impl Session {
         left.push_str(&format!("  {}", describe(&layout)));
         if self.view_only {
             left.push_str("  view-only");
-        }
-        // Worth saying loudly: without it, a released keyboard is indistinguishable
-        // from a session that has stopped responding.
-        if self.input_released {
-            left.push_str("  INPUT RELEASED");
         }
         if self.input.is_armed() {
             left.push_str("  PREFIX");
