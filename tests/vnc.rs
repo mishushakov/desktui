@@ -83,10 +83,7 @@ fn negotiates_the_terminals_exact_pixel_size() {
         "status line does not show the negotiated size: {}",
         show(&term.output())
     );
-    assert!(
-        contains(&term.output(), b"\x1b_Ga=T"),
-        "nothing was drawn"
-    );
+    assert!(contains(&term.output(), b"\x1b_Ga=T"), "nothing was drawn");
 
     quit(&mut term);
     let status = term.wait(Duration::from_secs(10)).expect("did not exit");
@@ -454,7 +451,11 @@ fn view_only_sends_nothing() {
             Request::Key { .. } | Request::Pointer { .. } | Request::CutText(_)
         )
     });
-    assert!(!sent_input, "view-only forwarded input: {:?}", server.requests());
+    assert!(
+        !sent_input,
+        "view-only forwarded input: {:?}",
+        server.requests()
+    );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
@@ -468,7 +469,9 @@ fn a_pasted_selection_goes_to_the_remote_clipboard() {
     // Bracketed paste, as a terminal delivers it.
     term.send(b"\x1b[200~hello there\x1b[201~");
     let cut = server
-        .wait_for(Duration::from_secs(10), |r| matches!(r, Request::CutText(_)))
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::CutText(_))
+        })
         .expect("the paste never reached the server");
     match cut {
         Request::CutText(text) => assert_eq!(text, "hello there"),
@@ -489,7 +492,9 @@ fn a_paste_outside_latin1_is_substituted_not_silently_shortened() {
 
     term.send("\x1b[200~caf\u{e9} \u{2615} tea\x1b[201~".as_bytes());
     let cut = server
-        .wait_for(Duration::from_secs(10), |r| matches!(r, Request::CutText(_)))
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::CutText(_))
+        })
         .expect("the paste never reached the server");
     match cut {
         Request::CutText(text) => {
@@ -646,7 +651,11 @@ fn view_only_does_not_reshape_the_remote_desktop() {
         server.requests()
     );
     // And it still draws, at the size the server chose.
-    assert!(contains(&term.output(), b"1024x768"), "{}", show(&term.output()));
+    assert!(
+        contains(&term.output(), b"1024x768"),
+        "{}",
+        show(&term.output())
+    );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
@@ -727,7 +736,11 @@ fn continuous_updates_are_enabled_and_stop_the_request_traffic() {
         .expect("continuous updates were never enabled");
     match enabled {
         Request::EnableContinuousUpdates { width, height, .. } => {
-            assert_eq!((width, height), (800, 600), "should cover the whole framebuffer");
+            assert_eq!(
+                (width, height),
+                (800, 600),
+                "should cover the whole framebuffer"
+            );
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -769,7 +782,9 @@ fn a_server_fence_is_echoed_with_the_request_bit_cleared() {
     let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
 
     let echoed = server
-        .wait_for(Duration::from_secs(10), |r| matches!(r, Request::Fence { .. }))
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::Fence { .. })
+        })
         .expect("the fence was never answered");
     match echoed {
         Request::Fence { flags, payload } => {
@@ -1060,6 +1075,149 @@ fn no_fence_support_means_no_round_trip_figure_rather_than_a_wrong_one() {
         contains(&out, b"--"),
         "the status line should say the round trip is unknown: {}",
         show(&out)
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_resize_goes_out_while_the_server_is_idle() {
+    // Nothing but the render tick drives a debounced resize, so it has to complete
+    // without help. With frames pushed rather than requested there is no traffic at all
+    // from an idle desktop, and a loop that only makes progress when something arrives
+    // would sit there until the user happened to move the mouse.
+    let ext = Extensions {
+        continuous_updates: true,
+        ..Extensions::default()
+    };
+    let server = FakeServer::start_with(1024, 768, Resize::Accept, ext);
+    let addr = server.addr.to_string();
+    let mut term = FakeTerm::spawn(
+        100,
+        25,
+        800,
+        425,
+        &[&addr, "--fps", "20", "--scale", "native"],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(
+        term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)),
+        "never drew anything: {}",
+        show(&term.output())
+    );
+
+    // Let the session settle so the server has stopped saying anything.
+    std::thread::sleep(Duration::from_secs(1));
+    let before = server.requests().len();
+
+    // Resize, then touch nothing whatsoever.
+    term.resize(200, 50, 1600, 850);
+
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::SetDesktopSize {
+                    width: 1600,
+                    height: 832,
+                    ..
+                }
+            ))
+            .is_some(),
+        "the resize never went out without input to prod it; requests since the resize: \
+         {:?}",
+        &server.requests()[before.min(server.requests().len())..]
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_single_resize_is_acted_on_at_once() {
+    // A lone resize should not sit out the debounce: the delay is there to coalesce a
+    // drag, and making a single one wait made the window look like it had not taken.
+    let (server, mut term) = start(Resize::Accept, (1024, 768));
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::SetDesktopSize { .. }
+            ))
+            .is_some(),
+        "no initial negotiation"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+
+    let at = std::time::Instant::now();
+    term.resize(100, 25, 800, 425);
+    assert!(
+        server
+            .wait_for(Duration::from_secs(5), |r| matches!(
+                r,
+                Request::SetDesktopSize {
+                    width: 800,
+                    height: 408,
+                    ..
+                }
+            ))
+            .is_some(),
+        "the resize never went out: {:?}",
+        server.requests()
+    );
+    let took = at.elapsed();
+    assert!(
+        took < Duration::from_millis(250),
+        "a single resize waited {took:?} for the debounce it does not need"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_drag_is_still_coalesced_into_a_few_requests() {
+    // The flip side: acting at once must not turn a drag into one request per frame.
+    let (server, mut term) = start(Resize::Accept, (1024, 768));
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::SetDesktopSize { .. }
+            ))
+            .is_some(),
+        "no initial negotiation"
+    );
+    let before = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::SetDesktopSize { .. }))
+        .count();
+
+    // Twenty size changes in under a second, as dragging an edge produces.
+    for step in 1..=20u16 {
+        let cols = 100 + step;
+        term.resize(cols, 25, cols * 8, 425);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    let asks = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::SetDesktopSize { .. }))
+        .count()
+        - before;
+    assert!(
+        asks <= 6,
+        "a drag should coalesce into a handful of requests, not one per step: saw {asks}"
+    );
+    // And the last size still has to be the one it settles on.
+    assert!(
+        term.wait_for(b"960x408", Duration::from_secs(10)),
+        "did not settle on the final size: {}",
+        show(&term.output())
     );
 
     quit(&mut term);

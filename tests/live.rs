@@ -547,6 +547,125 @@ fn a_real_server_answers_the_latency_probe() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn an_idle_resize_completes_without_any_input() {
+    // Reported symptom: a resize sometimes only takes effect once the mouse is moved.
+    // Nothing but the render tick should be needed, so this resizes and then touches
+    // nothing at all, timing how long the new size takes to appear.
+    let log = std::env::temp_dir().join("vnctui-idle-resize.log");
+    let _ = std::fs::remove_file(&log);
+
+    let addr = server();
+    let mut term = FakeTerm::spawn_with_env(
+        100,
+        25,
+        800,
+        425,
+        &[
+            addr.as_str(),
+            "--fps",
+            "20",
+            "--scale",
+            "native",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(
+        term.wait_for(b"800x408", Duration::from_secs(30)),
+        "never reached the first size: {}",
+        tail(&term.output())
+    );
+    // Let everything settle, so the desktop is genuinely idle.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let at = std::time::Instant::now();
+    term.resize(200, 50, 1600, 850);
+    let arrived = term.wait_for(b"1600x832", Duration::from_secs(20));
+    let took = at.elapsed();
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        arrived,
+        "the resize never completed with no input to prod it. Log:\n{logged}"
+    );
+    // The debounce is 250ms, so anything past a couple of seconds means it was waiting
+    // for something rather than driving itself.
+    assert!(
+        took < Duration::from_secs(3),
+        "the resize took {took:?}, which means something had to wake it. Log:\n{logged}"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn a_dragged_resize_settles_without_any_input() {
+    // Closer to how a window is actually resized: dozens of size changes in a second as
+    // the edge is dragged, then nothing. The last one has to settle on its own.
+    let log = std::env::temp_dir().join("vnctui-drag-resize.log");
+    let _ = std::fs::remove_file(&log);
+
+    let addr = server();
+    let mut term = FakeTerm::spawn_with_env(
+        100,
+        25,
+        800,
+        425,
+        &[
+            addr.as_str(),
+            "--fps",
+            "20",
+            "--scale",
+            "native",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(term.wait_for(b"800x408", Duration::from_secs(30)));
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Drag: grow a few cells at a time, as a window manager would report it.
+    for step in 1..=20u16 {
+        let cols = 100 + step * 5;
+        let rows = 25 + step;
+        term.resize(cols, rows, cols * 8, rows * 17);
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    // Released. From here on nothing is touched at all.
+    let at = std::time::Instant::now();
+    let (cols, rows) = (200u16, 45u16);
+    let expected = format!("{}x{}", cols as u32 * 8, (rows as u32 - 1) * 17);
+    let arrived = term.wait_for(expected.as_bytes(), Duration::from_secs(20));
+    let took = at.elapsed();
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    let applied = logged.matches("applying resize").count();
+    assert!(
+        arrived,
+        "the dragged resize never settled on {expected} with no input. Applied {applied} \
+         times. Log tail:\n{}",
+        logged.lines().rev().take(25).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        took < Duration::from_secs(4),
+        "settling took {took:?} after the drag stopped, so something had to wake it"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+    let _ = std::fs::remove_file(&log);
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 fn tail(buf: &[u8]) -> String {

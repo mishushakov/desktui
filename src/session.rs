@@ -330,6 +330,9 @@ struct Session {
     last_stats: FrameStats,
     dropped: u64,
     pending_metrics: Option<Instant>,
+    /// When a resize was last acted on, so the first one after a quiet spell can be
+    /// acted on at once rather than waiting out the debounce.
+    metrics_applied_at: Option<Instant>,
     quit: bool,
 }
 
@@ -382,6 +385,7 @@ impl Session {
             last_stats: FrameStats::default(),
             dropped: 0,
             pending_metrics: None,
+            metrics_applied_at: None,
             quit: false,
         })
     }
@@ -497,7 +501,10 @@ impl Session {
                 self.enable_continuous_updates().await?;
             }
             VncEvent::Fence { flags, payload } => {
-                tracing::debug!("fence from server, flags {flags:#x}, {} bytes", payload.len());
+                tracing::debug!(
+                    "fence from server, flags {flags:#x}, {} bytes",
+                    payload.len()
+                );
                 // A fence at all means the server understands them, which is what makes
                 // the latency probe possible.
                 self.fence_supported = true;
@@ -506,8 +513,8 @@ impl Session {
                 // order and are handled one at a time, which is what BlockBefore and
                 // BlockAfter ask for, so echoing is all there is to do.
                 if flags & crate::rfb::fence::REQUEST != 0 {
-                    let echo = flags
-                        & (crate::rfb::fence::BLOCK_BEFORE | crate::rfb::fence::BLOCK_AFTER);
+                    let echo =
+                        flags & (crate::rfb::fence::BLOCK_BEFORE | crate::rfb::fence::BLOCK_AFTER);
                     self.send(X11Event::Fence {
                         flags: echo,
                         payload,
@@ -570,8 +577,7 @@ impl Session {
         }
         tracing::info!("remote framebuffer is now {}x{}", size.0, size.1);
         self.remote = size;
-        self.fb
-            .resize(u32::from(size.0), u32::from(size.1));
+        self.fb.resize(u32::from(size.0), u32::from(size.1));
         self.pan = (0, 0);
         self.relayout();
         if let Some(note) = note {
@@ -731,7 +737,8 @@ impl Session {
             let (area_w, area_h) = self.metrics.image_area();
             // A desktop that already fits needs no scaling at all; only a larger
             // one has to be resampled.
-            self.mode = if u32::from(self.remote.0) <= area_w && u32::from(self.remote.1) <= area_h {
+            self.mode = if u32::from(self.remote.0) <= area_w && u32::from(self.remote.1) <= area_h
+            {
                 ScaleMode::OneToOne
             } else {
                 ScaleMode::Fit
@@ -745,18 +752,18 @@ impl Session {
             Event::Key(key) => {
                 let locks = self.input.lock_state(&key);
                 match self.input.on_key(key) {
-                KeyOutcome::Ignored => {}
-                KeyOutcome::Keys(keys) => {
-                    if !self.view_only {
-                        // Before the keystroke, not after: the whole point is that the
-                        // remote interprets *this* key with the right lock state.
-                        self.sync_lock_keys(locks).await?;
-                        for key in keys {
-                            self.send(X11Event::KeyEvent(key)).await?;
+                    KeyOutcome::Ignored => {}
+                    KeyOutcome::Keys(keys) => {
+                        if !self.view_only {
+                            // Before the keystroke, not after: the whole point is that the
+                            // remote interprets *this* key with the right lock state.
+                            self.sync_lock_keys(locks).await?;
+                            for key in keys {
+                                self.send(X11Event::KeyEvent(key)).await?;
+                            }
                         }
                     }
-                }
-                KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
+                    KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
                 }
             }
             Event::Mouse(mouse) => {
@@ -796,8 +803,9 @@ impl Session {
                     });
                 }
             }
-            Event::Resize(..) => {
+            Event::Resize(cols, rows) => {
                 // Coalesce: a window drag produces a stream of these.
+                tracing::debug!("resize event: {cols}x{rows} cells");
                 self.pending_metrics = Some(Instant::now());
             }
             Event::FocusLost => {
@@ -890,17 +898,34 @@ impl Session {
     async fn on_tick(&mut self) -> Result<()> {
         // A resize has settled: adopt the new geometry, and ask the server to
         // match it if it is willing to.
+        // Leading edge, then trailing: the first resize after a quiet spell is acted on
+        // at once, and only a continuing stream of them is held back. Waiting out the
+        // debounce for a single resize makes the window feel like it did not take, which
+        // is the whole reason the delay was noticeable.
+        let quiet_before = self
+            .metrics_applied_at
+            .is_none_or(|last| last.elapsed() >= RESIZE_DEBOUNCE);
         if let Some(at) = self.pending_metrics
-            && at.elapsed() >= RESIZE_DEBOUNCE {
-                self.pending_metrics = None;
-                self.metrics = Metrics::query()?;
-                self.relayout();
-                if self.mode == ScaleMode::Native
-                    || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
-                {
-                    self.request_native_size(false).await?;
-                }
+            && (quiet_before || at.elapsed() >= RESIZE_DEBOUNCE)
+        {
+            self.pending_metrics = None;
+            self.metrics_applied_at = Some(Instant::now());
+            self.metrics = Metrics::query()?;
+            tracing::debug!(
+                "applying resize after {:?}: {}x{} cells, {}x{} px",
+                at.elapsed(),
+                self.metrics.cols,
+                self.metrics.rows,
+                self.metrics.px_w,
+                self.metrics.px_h
+            );
+            self.relayout();
+            if self.mode == ScaleMode::Native
+                || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
+            {
+                self.request_native_size(false).await?;
             }
+        }
 
         // With frames arriving unbidden there is no request to time, so ask the server
         // to bounce a fence back and measure that instead.
@@ -908,9 +933,10 @@ impl Session {
 
         // A pointer that stopped moving mid-rate-limit still has to arrive.
         if !self.view_only
-            && let Some(pointer) = self.input.flush_motion() {
-                self.send(X11Event::PointerEvent(pointer)).await?;
-            }
+            && let Some(pointer) = self.input.flush_motion()
+        {
+            self.send(X11Event::PointerEvent(pointer)).await?;
+        }
 
         // Normally the request went out the moment the last update finished, so
         // this only covers the gaps: the very first frame, and a server that has
@@ -1227,9 +1253,7 @@ fn decode_jpeg(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         .decode()
         .map_err(|err| anyhow::anyhow!("{err:?}"))
         .context("JPEG decode failed")?;
-    let info = decoder
-        .info()
-        .context("JPEG carried no dimensions")?;
+    let info = decoder.info().context("JPEG carried no dimensions")?;
     let (w, h) = (u32::from(info.width), u32::from(info.height));
     anyhow::ensure!(
         pixels.len() >= (w as usize) * (h as usize) * 3,
@@ -1245,7 +1269,12 @@ mod tests {
 
     #[test]
     fn an_unsupported_or_refused_resize_explains_itself() {
-        assert!(Resize::Unsupported.note().unwrap().contains("cannot resize"));
+        assert!(
+            Resize::Unsupported
+                .note()
+                .unwrap()
+                .contains("cannot resize")
+        );
         let refused = Resize::Refused(ResizeStatus::Prohibited);
         assert!(refused.note().unwrap().contains("prohibited"));
         // States that are not a dead end say nothing.
