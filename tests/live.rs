@@ -245,6 +245,119 @@ fn one_client_adopts_a_resize_another_client_asked_for() {
     watcher.wait(Duration::from_secs(15));
 }
 
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn the_desktop_is_redrawn_in_full_after_a_resize() {
+    // The second half of the resize glitch: the framebuffer was cleared to black on
+    // a size change, and the server only sends what it thinks changed -- so whatever
+    // it considered unchanged stayed black. Answering the resize with a
+    // non-incremental request is forbidden, so the overlap has to be kept instead.
+    let mut term = start(&["--scale", "native"]);
+    assert!(
+        term.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(30)),
+        "never reached the first size: {}",
+        tail(&term.output())
+    );
+    // Let the first screenful settle.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let before = count(&term.output(), b"\x1b_Ga=T");
+    term.resize(100, 25, 800, 425);
+    assert!(
+        term.wait_for(b"800x408", Duration::from_secs(30)),
+        "the desktop did not follow: {}",
+        tail(&term.output())
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    let after = count(&term.output(), b"\x1b_Ga=T");
+
+    // A full redraw at 800x408 is 7x4 = 28 tiles of 128x136. Comfortably more than a
+    // handful, which is what a partial repaint would produce.
+    let drawn = after - before;
+    assert!(
+        drawn >= 20,
+        "expected the whole screen to be redrawn after the resize, saw {drawn} tiles"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+}
+
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn a_real_server_negotiates_continuous_updates() {
+    // TigerVNC implements the extension, so this is the one test that proves the
+    // negotiation works against something that was not written to agree with us.
+    let mut term = start(&["--scale", "native", "--log-file", "/tmp/vnctui-live.log"]);
+    assert!(
+        term.wait_for(b"continuous updates", Duration::from_secs(30)),
+        "the server never enabled continuous updates: {}",
+        tail(&term.output())
+    );
+
+    // And it keeps drawing on pushed frames alone.
+    let before = count(&term.output(), b"\x1b_Ga=T");
+    for x in (100..600).step_by(50) {
+        term.send(format!("\x1b[<35;{x};300M").as_bytes());
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        count(&term.output(), b"\x1b_Ga=T") > before,
+        "no frames arrived once requests stopped"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+}
+
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn a_real_server_reports_its_lock_key_state() {
+    // Without this the caps-lock correction has nothing to compare against, so it is
+    // worth knowing that a real server actually sends it rather than only our fake one.
+    // The state arrives as a debug event, so the log is where it can be observed.
+    let log = std::env::temp_dir().join("vnctui-live-led.log");
+    let _ = std::fs::remove_file(&log);
+
+    let addr = server();
+    let mut term = FakeTerm::spawn_with_env(
+        COLS,
+        ROWS,
+        PIXELS.0,
+        PIXELS.1,
+        &[
+            addr.as_str(),
+            "--fps",
+            "15",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)));
+
+    let start = std::time::Instant::now();
+    let mut logged = String::new();
+    while start.elapsed() < Duration::from_secs(15) {
+        logged = std::fs::read_to_string(&log).unwrap_or_default();
+        if logged.contains("remote lock keys") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        logged.contains("remote lock keys"),
+        "the server never reported its lock keys; the correction would have nothing to \
+         compare against. Log:\n{logged}"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+    let _ = std::fs::remove_file(&log);
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 fn tail(buf: &[u8]) -> String {

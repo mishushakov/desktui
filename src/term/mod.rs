@@ -24,6 +24,11 @@ static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
 /// framing and `1016` to get that position in pixels rather than cells. The
 /// keyboard flags are disambiguate, report-event-types and report-all-keys,
 /// which is what turns key releases into events -- RFB needs down and up.
+///
+/// Focus reporting (`1004`) matters more than it looks: without it the terminal
+/// never says the window lost focus, so a modifier held while switching away stays
+/// held as far as the remote is concerned. The release-everything path existed
+/// already and was simply never reached.
 const SETUP: &str = concat!(
     "\x1b[?1049h", // alternate screen
     "\x1b[?25l",   // hide the text cursor
@@ -32,6 +37,7 @@ const SETUP: &str = concat!(
     "\x1b[?1006h", // SGR mouse framing
     "\x1b[?1016h", // ... in pixels
     "\x1b[?2004h", // bracketed paste
+    "\x1b[?1004h", // focus in/out, so held keys can be released on focus loss
     "\x1b[>11u",   // kitty keyboard: disambiguate | event types | all keys
     "\x1b[2J",
 );
@@ -41,6 +47,7 @@ const SETUP: &str = concat!(
 const TEARDOWN: &str = concat!(
     "\x1b_Ga=d,d=A,q=2\x1b\\",
     "\x1b[<u",
+    "\x1b[?1004l",
     "\x1b[?2004l",
     "\x1b[?1016l",
     "\x1b[?1006l",

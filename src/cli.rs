@@ -28,6 +28,21 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Transfer::Auto)]
     pub transfer: Transfer,
 
+    /// JPEG quality for Tight, 0 (worst) to 9 (best).
+    ///
+    /// Unset means no JPEG at all: the protocol says Tight only uses JPEG when a
+    /// quality level is given, so leaving this alone is how to ask for a lossless
+    /// picture. Set it on a slow link, where lossless is unaffordable.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
+    pub quality: Option<u8>,
+
+    /// Compression level, 0 (least) to 9 (most).
+    ///
+    /// Lossless either way; this trades the server's CPU against bandwidth. Unset
+    /// leaves the choice to the server.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
+    pub compression: Option<u8>,
+
     /// Target frame rate. Frames are dropped rather than queued when the
     /// terminal cannot keep up.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]

@@ -1,10 +1,10 @@
-use crate::rfb::{MAX_CUT_TEXT, MAX_PAYLOAD, PixelFormat, Rect, ScreenInfo, VncEncoding, VncError};
+use crate::rfb::{MAX_CUT_TEXT, MAX_PAYLOAD, PixelFormat, Rect, ScreenInfo, VncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug)]
 pub(super) enum ClientMsg {
     SetPixelFormat(PixelFormat),
-    SetEncodings(Vec<VncEncoding>),
+
     FramebufferUpdateRequest(Rect, u8),
     KeyEvent(u32, bool),
     PointerEvent(u16, u16, u8),
@@ -14,6 +14,11 @@ pub(super) enum ClientMsg {
         height: u16,
         screens: Vec<ScreenInfo>,
     },
+    /// Raw encoding numbers appended to `SetEncodings`, for hints that are a number
+    /// and nothing else: quality and compression levels.
+    SetEncodingsRaw(Vec<i32>),
+    EnableContinuousUpdates { enable: bool, rect: Rect },
+    Fence { flags: u32, payload: Vec<u8> },
 }
 
 impl ClientMsg {
@@ -35,26 +40,51 @@ impl ClientMsg {
                 writer.write_all(&payload).await?;
                 Ok(())
             }
-            ClientMsg::SetEncodings(encodings) => {
-                //  +--------------+--------------+---------------------+
-                // | No. of bytes | Type [Value] | Description         |
-                // +--------------+--------------+---------------------+
-                // | 1            | U8 [2]       | message-type        |
-                // | 1            |              | padding             |
-                // | 2            | U16          | number-of-encodings |
-                // +--------------+--------------+---------------------+
-
-                // This is followed by number-of-encodings repetitions of the following:
-                // +--------------+--------------+---------------+
-                // | No. of bytes | Type [Value] | Description   |
-                // +--------------+--------------+---------------+
-                // | 4            | S32          | encoding-type |
-                // +--------------+--------------+---------------+
+            ClientMsg::SetEncodingsRaw(ids) => {
+                // Same message as SetEncodings, but the caller has already reduced
+                // everything to numbers -- which is all a quality or compression hint
+                // is.
                 let mut payload = vec![2, 0];
-                payload.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
-                for e in encodings {
-                    payload.write_u32(e.into()).await?;
+                payload.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+                for id in ids {
+                    payload.extend_from_slice(&id.to_be_bytes());
                 }
+                writer.write_all(&payload).await?;
+                Ok(())
+            }
+            ClientMsg::EnableContinuousUpdates { enable, rect } => {
+                // +--------------+--------------+--------------+
+                // | 1            | U8 [150]     | message-type |
+                // | 1            | U8           | enable-flag  |
+                // | 2            | U16          | x-position   |
+                // | 2            | U16          | y-position   |
+                // | 2            | U16          | width        |
+                // | 2            | U16          | height       |
+                // +--------------+--------------+--------------+
+                let mut payload = vec![150_u8, enable as u8];
+                payload.extend_from_slice(&rect.x.to_be_bytes());
+                payload.extend_from_slice(&rect.y.to_be_bytes());
+                payload.extend_from_slice(&rect.width.to_be_bytes());
+                payload.extend_from_slice(&rect.height.to_be_bytes());
+                writer.write_all(&payload).await?;
+                Ok(())
+            }
+            ClientMsg::Fence { flags, payload: body } => {
+                // +--------------+--------------+--------------+
+                // | 1            | U8 [248]     | message-type |
+                // | 3            |              | padding      |
+                // | 4            | U32          | flags        |
+                // | 1            | U8           | length       |
+                // | length       | U8 array     | payload      |
+                // +--------------+--------------+--------------+
+                //
+                // The payload is capped at 64 bytes by the spec, and echoing more
+                // than we were sent would be a protocol error of our own making.
+                let body = if body.len() > 64 { &body[..64] } else { &body[..] };
+                let mut payload = vec![248_u8, 0, 0, 0];
+                payload.extend_from_slice(&flags.to_be_bytes());
+                payload.push(body.len() as u8);
+                payload.extend_from_slice(body);
                 writer.write_all(&payload).await?;
                 Ok(())
             }
@@ -259,6 +289,90 @@ mod client_msg_tests {
     }
 
     #[tokio::test]
+    async fn enable_continuous_updates_matches_the_wire_format() {
+        let bytes = encode(ClientMsg::EnableContinuousUpdates {
+            enable: true,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1600,
+                height: 832,
+            },
+        })
+        .await;
+        assert_eq!(
+            bytes,
+            vec![
+                150, // message-type
+                1,   // enable
+                0x00, 0x00, // x
+                0x00, 0x00, // y
+                0x06, 0x40, // width  = 1600
+                0x03, 0x40, // height = 832
+            ]
+        );
+
+        let off = encode(ClientMsg::EnableContinuousUpdates {
+            enable: false,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        })
+        .await;
+        assert_eq!(off[1], 0, "the enable flag has to clear");
+    }
+
+    #[tokio::test]
+    async fn a_fence_response_matches_the_wire_format() {
+        let bytes = encode(ClientMsg::Fence {
+            flags: 0b11,
+            payload: b"sync".to_vec(),
+        })
+        .await;
+        assert_eq!(
+            bytes,
+            vec![
+                248, // message-type
+                0, 0, 0, // padding
+                0x00, 0x00, 0x00, 0x03, // flags
+                4,    // length
+                b's', b'y', b'n', b'c',
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_fence_payload_is_clipped_to_the_limit() {
+        // The spec caps a fence payload at 64 bytes; echoing more than that back would
+        // be a protocol error of our own making.
+        let bytes = encode(ClientMsg::Fence {
+            flags: 0,
+            payload: vec![0xab; 200],
+        })
+        .await;
+        assert_eq!(bytes[8], 64, "declared length");
+        assert_eq!(bytes.len(), 9 + 64);
+    }
+
+    #[tokio::test]
+    async fn the_hint_encodings_go_out_with_the_rest() {
+        // Quality and compression are encoding numbers with no rectangle behind them,
+        // and they have to share the one SetEncodings message: a second would replace
+        // the first rather than adding to it.
+        let bytes = encode(ClientMsg::SetEncodingsRaw(vec![7, 16, -23, -254])).await;
+        assert_eq!(bytes[0], 2, "message-type");
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 4, "count");
+        let ids: Vec<i32> = bytes[4..]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(ids, vec![7, 16, -23, -254]);
+    }
+
+    #[tokio::test]
     async fn key_and_pointer_events_match_the_spec() {
         let key = encode(ClientMsg::KeyEvent(0xffe1, true)).await;
         assert_eq!(key, vec![4, 1, 0, 0, 0x00, 0x00, 0xff, 0xe1]);
@@ -275,6 +389,10 @@ pub(super) enum ServerMsg {
     // SetColorMapEntries,
     Bell,
     ServerCutText(String),
+    /// The server has stopped pushing updates. Also its way of saying the extension
+    /// exists, the first time it arrives.
+    EndOfContinuousUpdates,
+    ServerFence { flags: u32, payload: Vec<u8> },
 }
 
 impl ServerMsg {
@@ -383,6 +501,25 @@ impl ServerMsg {
                 Ok(Self::ServerCutText(
                     String::from_utf8_lossy(&buffer_str).to_string(),
                 ))
+            }
+            150 => {
+                // EndOfContinuousUpdates carries nothing but its type.
+                Ok(ServerMsg::EndOfContinuousUpdates)
+            }
+            248 => {
+                // ServerFence: padding, flags, length, payload.
+                let mut padding = [0; 3];
+                reader.read_exact(&mut padding).await?;
+                let flags = reader.read_u32().await?;
+                let len = reader.read_u8().await? as usize;
+                // The spec caps this at 64. A longer one is a broken server, and
+                // reading it anyway keeps the stream aligned.
+                let mut payload = vec![0; len];
+                reader.read_exact(&mut payload).await?;
+                if len > 64 {
+                    payload.truncate(64);
+                }
+                Ok(ServerMsg::ServerFence { flags, payload })
             }
             _ => Err(VncError::WrongServerMessage),
         }

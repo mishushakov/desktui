@@ -186,7 +186,7 @@ fn print_caps_reports_both_geometry_sources_and_flags_a_mismatch() {
 }
 
 #[test]
-fn a_resize_relayouts_and_releases_orphaned_images() {
+fn a_resize_relayouts_and_releases_the_old_images() {
     let mut term = FakeTerm::spawn(120, 40, 960, 640, &["--test-pattern", "--fps", "30"]);
     term.answer_probe(
         b"\x1b_Gi=1893;OK\x1b\\\x1b[4;640;960t\x1b[6;16;8t\x1b[?1016;2$y\x1b[?2026;2$y\x1b[?62;22c",
@@ -205,9 +205,12 @@ fn a_resize_relayouts_and_releases_orphaned_images() {
         "status line did not move to the new last row: {}",
         show(&term.output())
     );
+    // A layout change drops every placement and redraws, rather than picking out
+    // the orphans: the whole grid is retransmitted anyway, and leaving the rest in
+    // place is what left stale rows on screen when the window grew.
     assert!(
-        term.wait_for(b"a=d,d=I", Duration::from_secs(5)),
-        "shrinking should release images that no longer have a tile: {}",
+        term.wait_for(b"a=d,d=A", Duration::from_secs(5)),
+        "a resize should release the old placements: {}",
         show(&term.output())
     );
     // And the new geometry has to be what it draws at.
@@ -312,4 +315,87 @@ fn shared_memory_is_the_default_when_the_terminal_answered_for_it() {
 
     term.send(b"q");
     term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn growing_the_window_does_not_leave_stale_status_lines() {
+    // Text does not move when the grid grows, so the status line written on the old
+    // last row stays there. Without a wipe, a window dragged larger accumulates one
+    // stale line per size it passed through, and the old placements linger with them.
+    let mut term = FakeTerm::spawn(80, 24, 640, 408, &["--test-pattern", "--fps", "20"]);
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(
+        term.wait_for(b"\x1b[24;1H", Duration::from_secs(10)),
+        "no status line on row 24: {}",
+        show(&term.output())
+    );
+
+    // Grow twice, the way a drag does.
+    for (cols, rows, px, py) in [(120u16, 36u16, 960u16, 612u16), (200, 50, 1600, 850)] {
+        term.resize(cols, rows, px, py);
+        assert!(
+            term.wait_for(format!("\x1b[{rows};1H").as_bytes(), Duration::from_secs(10)),
+            "status line never reached row {rows}: {}",
+            show(&term.output())
+        );
+    }
+
+    // Every relayout has to erase the screen and drop the old placements, or the
+    // rows the status line used to occupy keep their text for ever.
+    let out = term.output();
+    assert!(
+        count(&out, b"\x1b[2J") >= 3,
+        "expected an erase per layout change, saw {}",
+        count(&out, b"\x1b[2J")
+    );
+    assert!(
+        count(&out, b"a=d,d=A") >= 2,
+        "expected the old placements to be dropped on each resize, saw {}",
+        count(&out, b"a=d,d=A")
+    );
+
+    // And after the last resize, the only status row still being written is the new
+    // one: nothing should be repainting rows 24 or 36 any more.
+    let after = out.len();
+    std::thread::sleep(Duration::from_millis(400));
+    let latest = term.output();
+    let tail = &latest[after.min(latest.len())..];
+    assert!(
+        contains(tail, b"\x1b[50;1H"),
+        "the status line stopped being drawn on the new last row"
+    );
+    for stale in [&b"\x1b[24;1H"[..], b"\x1b[36;1H"] {
+        assert!(
+            !contains(tail, stale),
+            "still writing to an old status row: {}",
+            String::from_utf8_lossy(stale)
+        );
+    }
+
+    term.send(b"q");
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn focus_reporting_is_enabled_so_held_keys_can_be_released() {
+    // Without mode 1004 the terminal never reports focus loss, so the code that
+    // releases everything held on the remote is unreachable and a modifier held while
+    // switching away stays held over there.
+    let mut term = FakeTerm::spawn(200, 50, 1600, 850, &["--test-pattern"]);
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+
+    assert!(
+        contains(&term.output(), b"\x1b[?1004h"),
+        "focus reporting was never enabled: {}",
+        show(&term.output())
+    );
+
+    term.send(b"q");
+    let status = term.wait(Duration::from_secs(10)).expect("did not exit");
+    assert!(status.success());
+    assert!(
+        contains(&term.output(), b"\x1b[?1004l"),
+        "focus reporting was left on at exit"
+    );
 }

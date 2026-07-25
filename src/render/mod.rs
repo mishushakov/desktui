@@ -360,17 +360,23 @@ impl Renderer {
 
     /// Adopt a new layout, redrawing everything.
     ///
-    /// Returns escape bytes that must be written before the next frame when the
-    /// grid shrank, to drop images that no longer have a tile.
+    /// Returns escape bytes to write before the next frame: the screen has to be
+    /// wiped, not merely repainted over. Text does not move when the grid changes, so
+    /// the status line drawn on the old last row stays exactly where it was, and a
+    /// window that grows accumulates one stale line per size it passed through.
+    /// Placements are equally stubborn: they belong to cells, and the tile covering a
+    /// cell stays until something says otherwise.
+    ///
+    /// Every tile is retransmitted immediately after this, so dropping all of them
+    /// costs only the bytes.
     pub fn relayout(&mut self, layout: Layout) -> Vec<u8> {
         let grid = TileGrid::new(&layout);
         let mut cleanup = Vec::new();
-        if grid.len() < self.placed {
-            for idx in grid.len()..self.placed {
-                KittyEncoder::delete(&mut cleanup, IMAGE_ID_BASE + idx as u32);
-            }
-            self.placed = grid.len();
-        }
+        // Text first, then images, so this does not depend on whether a given
+        // terminal treats an erase as also clearing placements.
+        cleanup.extend_from_slice(b"\x1b[2J");
+        KittyEncoder::delete_all(&mut cleanup);
+        self.placed = 0;
 
         self.layout = layout;
         self.grid = grid;
@@ -758,7 +764,37 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_the_grid_deletes_the_orphaned_images() {
+    fn a_relayout_wipes_the_screen_before_redrawing() {
+        // Growing the terminal used to leave the old status line behind on the row
+        // that used to be the last one, one stale line per size passed through, plus
+        // whatever placements the old grid had put in cells the new grid does not use.
+        let m = ghostty();
+        let (w, h) = m.image_area();
+        let mut r = Renderer::new(
+            Layout::compute(&m, ScaleMode::Native, w, h, (0, 0)),
+            true,
+            Transfer::Direct,
+        );
+        let fb = Framebuffer::new(w, h);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        r.commit();
+
+        let bigger = metrics(240, 70, 8, 17);
+        let (bw, bh) = bigger.image_area();
+        let cleanup = r.relayout(Layout::compute(&bigger, ScaleMode::Native, bw, bh, (0, 0)));
+        let text = String::from_utf8(cleanup).unwrap();
+        assert!(text.contains("\x1b[2J"), "the screen was not erased: {text:?}");
+        assert!(
+            text.contains("a=d,d=A"),
+            "the old placements were not dropped: {text:?}"
+        );
+        assert!(r.has_work(), "everything has to be redrawn afterwards");
+        assert_eq!(r.dirty_tiles(), r.tile_count());
+    }
+
+    #[test]
+    fn shrinking_the_grid_drops_every_image() {
         let m = ghostty();
         let (w, h) = m.image_area();
         let big = Layout::compute(&m, ScaleMode::Native, w, h, (0, 0));
@@ -773,7 +809,7 @@ mod tests {
         let small = Layout::compute(&m, ScaleMode::Fit, 64, 64, (0, 0));
         let cleanup = r.relayout(small);
         let text = String::from_utf8(cleanup).unwrap();
-        assert!(text.contains("a=d"), "expected deletes, got {text:?}");
+        assert!(text.contains("a=d,d=A"), "expected a delete-all, got {text:?}");
         assert!(r.has_work(), "a relayout must redraw everything");
     }
 

@@ -19,6 +19,57 @@ pub enum VncEncoding {
     /// The client can cope with the framebuffer changing size, and can ask for a
     /// size of its own with `SetDesktopSize`.
     ExtendedDesktopSizePseudo = -308,
+    /// The server reports the state of the lock keys, so the client can tell when
+    /// its own caps lock disagrees with the remote one.
+    QemuLedStatePseudo = -261,
+    /// The client understands `ServerFence` and will answer it. Requesting this is
+    /// how a client discovers the extension: the server sends a fence in reply.
+    FencePseudo = -312,
+    /// The client wants updates pushed rather than requested. Requesting this is how
+    /// support is discovered: the server answers with `EndOfContinuousUpdates`.
+    ContinuousUpdatesPseudo = -313,
+}
+
+/// Encoding numbers for the quality and compression hints.
+///
+/// These are ranges rather than single values, and carry no rectangles: the number
+/// itself is the message. Not sending a quality level matters -- the spec says
+/// `JpegCompression` is not used in Tight encoding unless one is given, which is the
+/// only way to ask a server for a lossless picture.
+pub mod hint {
+    /// -32 is the lowest quality, -23 the highest.
+    pub const QUALITY_BASE: i32 = -32;
+    /// -256 is the least compression, -247 the most.
+    pub const COMPRESSION_BASE: i32 = -256;
+
+    /// The encoding number for a JPEG quality level, 0 (lowest) to 9 (highest).
+    pub fn quality(level: u8) -> i32 {
+        QUALITY_BASE + i32::from(level.min(9))
+    }
+
+    /// The encoding number for a compression level, 0 (least) to 9 (most).
+    pub fn compression(level: u8) -> i32 {
+        COMPRESSION_BASE + i32::from(level.min(9))
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::hint;
+
+    #[test]
+    fn quality_and_compression_map_to_the_documented_ranges() {
+        // -32 is the worst quality and -23 the best; -256 the least compression and
+        // -247 the most. Getting these backwards would quietly ask for the opposite of
+        // what the user wanted.
+        assert_eq!(hint::quality(0), -32);
+        assert_eq!(hint::quality(9), -23);
+        assert_eq!(hint::compression(0), -256);
+        assert_eq!(hint::compression(9), -247);
+        // Out of range is clamped rather than wrapping into another encoding's number.
+        assert_eq!(hint::quality(200), -23);
+        assert_eq!(hint::compression(200), -247);
+    }
 }
 
 /// An encoding the server used that this client did not ask for.
@@ -47,6 +98,9 @@ impl TryFrom<u32> for VncEncoding {
             -223 => Ok(VncEncoding::DesktopSizePseudo),
             -224 => Ok(VncEncoding::LastRectPseudo),
             -308 => Ok(VncEncoding::ExtendedDesktopSizePseudo),
+            -261 => Ok(VncEncoding::QemuLedStatePseudo),
+            -312 => Ok(VncEncoding::FencePseudo),
+            -313 => Ok(VncEncoding::ContinuousUpdatesPseudo),
             other => Err(UnknownEncoding(other)),
         }
     }

@@ -41,6 +41,20 @@ pub enum Request {
     Pointer { x: u16, y: u16, buttons: u8 },
     CutText(String),
     SetDesktopSize { width: u16, height: u16, screen_ids: Vec<u32> },
+    EnableContinuousUpdates { enable: bool, width: u16, height: u16 },
+    Fence { flags: u32, payload: Vec<u8> },
+}
+
+/// Extensions the fake server offers, beyond the resize behaviour.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Extensions {
+    /// Answer `SetEncodings` with `EndOfContinuousUpdates`, which is how a server
+    /// says the extension exists, then push frames without being asked.
+    pub continuous_updates: bool,
+    /// Send a `ServerFence` with the request bit set, and expect it echoed back.
+    pub fence: bool,
+    /// Report lock-key state, with caps lock on.
+    pub led_caps_on: bool,
 }
 
 pub struct FakeServer {
@@ -52,6 +66,16 @@ pub struct FakeServer {
 impl FakeServer {
     /// Start listening on a loopback port chosen by the kernel.
     pub fn start(width: u16, height: u16, resize: Resize) -> Self {
+        Self::start_with(width, height, resize, Extensions::default())
+    }
+
+    /// As [`Self::start`], with extensions enabled.
+    pub fn start_with(
+        width: u16,
+        height: u16,
+        resize: Resize,
+        extensions: Extensions,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -61,7 +85,15 @@ impl FakeServer {
         let thread_stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
-                let _ = serve(stream, width, height, resize, thread_requests, thread_stop);
+                let _ = serve(
+                    stream,
+                    width,
+                    height,
+                    resize,
+                    extensions,
+                    thread_requests,
+                    thread_stop,
+                );
             }
         });
 
@@ -103,6 +135,7 @@ fn serve(
     mut width: u16,
     mut height: u16,
     resize: Resize,
+    extensions: Extensions,
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
@@ -152,6 +185,26 @@ fn serve(
                     encodings.push(i32::from_be_bytes(e));
                 }
                 record(&requests, Request::SetEncodings(encodings));
+
+                // The first sight of the ContinuousUpdates encoding is answered with
+                // EndOfContinuousUpdates, which is how the spec has a server admit the
+                // extension exists.
+                if extensions.continuous_updates {
+                    stream.write_all(&[150])?;
+                    stream.flush()?;
+                }
+                // Likewise a fence: the server sends one to show it understands them.
+                if extensions.fence {
+                    let mut msg = vec![248u8, 0, 0, 0];
+                    msg.extend_from_slice(&(0x8000_0003u32).to_be_bytes());
+                    msg.push(4);
+                    msg.extend_from_slice(b"hail");
+                    stream.write_all(&msg)?;
+                    stream.flush()?;
+                }
+                if extensions.led_caps_on {
+                    send_led_state(&mut stream, true, false)?;
+                }
             }
             3 => {
                 let mut rest = [0u8; 9];
@@ -202,6 +255,35 @@ fn serve(
                     &requests,
                     Request::CutText(String::from_utf8_lossy(&text).into_owned()),
                 );
+            }
+            150 => {
+                let mut rest = [0u8; 9];
+                stream.read_exact(&mut rest)?;
+                record(
+                    &requests,
+                    Request::EnableContinuousUpdates {
+                        enable: rest[0] == 1,
+                        width: u16::from_be_bytes([rest[5], rest[6]]),
+                        height: u16::from_be_bytes([rest[7], rest[8]]),
+                    },
+                );
+                if rest[0] == 1 {
+                    // Push a frame unasked, which is the whole point of the extension.
+                    send_full_frame(&mut stream, width, height)?;
+                } else {
+                    // Turning it off is acknowledged with EndOfContinuousUpdates.
+                    stream.write_all(&[150])?;
+                    stream.flush()?;
+                }
+            }
+            248 => {
+                let mut head = [0u8; 8];
+                stream.read_exact(&mut head)?;
+                let flags = u32::from_be_bytes([head[3], head[4], head[5], head[6]]);
+                let len = head[7] as usize;
+                let mut payload = vec![0u8; len];
+                stream.read_exact(&mut payload)?;
+                record(&requests, Request::Fence { flags, payload });
             }
             251 => {
                 // SetDesktopSize: padding, width, height, screen count, padding,
@@ -272,6 +354,27 @@ fn serve(
         }
     }
     Ok(())
+}
+
+/// One `FramebufferUpdate` holding a QEMU LED state rectangle.
+fn send_led_state(stream: &mut TcpStream, caps: bool, num: bool) -> std::io::Result<()> {
+    let mut msg = vec![0, 0];
+    msg.extend_from_slice(&1u16.to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes()); // x
+    msg.extend_from_slice(&0u16.to_be_bytes()); // y
+    msg.extend_from_slice(&0u16.to_be_bytes()); // width
+    msg.extend_from_slice(&0u16.to_be_bytes()); // height
+    msg.extend_from_slice(&(-261i32).to_be_bytes());
+    let mut state = 0u8;
+    if num {
+        state |= 2;
+    }
+    if caps {
+        state |= 4;
+    }
+    msg.push(state);
+    stream.write_all(&msg)?;
+    stream.flush()
 }
 
 fn record(requests: &Arc<Mutex<Vec<Request>>>, request: Request) {

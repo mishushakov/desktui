@@ -17,7 +17,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 
 use super::Metrics;
@@ -58,6 +59,17 @@ pub enum Command {
     Help,
     /// The prefix was pressed twice: send it through to the server.
     SendPrefix,
+}
+
+/// The local lock-key state, as far as the terminal will say.
+///
+/// `None` means "no idea": a terminal without the Kitty keyboard protocol never
+/// mentions lock keys, and an unset bit is then indistinguishable from the key being
+/// off. Only when the protocol is in use does absence mean off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LockState {
+    pub caps: Option<bool>,
+    pub num: Option<bool>,
 }
 
 /// What a key event turned into.
@@ -111,6 +123,19 @@ impl InputMapper {
 
     pub fn prefix(&self) -> char {
         self.prefix
+    }
+
+    /// The lock-key state this event reports, if the terminal reports any.
+    pub fn lock_state(&self, ev: &KeyEvent) -> LockState {
+        if !self.expect_releases {
+            // No Kitty keyboard protocol, so no lock reporting either, and an absent
+            // bit would be read as "off" when it only means "unsaid".
+            return LockState::default();
+        }
+        LockState {
+            caps: Some(ev.state.contains(KeyEventState::CAPS_LOCK)),
+            num: Some(ev.state.contains(KeyEventState::NUM_LOCK)),
+        }
     }
 
     pub fn is_armed(&self) -> bool {

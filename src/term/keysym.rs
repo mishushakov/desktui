@@ -57,6 +57,10 @@ mod sym {
     pub const AUDIO_FORWARD: u32 = 0x1008ff97;
 }
 
+/// Lock keys, needed by name so a mismatch with the remote can be corrected.
+pub const CAPS_LOCK: u32 = sym::CAPS_LOCK;
+pub const NUM_LOCK: u32 = sym::NUM_LOCK;
+
 /// A character's keysym.
 ///
 /// Latin-1 maps one to one; anything else gets the Unicode offset. Both rules are

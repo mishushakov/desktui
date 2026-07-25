@@ -102,6 +102,8 @@ impl VncInner {
         shared: bool,
         mut pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
+        quality: Option<u8>,
+        compression: Option<u8>,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -122,7 +124,7 @@ impl VncInner {
             .await?;
 
         trace!("client encodings: {:?}", encodings);
-        send_client_encoding(&mut stream, encodings).await?;
+        send_client_encoding(&mut stream, encodings, quality, compression).await?;
 
         // Start with a non-incremental request. Besides fetching the first frame,
         // this is the only way to learn the screen layout: a server supporting
@@ -206,6 +208,10 @@ impl VncInner {
                 height,
                 screens,
             },
+            X11Event::EnableContinuousUpdates { enable, rect } => {
+                ClientMsg::EnableContinuousUpdates { enable, rect }
+            }
+            X11Event::Fence { flags, payload } => ClientMsg::Fence { flags, payload },
         };
         self.input_ch.send(msg).await?;
         Ok(())
@@ -266,13 +272,16 @@ impl VncClient {
         shared: bool,
         pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
+        quality: Option<u8>,
+        compression: Option<u8>,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         Ok(Self {
             inner: Arc::new(Mutex::new(
-                VncInner::new(stream, shared, pixel_format, encodings).await?,
+                VncInner::new(stream, shared, pixel_format, encodings, quality, compression)
+                    .await?,
             )),
         })
     }
@@ -387,11 +396,26 @@ where
     Ok(())
 }
 
-async fn send_client_encoding<S>(stream: &mut S, encodings: Vec<VncEncoding>) -> Result<(), VncError>
+async fn send_client_encoding<S>(
+    stream: &mut S,
+    encodings: Vec<VncEncoding>,
+    quality: Option<u8>,
+    compression: Option<u8>,
+) -> Result<(), VncError>
 where
     S: AsyncWrite + Unpin,
 {
-    ClientMsg::SetEncodings(encodings).write(stream).await?;
+    // The hints are encoding numbers with no rectangle behind them, so they belong in
+    // the same list -- and it has to be one message, because a second `SetEncodings`
+    // replaces the first rather than adding to it.
+    let mut ids: Vec<i32> = encodings.into_iter().map(|e| e as i32).collect();
+    if let Some(level) = quality {
+        ids.push(crate::rfb::hint::quality(level));
+    }
+    if let Some(level) = compression {
+        ids.push(crate::rfb::hint::compression(level));
+    }
+    ClientMsg::SetEncodingsRaw(ids).write(stream).await?;
     Ok(())
 }
 
@@ -498,6 +522,26 @@ where
                             );
                             output_func(VncEvent::DesktopLayout(layout)).await?;
                         }
+                        VncEncoding::QemuLedStatePseudo => {
+                            // One byte: scroll lock, num lock, caps lock.
+                            let state = stream.read_u8().await?;
+                            output_func(VncEvent::LedState {
+                                scroll: state & 1 != 0,
+                                num: state & 2 != 0,
+                                caps: state & 4 != 0,
+                            })
+                            .await?;
+                        }
+                        // Both are negotiated through SetEncodings and answered with
+                        // messages, never with rectangles. A server sending one here
+                        // is out of contract, and guessing at a length would lose the
+                        // stream.
+                        VncEncoding::FencePseudo | VncEncoding::ContinuousUpdatesPseudo => {
+                            return Err(VncError::General(format!(
+                                "server sent {:?} as a rectangle",
+                                rect.encoding
+                            )));
+                        }
                         VncEncoding::LastRectPseudo => break,
                     }
                 }
@@ -510,6 +554,12 @@ where
             }
             ServerMsg::ServerCutText(text) => {
                 output_func(VncEvent::Text(text)).await?;
+            }
+            ServerMsg::EndOfContinuousUpdates => {
+                output_func(VncEvent::EndOfContinuousUpdates).await?;
+            }
+            ServerMsg::ServerFence { flags, payload } => {
+                output_func(VncEvent::Fence { flags, payload }).await?;
             }
         }
     }
@@ -693,6 +743,105 @@ mod tests {
             }
             other => panic!("expected a desktop layout, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn led_state_decodes_each_lock_key() {
+        for (byte, scroll, num, caps) in [
+            (0b000u8, false, false, false),
+            (0b001, true, false, false),
+            (0b010, false, true, false),
+            (0b100, false, false, true),
+            (0b111, true, true, true),
+            // The remaining bits are reserved and must be ignored rather than
+            // mistaken for another lock key.
+            (0b1111_1100, false, false, true),
+        ] {
+            let mut stream = update_header(1);
+            stream.extend(rect_header(0, 0, 0, 0, -261));
+            stream.push(byte);
+
+            let events = events_from(&stream).await;
+            match &events[0] {
+                VncEvent::LedState {
+                    scroll: s,
+                    num: n,
+                    caps: c,
+                } => {
+                    assert_eq!((*s, *n, *c), (scroll, num, caps), "byte {byte:#010b}");
+                }
+                other => panic!("expected LED state, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn end_of_continuous_updates_is_reported() {
+        // A server sends this the first time it sees the encoding requested, which is
+        // how support is discovered.
+        let events = events_from(&[150]).await;
+        assert!(matches!(events[0], VncEvent::EndOfContinuousUpdates));
+    }
+
+    #[tokio::test]
+    async fn a_server_fence_arrives_with_its_flags_and_payload() {
+        let mut stream = vec![248, 0, 0, 0];
+        stream.extend_from_slice(&(0x8000_0003u32).to_be_bytes()); // request | before | after
+        stream.push(4);
+        stream.extend_from_slice(b"ping");
+
+        let events = events_from(&stream).await;
+        match &events[0] {
+            VncEvent::Fence { flags, payload } => {
+                assert_eq!(*flags, 0x8000_0003);
+                assert_eq!(payload, b"ping");
+            }
+            other => panic!("expected a fence, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overlong_fence_payload_is_read_in_full_but_kept_short() {
+        // The stream has to stay aligned even when a server ignores the 64-byte cap,
+        // so all of it is read and only what we keep is clipped.
+        let mut stream = vec![248, 0, 0, 0];
+        stream.extend_from_slice(&0u32.to_be_bytes());
+        stream.push(200);
+        stream.extend_from_slice(&[0xcd; 200]);
+        // A message after it proves the reader did not lose its place.
+        stream.push(2); // Bell
+
+        let events = events_from(&stream).await;
+        match &events[0] {
+            VncEvent::Fence { payload, .. } => assert_eq!(payload.len(), 64),
+            other => panic!("expected a fence, got {other:?}"),
+        }
+        assert!(
+            matches!(events[1], VncEvent::Bell),
+            "the stream lost alignment: {:?}",
+            events
+        );
+    }
+
+    #[tokio::test]
+    async fn a_negotiation_only_encoding_sent_as_a_rectangle_is_refused() {
+        // Fence and ContinuousUpdates are answered with messages. As a rectangle they
+        // have no length, so guessing would lose the stream.
+        let mut stream = update_header(1);
+        stream.extend(rect_header(0, 0, 0, 0, -313));
+
+        let collected = Rc::new(RefCell::new(Vec::new()));
+        let sink = |event: VncEvent| {
+            let collected = Rc::clone(&collected);
+            async move {
+                collected.borrow_mut().push(event);
+                Ok(())
+            }
+        };
+        let pf = PixelFormat::bgra();
+        let mut slice = stream.as_slice();
+        let err = read_loop(&mut slice, &pf, &sink).await.unwrap_err();
+        assert!(err.to_string().contains("as a rectangle"), "{err}");
     }
 
     #[tokio::test]

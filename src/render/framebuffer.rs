@@ -50,20 +50,38 @@ impl Framebuffer {
         Rect::new(0, 0, self.w, self.h)
     }
 
-    /// Reallocate to a new size, clearing to opaque black.
+    /// Reallocate to a new size, keeping whatever content still fits.
     ///
-    /// Contents are not preserved: a resize is always followed by a full
-    /// framebuffer request, so carrying the old pixels over would only show
-    /// stale content for a moment longer.
+    /// The overlap has to be preserved. After the desktop changes size the server
+    /// sends only what it considers changed, and it does not consider content that
+    /// merely moved to be changed -- so anything cleared here that the server does
+    /// not resend stays black until something else happens to damage it. The spec
+    /// rules out the obvious alternative: a client must not answer an
+    /// `ExtendedDesktopSize` rectangle with a non-incremental request, because the
+    /// server answers *that* with another rectangle and the two never stop. noVNC
+    /// preserves its canvas across a resize for the same reason.
     pub fn resize(&mut self, w: u32, h: u32) {
-        self.w = w;
-        self.h = h;
-        let len = (w as usize) * (h as usize) * 4;
-        self.data.clear();
-        self.data.resize(len, 0);
-        for px in self.data.chunks_exact_mut(4) {
+        if w == self.w && h == self.h {
+            return;
+        }
+
+        let mut next = vec![0u8; (w as usize) * (h as usize) * 4];
+        for px in next.chunks_exact_mut(4) {
             px[3] = 0xff;
         }
+
+        // Copy the region present in both, row by row: the stride changed.
+        let copy_w = (w.min(self.w) as usize) * 4;
+        let copy_h = h.min(self.h) as usize;
+        for row in 0..copy_h {
+            let from = row * (self.w as usize) * 4;
+            let to = row * (w as usize) * 4;
+            next[to..to + copy_w].copy_from_slice(&self.data[from..from + copy_w]);
+        }
+
+        self.data = next;
+        self.w = w;
+        self.h = h;
     }
 
     /// Clip a rectangle to the framebuffer, returning `None` if nothing is left.
@@ -296,12 +314,52 @@ mod tests {
     }
 
     #[test]
-    fn resize_clears_to_opaque_black() {
+    fn resize_keeps_the_overlap_and_blacks_out_the_rest() {
+        // The server sends only what it thinks changed after a desktop resize, and
+        // content that merely moved does not count -- so anything discarded here that
+        // the server does not resend would stay black. Answering the resize with a
+        // non-incremental request is not allowed, so the overlap has to survive.
         let mut fb = Framebuffer::new(2, 2);
-        fb.fill(fb.rect(), [1, 2, 3]);
-        fb.resize(3, 1);
-        assert_eq!(fb.width(), 3);
-        assert_eq!(fb.height(), 1);
+        fb.fill(Rect::new(0, 0, 1, 1), [11, 12, 13]);
+        fb.fill(Rect::new(1, 0, 1, 1), [21, 22, 23]);
+        fb.fill(Rect::new(0, 1, 1, 1), [31, 32, 33]);
+
+        // Grow: everything that was there is still there, in the same place.
+        fb.resize(4, 3);
+        assert_eq!((fb.width(), fb.height()), (4, 3));
+        assert_eq!(bgra(&fb, 0, 0), [11, 12, 13, 0xff]);
+        assert_eq!(bgra(&fb, 1, 0), [21, 22, 23, 0xff]);
+        assert_eq!(bgra(&fb, 0, 1), [31, 32, 33, 0xff], "the stride changed too");
+        // And the new area is opaque black rather than whatever the allocator had.
+        assert_eq!(bgra(&fb, 3, 2), [0, 0, 0, 0xff]);
         assert_eq!(bgra(&fb, 2, 0), [0, 0, 0, 0xff]);
+    }
+
+    #[test]
+    fn shrinking_keeps_the_top_left_and_drops_the_rest() {
+        let mut fb = Framebuffer::new(4, 4);
+        fb.fill(fb.rect(), [9, 9, 9]);
+        fb.fill(Rect::new(0, 0, 1, 1), [1, 2, 3]);
+        fb.resize(2, 2);
+        assert_eq!((fb.width(), fb.height()), (2, 2));
+        assert_eq!(bgra(&fb, 0, 0), [1, 2, 3, 0xff]);
+        assert_eq!(bgra(&fb, 1, 1), [9, 9, 9, 0xff]);
+    }
+
+    #[test]
+    fn resizing_to_the_same_size_is_a_no_op() {
+        let mut fb = Framebuffer::new(2, 2);
+        fb.fill(fb.rect(), [7, 7, 7]);
+        fb.resize(2, 2);
+        assert_eq!(bgra(&fb, 1, 1), [7, 7, 7, 0xff], "content must not be dropped");
+    }
+
+    #[test]
+    fn resizing_through_zero_does_not_panic() {
+        let mut fb = Framebuffer::new(4, 4);
+        fb.resize(0, 0);
+        assert_eq!((fb.width(), fb.height()), (0, 0));
+        fb.resize(2, 2);
+        assert_eq!(bgra(&fb, 0, 0), [0, 0, 0, 0xff]);
     }
 }

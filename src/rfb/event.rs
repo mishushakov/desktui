@@ -169,8 +169,39 @@ pub enum VncEvent {
     /// The server's clipboard changed. Latin-1 only, per
     /// [RFC6143](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.6.4).
     Text(String),
+    /// The server's lock-key state changed.
+    ///
+    /// Worth having because a remote caps lock that disagrees with the local one
+    /// makes every keystroke come out in the wrong case.
+    LedState {
+        /// Decoded for completeness; no terminal reports its own scroll lock, so
+        /// there is nothing to compare it against.
+        #[allow(dead_code)]
+        scroll: bool,
+        num: bool,
+        caps: bool,
+    },
+    /// The server is no longer pushing updates unasked.
+    ///
+    /// Also how support is discovered: a server sends this the first time it sees
+    /// `ContinuousUpdates` in `SetEncodings`.
+    EndOfContinuousUpdates,
+    /// A synchronisation point from the server, to be echoed back.
+    Fence { flags: u32, payload: Vec<u8> },
     /// An error from the async routines, propagated to the current context.
     Error(String),
+}
+
+/// Fence flag bits, from the RFB `ClientFence` definition.
+pub mod fence {
+    pub const BLOCK_BEFORE: u32 = 1 << 0;
+    pub const BLOCK_AFTER: u32 = 1 << 1;
+    /// Not honoured: it asks the server to hold the *next* update until the fence is
+    /// answered, and we filter it out of a response rather than pretend to implement
+    /// it. Named so the filter reads clearly.
+    #[allow(dead_code)]
+    pub const SYNC_NEXT: u32 = 1 << 2;
+    pub const REQUEST: u32 = 1 << 31;
 }
 
 /// X11 keyboard event to notify the server.
@@ -229,6 +260,13 @@ pub enum X11Event {
     PointerEvent(ClientMouseEvent),
     /// Send text to the server's clipboard. Latin-1 only.
     CopyText(String),
+    /// Ask the server to start or stop pushing updates without being asked.
+    ///
+    /// Only legal once the server has sent `EndOfContinuousUpdates`, which is its
+    /// way of saying the extension exists.
+    EnableContinuousUpdates { enable: bool, rect: Rect },
+    /// Answer a `ServerFence`, or start a synchronisation of our own.
+    Fence { flags: u32, payload: Vec<u8> },
     /// Ask the server to change its framebuffer size.
     ///
     /// Only legal once a [`VncEvent::DesktopLayout`] has arrived, and the screen

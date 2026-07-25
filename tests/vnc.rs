@@ -9,7 +9,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::server::{FakeServer, Request, Resize};
+use common::server::{Extensions, FakeServer, Request, Resize};
 use common::*;
 
 /// A 200x50 terminal of 8x17 cells: 1600x850 pixels, of which 49 rows are usable.
@@ -286,12 +286,28 @@ fn requests_the_encodings_it_can_actually_decode() {
                 "TRLE must not be advertised: its decoder was dropped, so a server \
                  taking us up on it would desynchronise the stream"
             );
-            // Advertising an encoding we cannot decode would leave the stream
-            // unrecoverable, since rectangles carry no length.
+            // The extensions asked for by number.
+            assert!(
+                encodings.contains(&-313),
+                "ContinuousUpdates missing: {encodings:?}"
+            );
+            assert!(encodings.contains(&-312), "Fence missing: {encodings:?}");
+            assert!(
+                encodings.contains(&-261),
+                "LED state missing: {encodings:?}"
+            );
+
+            // Anything advertised has to be something we can consume. For a data
+            // encoding that means a decoder, because rectangles carry no length and a
+            // surprise would leave the stream unrecoverable. Fence and
+            // ContinuousUpdates are different in kind: they are answered with
+            // messages, never rectangles.
+            const DECODABLE_RECTS: [i32; 8] = [0, 1, 7, 16, -223, -224, -261, -308];
+            const NEGOTIATION_ONLY: [i32; 2] = [-312, -313];
             for encoding in &encodings {
                 assert!(
-                    [0, 1, 7, 16, -223, -224, -308].contains(encoding),
-                    "advertised {encoding} with no decoder for it"
+                    DECODABLE_RECTS.contains(encoding) || NEGOTIATION_ONLY.contains(encoding),
+                    "advertised {encoding} with nothing to handle it"
                 );
             }
         }
@@ -454,6 +470,37 @@ fn a_pasted_selection_goes_to_the_remote_clipboard() {
         Request::CutText(text) => assert_eq!(text, "hello there"),
         other => panic!("unexpected request {other:?}"),
     }
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_paste_outside_latin1_is_substituted_not_silently_shortened() {
+    // RFB clipboard traffic is Latin-1 only. Dropping the rest moves every character
+    // after it; a question mark keeps the text the same shape and is visibly a
+    // substitution, which is what noVNC does too.
+    let (server, mut term) = start(Resize::Accept, (800, 600));
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+
+    term.send("\x1b[200~caf\u{e9} \u{2615} tea\x1b[201~".as_bytes());
+    let cut = server
+        .wait_for(Duration::from_secs(10), |r| matches!(r, Request::CutText(_)))
+        .expect("the paste never reached the server");
+    match cut {
+        Request::CutText(text) => {
+            // The e-acute is Latin-1 and survives; the coffee cup is not and becomes
+            // '?', leaving the length and the spaces where they were.
+            assert_eq!(text, "caf\u{e9} ? tea", "got {text:?}");
+        }
+        other => panic!("unexpected request {other:?}"),
+    }
+    // And the user is told, rather than left wondering what happened to it.
+    assert!(
+        term.wait_for(b"not Latin-1", Duration::from_secs(5)),
+        "the substitution was not reported: {}",
+        show(&term.output())
+    );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
@@ -642,6 +689,174 @@ fn a_server_that_snaps_to_its_own_size_does_not_cause_a_request_loop() {
         term.wait_for(b"1600x800", Duration::from_secs(5)),
         "should show the size the server actually granted: {}",
         show(&term.output())
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+/// Start a server with extensions enabled, and a client pointed at it.
+fn start_with(ext: Extensions, remote: (u16, u16), extra: &[&str]) -> (FakeServer, FakeTerm) {
+    let server = FakeServer::start_with(remote.0, remote.1, Resize::Accept, ext);
+    let addr = server.addr.to_string();
+    let mut args = vec![addr.as_str(), "--fps", "15"];
+    args.extend_from_slice(extra);
+    let mut term = FakeTerm::spawn(COLS, ROWS, PIXELS.0, PIXELS.1, &args);
+    term.answer_probe(GHOSTTY_REPLIES);
+    (server, term)
+}
+
+#[test]
+fn continuous_updates_are_enabled_and_stop_the_request_traffic() {
+    // The server pushing frames saves a round trip each time. Once it is on, asking as
+    // well would defeat the point, so the requests have to stop.
+    let ext = Extensions {
+        continuous_updates: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+
+    let enabled = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::EnableContinuousUpdates { enable: true, .. })
+        })
+        .expect("continuous updates were never enabled");
+    match enabled {
+        Request::EnableContinuousUpdates { width, height, .. } => {
+            assert_eq!((width, height), (800, 600), "should cover the whole framebuffer");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(
+        term.wait_for(b"continuous updates", Duration::from_secs(10)),
+        "the user was not told: {}",
+        show(&term.output())
+    );
+
+    // From here on, no more update requests: the count must stop moving.
+    let requests_before = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::FramebufferUpdate { .. }))
+        .count();
+    std::thread::sleep(Duration::from_secs(2));
+    let requests_after = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::FramebufferUpdate { .. }))
+        .count();
+    assert_eq!(
+        requests_before, requests_after,
+        "kept asking for updates after the server started pushing them"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_server_fence_is_echoed_with_the_request_bit_cleared() {
+    // A fence is a synchronisation point: the server asks, and the answer has to come
+    // back with the request bit cleared and any flag we do not implement removed.
+    let ext = Extensions {
+        fence: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+
+    let echoed = server
+        .wait_for(Duration::from_secs(10), |r| matches!(r, Request::Fence { .. }))
+        .expect("the fence was never answered");
+    match echoed {
+        Request::Fence { flags, payload } => {
+            assert_eq!(
+                flags & (1 << 31),
+                0,
+                "the request bit must be cleared in a response"
+            );
+            assert_eq!(flags, 0b11, "BlockBefore and BlockAfter should survive");
+            assert_eq!(payload, b"hail", "the payload comes back unchanged");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_disagreeing_caps_lock_is_corrected_before_the_keystroke() {
+    // The server says its caps lock is on; the terminal reports a key pressed with it
+    // off. Sent as-is the letter would arrive in the wrong case, so a caps lock tap has
+    // to go first.
+    let ext = Extensions {
+        led_caps_on: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+
+    // A Kitty-protocol press of 'x' with no lock modifiers: caps lock is off locally.
+    term.send(b"\x1b[120u");
+
+    let keys = || -> Vec<(u32, bool)> {
+        server
+            .requests()
+            .iter()
+            .filter_map(|r| match r {
+                Request::Key { keysym, down } => Some((*keysym, *down)),
+                _ => None,
+            })
+            .collect()
+    };
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if keys().iter().any(|(k, _)| *k == 0x78) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let sent = keys();
+    let caps = 0xffe5u32;
+    let caps_at = sent.iter().position(|(k, down)| *k == caps && *down);
+    let x_at = sent.iter().position(|(k, down)| *k == 0x78 && *down);
+    assert!(
+        caps_at.is_some(),
+        "no caps lock correction was sent: {sent:x?}"
+    );
+    assert!(
+        caps_at < x_at,
+        "the correction has to precede the keystroke: {sent:x?}"
+    );
+    // And it is a tap, not a key left down.
+    assert!(
+        sent.iter().any(|(k, down)| *k == caps && !*down),
+        "caps lock was pressed and never released: {sent:x?}"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_matching_caps_lock_is_left_alone() {
+    // Nothing to fix, so nothing should be sent: a spurious tap would turn the remote
+    // caps lock on and make every later keystroke wrong.
+    let (server, mut term) = start_with(Extensions::default(), (800, 600), &["--scale", "fit"]);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+
+    term.send(b"\x1b[120u");
+    std::thread::sleep(Duration::from_millis(600));
+
+    let touched_caps = server
+        .requests()
+        .iter()
+        .any(|r| matches!(r, Request::Key { keysym: 0xffe5, .. }));
+    assert!(
+        !touched_caps,
+        "sent a lock-key correction with no LED state to justify it: {:?}",
+        server.requests()
     );
 
     quit(&mut term);

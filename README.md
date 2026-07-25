@@ -28,9 +28,8 @@ pan.
 ## Requirements
 
 A terminal that implements the Kitty graphics protocol. **Ghostty**, **kitty** and
-**WezTerm** all do. Alacritty supports no image protocol at all by design and can
-never work. The startup probe checks, and refuses with an explanation rather than
-drawing nothing.
+**WezTerm** all do. A terminal with no image protocol cannot work at all. The startup
+probe checks, and refuses with an explanation rather than drawing nothing.
 
 Also used when the terminal offers it:
 
@@ -117,11 +116,14 @@ is not a prerequisite for video.
 ## Development
 
 ```
-make test           # 167 tests, no server or terminal needed
+make test           # 174 tests, no server or terminal needed
 make check          # fmt, clippy, tests
 make test-live      # 4 more, against the real desktop container
 make perf           # time the compose pipeline
 ```
+
+The protocol layer is vendored rather than a dependency — [`src/rfb/README.md`](src/rfb/README.md)
+says why, and what was fixed on the way in.
 
 There are three integration suites and they cover different ground.
 
@@ -157,6 +159,33 @@ VNC_PASSWORD=… vnctui localhost::5901
 `--log-file` is the only way to get diagnostics; anything written to stdout would
 land in the middle of a graphics escape sequence.
 
+## Extensions it negotiates
+
+Beyond the encodings, three extensions earn their keep.
+
+**Continuous updates** (-313), with **Fence** (-312). The server pushes frames instead
+of answering a request each time, saving a round trip per frame — the difference
+between 20 fps and 40 on a 25 ms link. The server admits the extension exists by
+answering `SetEncodings` with `EndOfContinuousUpdates`; from then on no requests go out
+at all, and a fence is echoed back with the request bit cleared and any flag we do not
+implement stripped. TigerVNC negotiates this, so `make test-live` covers it against a
+real server rather than only a cooperative fake.
+
+**Lock-key state** (`QEMULedEvent`, -261). A remote caps lock that disagrees with the
+local keyboard turns every keystroke into the wrong case, and nothing in the keystroke
+itself reveals it. The server reports its lock state, and when that disagrees with what
+the terminal says, a lock-key tap goes out *before* the keystroke. The remembered state
+is cleared at that moment: the correction takes a round trip to be reflected, and
+acting on the stale value would toggle it straight back. Local state comes from the
+Kitty keyboard protocol; without it we report "unknown" and leave the remote alone,
+because an unset bit would otherwise read as "off".
+
+**Quality and compression hints** (-32..-23, -256..-247), via `--quality` and
+`--compression`. Both default to *unset*, and for quality that is the important case:
+the spec says Tight does not use JPEG at all unless a quality level is given, so saying
+nothing is the only way to ask for a lossless picture. Setting `--quality` turns JPEG
+on — what you want on a link too slow for lossless, and not otherwise.
+
 ## Checked against noVNC
 
 The protocol half was reviewed line by line against [noVNC's `rfb.js`](https://github.com/novnc/noVNC/blob/master/core/rfb.js),
@@ -175,18 +204,27 @@ request was queued on the render tick instead of being sent the moment an update
 finished, which left the server idle for up to a whole frame interval. noVNC sends it
 from the message handler, and now so does this.
 
-noVNC has three things this does not, all worth having: continuous updates (the
-server pushes frames without a request per frame), quality and compression level
-hints for Tight, and QEMU extended key events for keys X11 keysyms cannot express.
+A second pass over the areas the first one skipped found two more, both fixed:
+focus reporting (mode `1004`) was never enabled, so the terminal never reported focus
+loss and the code that releases held keys was unreachable — a modifier held while
+switching away stayed held on the remote; and a paste containing non-Latin-1
+characters dropped them, shortening the text, where noVNC substitutes `?` and keeps
+its shape.
 
-## The RFB layer
+Everything that pass judged worth having has since been implemented: **lock-key
+sync**, **continuous updates** with **fence**, and the **quality and compression
+hints**. See *Extensions it negotiates* above.
 
-`src/rfb/` is vendored from `vnc-rs` 0.5.3 (MIT OR Apache-2.0) rather than used as a
-dependency, because this client needs `SetDesktopSize`, a signal that a framebuffer
-update finished, and a screen size that survives a resize. While vendoring, four
-remotely-triggerable panics, two unbounded allocations, one case of undefined
-behaviour and two unsound `transmute`s were fixed, and the TRLE decoder was dropped
-as unusable. `src/rfb/mod.rs` lists all of it.
+### Still missing, in rough order of what you would notice
+
+| | what it is | worth it? |
+|---|---|---|
+| **`QEMUExtendedKeyEvent`** (-258) | raw scancodes, for keys X11 keysyms cannot express and layouts that disagree | maybe — a terminal reports far less than a browser does anyway |
+| **`DesktopName`** (-307) | the server renaming the desktop mid-session; ours shows the name from connect time only | cosmetic |
+| **Extended clipboard** (-1063) | large transfers, other formats, and clipboard *requests* rather than pushes | no — we correctly refuse it, and RFB's Latin-1 text covers the terminal case |
+| **`ExtendedMouseButtons`** (-316) | back and forward buttons | no — terminals report three buttons |
+| **XVP** (-309) | remote shutdown, reboot, reset | no |
+| **Cursor pseudo-encodings** (-239, -1006) | local cursor rendering | listed below |
 
 ## Not done yet
 

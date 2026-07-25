@@ -21,7 +21,7 @@ use crate::rfb::{
     VncEncoding, VncError, VncEvent, X11Event,
 };
 use crate::term::caps::Caps;
-use crate::term::input::{Command, InputMapper, KeyOutcome};
+use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
 use crate::ui::status;
@@ -103,7 +103,7 @@ pub async fn run(
     // The first connection is made before the alternate screen, so that a
     // password prompt is somewhere the user can see it. Later attempts reuse the
     // password and need no prompt.
-    let (client, password) = connect(addr, password).await?;
+    let (client, password) = connect(addr, password, args).await?;
     guard.begin_full_screen()?;
 
     let mut next = Some(client);
@@ -115,7 +115,7 @@ pub async fn run(
                 backoff = RECONNECT_BACKOFF;
                 client
             }
-            None => match try_connect(addr, password.clone()).await {
+            None => match try_connect(addr, password.clone(), args.quality, args.compression).await {
                 Ok(client) => {
                     backoff = RECONNECT_BACKOFF;
                     client
@@ -167,12 +167,16 @@ fn notice(text: &str) {
 
 /// Open the connection, prompting for a password only if the server asks for one
 /// and none was supplied.
-async fn connect(addr: &str, password: Option<String>) -> Result<(VncClient, Option<String>)> {
-    match try_connect(addr, password.clone()).await {
+async fn connect(
+    addr: &str,
+    password: Option<String>,
+    args: &Args,
+) -> Result<(VncClient, Option<String>)> {
+    match try_connect(addr, password.clone(), args.quality, args.compression).await {
         Ok(client) => Ok((client, password)),
         Err(VncError::NoPassword) => {
             let password = crate::prompt_password(addr)?;
-            let client = try_connect(addr, Some(password.clone()))
+            let client = try_connect(addr, Some(password.clone()), args.quality, args.compression)
                 .await
                 .map_err(|err| anyhow::anyhow!("{err}"))?;
             Ok((client, Some(password)))
@@ -181,7 +185,12 @@ async fn connect(addr: &str, password: Option<String>) -> Result<(VncClient, Opt
     }
 }
 
-async fn try_connect(addr: &str, password: Option<String>) -> Result<VncClient, VncError> {
+async fn try_connect(
+    addr: &str,
+    password: Option<String>,
+    quality: Option<u8>,
+    compression: Option<u8>,
+) -> Result<VncClient, VncError> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| VncError::General(format!("timed out connecting to {addr}")))?
@@ -203,6 +212,15 @@ async fn try_connect(addr: &str, password: Option<String>) -> Result<VncClient, 
         .add_encoding(VncEncoding::ExtendedDesktopSizePseudo)
         .add_encoding(VncEncoding::DesktopSizePseudo)
         .add_encoding(VncEncoding::LastRectPseudo)
+        // Ask the server to push frames rather than answer a request each time, which
+        // saves a round trip per frame; Fence is what makes that safe to negotiate.
+        .add_encoding(VncEncoding::ContinuousUpdatesPseudo)
+        .add_encoding(VncEncoding::FencePseudo)
+        // And to tell us its lock-key state, so a caps lock that disagrees with the
+        // local keyboard can be corrected instead of shouting.
+        .add_encoding(VncEncoding::QemuLedStatePseudo)
+        .set_quality(quality)
+        .set_compression(compression)
         .allow_shared(true)
         // BGRA is what an x86 server produces natively, so this is the format
         // that costs neither side a swizzle on the wire. The pack to RGB happens
@@ -239,6 +257,16 @@ struct Session {
     awaiting_update: bool,
     requested_at: Instant,
     rtt: Duration,
+    /// The server pushes updates without being asked, so no requests are sent.
+    continuous_updates: bool,
+    /// The rectangle continuous updates was last enabled for, so a resize can tell
+    /// whether it needs to say so again.
+    continuous_rect: Option<(u16, u16)>,
+    /// The remote lock-key state, when the server tells us. `None` means unknown,
+    /// which is also what it becomes right after a correction is sent: the answer
+    /// takes a moment to arrive and acting twice would toggle it back.
+    remote_caps_lock: Option<bool>,
+    remote_num_lock: Option<bool>,
 
     view_only: bool,
     no_clipboard: bool,
@@ -286,6 +314,10 @@ impl Session {
             awaiting_update: true, // the engine asks for the first frame itself
             requested_at: Instant::now(),
             rtt: Duration::ZERO,
+            continuous_updates: false,
+            continuous_rect: None,
+            remote_caps_lock: None,
+            remote_num_lock: None,
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
             show_help: false,
@@ -386,6 +418,41 @@ impl Session {
             VncEvent::SetPixelFormat(pf) => {
                 tracing::debug!("server pixel format: {pf:?}");
             }
+            VncEvent::LedState { num, caps, .. } => {
+                // Only useful as something to compare the local keyboard against, so
+                // scroll lock is ignored: no terminal reports it.
+                tracing::debug!("remote lock keys: caps={caps} num={num}");
+                self.remote_caps_lock = Some(caps);
+                self.remote_num_lock = Some(num);
+            }
+            VncEvent::EndOfContinuousUpdates => {
+                // The first one of these is the server saying the extension exists.
+                // Any later one means it stopped, and asking again is how it restarts.
+                if !self.continuous_updates {
+                    tracing::info!("server supports continuous updates; enabling");
+                    self.set_note("continuous updates: the server pushes frames".into());
+                }
+                self.continuous_updates = false;
+                self.continuous_rect = None;
+                self.enable_continuous_updates().await?;
+            }
+            VncEvent::Fence { flags, payload } => {
+                // A fence with the request bit set has to come back with that bit
+                // cleared, along with any flag we do not understand. Ours arrive in
+                // order and are handled one at a time, which is what BlockBefore and
+                // BlockAfter ask for, so echoing is all there is to do.
+                if flags & crate::rfb::fence::REQUEST != 0 {
+                    let echo = flags
+                        & (crate::rfb::fence::BLOCK_BEFORE | crate::rfb::fence::BLOCK_AFTER);
+                    self.send(X11Event::Fence {
+                        flags: echo,
+                        payload,
+                    })
+                    .await?;
+                } else {
+                    tracing::debug!("unsolicited fence response, flags {flags:#x}");
+                }
+            }
             // Requested only once local cursor rendering exists; until then the
             // server draws the pointer into the framebuffer itself.
             VncEvent::SetCursor(..) => {}
@@ -418,6 +485,9 @@ impl Session {
         }
         tracing::info!("remote framebuffer is now {}x{}", size.0, size.1);
         self.remote = size;
+        // The pushed region is remembered by the server, so a new size means saying
+        // so again or the rest of the screen never arrives.
+        self.continuous_rect = None;
         self.fb
             .resize(u32::from(size.0), u32::from(size.1));
         self.pan = (0, 0);
@@ -580,17 +650,23 @@ impl Session {
 
     async fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::Key(key) => match self.input.on_key(key) {
+            Event::Key(key) => {
+                let locks = self.input.lock_state(&key);
+                match self.input.on_key(key) {
                 KeyOutcome::Ignored => {}
                 KeyOutcome::Keys(keys) => {
                     if !self.view_only {
+                        // Before the keystroke, not after: the whole point is that the
+                        // remote interprets *this* key with the right lock state.
+                        self.sync_lock_keys(locks).await?;
                         for key in keys {
                             self.send(X11Event::KeyEvent(key)).await?;
                         }
                     }
                 }
                 KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
-            },
+                }
+            }
             Event::Mouse(mouse) => {
                 if !self.view_only {
                     let events = {
@@ -604,11 +680,21 @@ impl Session {
             }
             Event::Paste(text) => {
                 if !self.view_only && !self.no_clipboard {
-                    // RFB clipboard traffic is Latin-1, so anything outside it has
-                    // to go rather than be mangled into something else.
-                    let latin1: String = text.chars().filter(|c| (*c as u32) < 0x100).collect();
+                    // RFB clipboard traffic is Latin-1 only. Substitute rather than
+                    // drop: deleting characters silently shortens the text and moves
+                    // everything after them, where a question mark leaves the shape
+                    // intact and is visibly a substitution. noVNC does the same.
+                    let dropped = text.chars().filter(|c| (*c as u32) > 0xff).count();
+                    let latin1: String = text
+                        .chars()
+                        .map(|c| if (c as u32) > 0xff { '?' } else { c })
+                        .collect();
                     self.send(X11Event::CopyText(latin1)).await?;
-                    self.set_note("pasted to the remote clipboard".into());
+                    self.set_note(if dropped > 0 {
+                        format!("pasted; {dropped} character(s) are not Latin-1 and became '?'")
+                    } else {
+                        "pasted to the remote clipboard".into()
+                    });
                 }
             }
             Event::Resize(..) => {
@@ -728,7 +814,7 @@ impl Session {
         // gone quiet.
         if !self.awaiting_update {
             self.request_update().await?;
-        } else if self.requested_at.elapsed() > UPDATE_WATCHDOG {
+        } else if !self.continuous_updates && self.requested_at.elapsed() > UPDATE_WATCHDOG {
             tracing::debug!(
                 "no update for {:?}; asking again",
                 self.requested_at.elapsed()
@@ -740,6 +826,69 @@ impl Session {
         self.draw()
     }
 
+    /// Ask the server to push updates for the whole framebuffer.
+    ///
+    /// Re-sent after a resize: the rectangle is remembered by the server, and the
+    /// spec says a second enable replaces the coordinates rather than adding to them.
+    async fn enable_continuous_updates(&mut self) -> Result<()> {
+        let size = self.remote;
+        if self.continuous_updates && self.continuous_rect == Some(size) {
+            return Ok(());
+        }
+        self.send(X11Event::EnableContinuousUpdates {
+            enable: true,
+            rect: crate::rfb::Rect {
+                x: 0,
+                y: 0,
+                width: size.0,
+                height: size.1,
+            },
+        })
+        .await?;
+        self.continuous_updates = true;
+        self.continuous_rect = Some(size);
+        // Nothing is outstanding any more: frames arrive unbidden from here.
+        self.awaiting_update = false;
+        Ok(())
+    }
+
+    /// Bring the remote lock keys into line with the local keyboard.
+    ///
+    /// A remote caps lock that disagrees with the local one turns every keystroke
+    /// into the wrong case, and nothing in the key events themselves reveals it --
+    /// the server has to say so, which is what the LED-state encoding is for.
+    async fn sync_lock_keys(&mut self, local: LockState) -> Result<()> {
+        // Decide first, send second: holding a borrow on the state while awaiting a
+        // send would mean borrowing self twice.
+        let mut corrections = Vec::new();
+        if let (Some(local_on), Some(remote_on)) = (local.caps, self.remote_caps_lock)
+            && local_on != remote_on
+        {
+            // Forget the remembered state before sending: the correction takes a round
+            // trip to come back, and acting on the stale value would toggle it again.
+            self.remote_caps_lock = None;
+            corrections.push(("caps lock", crate::term::keysym::CAPS_LOCK));
+        }
+        if let (Some(local_on), Some(remote_on)) = (local.num, self.remote_num_lock)
+            && local_on != remote_on
+        {
+            self.remote_num_lock = None;
+            corrections.push(("num lock", crate::term::keysym::NUM_LOCK));
+        }
+
+        for (name, keysym) in corrections {
+            tracing::debug!("correcting remote {name}");
+            for down in [true, false] {
+                self.send(X11Event::KeyEvent(crate::rfb::ClientKeyEvent {
+                    keycode: keysym,
+                    down,
+                }))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Ask for the next incremental update, keeping one in flight at a time.
     ///
     /// A floor on the interval guards against a server that answers an incremental
@@ -747,6 +896,10 @@ impl Session {
     /// request until something changes, and a server that does not would otherwise
     /// have us both spinning at full tilt.
     async fn request_update(&mut self) -> Result<()> {
+        // The server is pushing frames; asking as well would undo the point of it.
+        if self.continuous_updates {
+            return Ok(());
+        }
         if self.awaiting_update {
             return Ok(());
         }

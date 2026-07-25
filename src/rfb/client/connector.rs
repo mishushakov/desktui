@@ -137,6 +137,8 @@ where
                             connector.allow_shared,
                             connector.pixel_format,
                             connector.encodings,
+                            connector.quality,
+                            connector.compression,
                         )
                         .await?,
                     ))
@@ -167,6 +169,8 @@ where
     allow_shared: bool,
     pixel_format: Option<PixelFormat>,
     encodings: Vec<VncEncoding>,
+    quality: Option<u8>,
+    compression: Option<u8>,
 }
 
 impl<S, F> VncConnector<S, F>
@@ -209,6 +213,8 @@ where
             rfb_version: VncVersion::RFB38,
             pixel_format: None,
             encodings: Vec::new(),
+            quality: None,
+            compression: None,
         }
     }
 
@@ -306,6 +312,23 @@ where
     ///
     pub fn add_encoding(mut self, encoding: VncEncoding) -> Self {
         self.encodings.push(encoding);
+        self
+    }
+
+    /// Ask for a JPEG quality level, 0 (worst) to 9 (best).
+    ///
+    /// Leaving this unset is meaningful: the spec says Tight does not use JPEG at all
+    /// unless a quality level is given, so silence is how a client asks for a lossless
+    /// picture.
+    pub fn set_quality(mut self, level: Option<u8>) -> Self {
+        self.quality = level;
+        self
+    }
+
+    /// Ask for a compression level, 0 (least) to 9 (most). Lossless either way: this
+    /// trades the server's CPU against bandwidth.
+    pub fn set_compression(mut self, level: Option<u8>) -> Self {
+        self.compression = level;
         self
     }
 

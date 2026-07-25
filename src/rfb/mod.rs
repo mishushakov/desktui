@@ -42,11 +42,11 @@ mod error;
 mod event;
 
 pub use client::{VncClient, VncConnector};
-pub use config::{PixelFormat, VncEncoding, VncVersion};
+pub use config::{PixelFormat, VncEncoding, VncVersion, hint};
 pub use error::VncError;
 pub use event::{
     ClientKeyEvent, ClientMouseEvent, Rect, ResizeStatus, Screen, ScreenInfo, ScreenLayout,
-    VncEvent, X11Event,
+    VncEvent, X11Event, fence,
 };
 
 /// Largest allocation we will make on a server's word alone.
