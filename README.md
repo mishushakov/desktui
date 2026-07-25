@@ -44,6 +44,13 @@ collides with tmux.
 Needs a Rust toolchain that speaks edition 2024 (1.85 or newer).
 
 ```
+cargo install desktui --locked
+```
+
+That installs the [released version](https://crates.io/crates/desktui). To get
+unreleased changes, build from the repository instead:
+
+```
 cargo install --git https://github.com/mishushakov/desktui --locked
 ```
 
@@ -53,7 +60,7 @@ Or from a checkout:
 cargo install --path . --locked
 ```
 
-Either one builds with the release profile and puts `desktui` in `~/.cargo/bin`, which
+All three build with the release profile and put `desktui` in `~/.cargo/bin`, which
 needs to be on your `PATH`. `--locked` builds against the versions in `Cargo.lock`;
 drop it to let Cargo pick newer ones.
 
