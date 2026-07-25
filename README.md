@@ -31,28 +31,13 @@ alone in both directions.
 **Look without touching.** `--view-only` for the session, `Ctrl+A v` to toggle. It
 stops input reaching the remote and leaves the pointer for the server to draw.
 
-**Survives a flaky link.** `--reconnect` retries with backoff, so a closed lid or a
-Wi-Fi handoff does not end the session.
-
 **Tuned for the link you are on.** `--quality` and `--compression` trade sharpness and
 server CPU against bandwidth, and `--fps` caps the frame rate. The defaults are
 lossless at 60 fps; turn quality down only when the link cannot afford it.
 
-**A password that does not leak.** `--password-file`, `$VNC_PASSWORD`, or a prompt that
-only appears if the server actually asks.
-
 **Your keys reach the remote, not the terminal.** Everything is passed through,
 including `Ctrl+C`. Local commands live behind `Ctrl+A`, which `--prefix` moves when it
 collides with tmux.
-
-**Fast where it can be, correct where it cannot.** `--transfer auto` picks the quickest
-path the terminal supports and falls back over SSH, and `Ctrl+A c` shows fps, bandwidth
-and server round-trip so you can see which one you got.
-
-**It tells you why it is not working.** `--print-caps` reports what the terminal
-supports before you connect, `--test-pattern` exercises the display path with no server
-at all, `--force` overrides the probe, and `--log-file` captures diagnostics. Refused
-resizes and unsupported authentication say so instead of hanging.
 
 ## Installing
 
