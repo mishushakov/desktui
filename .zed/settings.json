@@ -1,0 +1,15 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          // Setting `cfgs` replaces the default list, so the two defaults
+          // (`debug_assertions`, `miri`) are repeated here. Without `test`,
+          // rust-analyzer greys out every `#[cfg(test)] mod tests` block as
+          // inactive code.
+          "cfgs": ["debug_assertions", "miri", "test"]
+        }
+      }
+    }
+  }
+}
