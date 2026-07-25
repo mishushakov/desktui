@@ -212,6 +212,18 @@ impl Layout {
         padded.intersect(&Rect::new(0, 0, self.dst_w, self.dst_h))
     }
 
+    /// Map a terminal pixel position into destination pixels, or `None` when it is
+    /// outside the drawn image.
+    pub fn terminal_px_to_dst(&self, tx: u32, ty: u32) -> Option<(u32, u32)> {
+        let ox = u32::from(self.origin_col) * self.cell_w;
+        let oy = u32::from(self.origin_row) * self.cell_h;
+        if tx < ox || ty < oy {
+            return None;
+        }
+        let (dx, dy) = (tx - ox, ty - oy);
+        (dx < self.dst_w && dy < self.dst_h).then_some((dx, dy))
+    }
+
     /// Map a terminal pixel position to a source pixel, clamped into the image.
     ///
     /// Returns `None` when the position is outside the drawn image, so a click
@@ -298,6 +310,29 @@ impl TileGrid {
     }
 }
 
+/// A mouse cursor, drawn by us rather than by the server.
+///
+/// Asking for the `Cursor` pseudo-encoding stops the server compositing the pointer
+/// into the framebuffer and has it send the shape instead, which is what lets the
+/// pointer move at local speed rather than at the speed of a round trip.
+#[derive(Debug, Clone)]
+pub struct Cursor {
+    pub w: u32,
+    pub h: u32,
+    /// The point within the image that sits under the pointer.
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// BGRA, with alpha taken from the cursor's mask, so 0 or 255.
+    pub pixels: Vec<u8>,
+}
+
+impl Cursor {
+    /// Is there anything to draw? A zero-sized cursor is how a server hides it.
+    fn is_visible(&self) -> bool {
+        self.w > 0 && self.h > 0 && self.pixels.len() >= (self.w as usize) * (self.h as usize) * 4
+    }
+}
+
 /// What one composed frame cost.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FrameStats {
@@ -328,6 +363,9 @@ pub struct Renderer {
     /// Tiles present in the terminal's image store, so a shrinking grid can
     /// clean up after itself.
     placed: usize,
+    cursor: Option<Cursor>,
+    /// Where the cursor's hotspot is, in destination pixels.
+    cursor_at: Option<(u32, u32)>,
     transfer: Transfer,
     shm: ShmPool,
     /// Set once, if shared memory turns out not to work, so the warning is not
@@ -348,6 +386,8 @@ impl Renderer {
             scaled: Framebuffer::new(0, 0),
             scratch: Vec::with_capacity(TILE_TARGET_PX as usize * TILE_TARGET_PX as usize * 3),
             placed: 0,
+            cursor: None,
+            cursor_at: None,
             transfer,
             shm: ShmPool::new(),
             shm_failed: false,
@@ -399,6 +439,17 @@ impl Renderer {
         let Some(dst) = self.layout.src_to_dst(r) else {
             return;
         };
+        self.mark_dst(dst);
+    }
+
+    /// Mark damage already in destination pixels, as the cursor overlay is.
+    pub fn mark_dst(&mut self, r: Rect) {
+        if r.is_empty() || self.grid.len() == 0 {
+            return;
+        }
+        let Some(dst) = r.intersect(&Rect::new(0, 0, self.layout.dst_w, self.layout.dst_h)) else {
+            return;
+        };
         let (x0, y0, x1, y1) = self.grid.tiles_covering(dst);
         for ty in y0..=y1 {
             for tx in x0..=x1 {
@@ -408,6 +459,81 @@ impl Renderer {
                         *slot = true;
                         self.dirty_count += 1;
                     }
+            }
+        }
+    }
+
+    /// Adopt a new cursor shape. The old one has to be repaired over.
+    pub fn set_cursor(&mut self, cursor: Option<Cursor>) {
+        if let Some(old) = self.cursor_rect() {
+            self.mark_dst(old);
+        }
+        self.cursor = cursor;
+        if let Some(new) = self.cursor_rect() {
+            self.mark_dst(new);
+        }
+    }
+
+    /// Move the cursor, in destination pixels. `None` hides it.
+    ///
+    /// Both the rectangle it left and the one it arrived at need repainting, or the
+    /// pointer smears a trail across the screen.
+    pub fn move_cursor(&mut self, at: Option<(u32, u32)>) {
+        if self.cursor_at == at {
+            return;
+        }
+        if let Some(old) = self.cursor_rect() {
+            self.mark_dst(old);
+        }
+        self.cursor_at = at;
+        if let Some(new) = self.cursor_rect() {
+            self.mark_dst(new);
+        }
+    }
+
+    /// Where the cursor sits in destination pixels, if it is being drawn at all.
+    fn cursor_rect(&self) -> Option<Rect> {
+        let cursor = self.cursor.as_ref()?;
+        if !cursor.is_visible() {
+            return None;
+        }
+        let (x, y) = self.cursor_at?;
+        // The hotspot is the point under the pointer, so the image starts above and
+        // left of it -- and may start off-screen, which is normal near an edge.
+        Some(Rect::new(
+            x.saturating_sub(cursor.hot_x),
+            y.saturating_sub(cursor.hot_y),
+            cursor.w,
+            cursor.h,
+        ))
+    }
+
+    /// Blend the cursor into one packed RGB tile.
+    ///
+    /// Drawing at composition time rather than into the framebuffer keeps the server's
+    /// picture untouched: there is nothing to save and restore, and a cursor that moves
+    /// twice between frames costs nothing extra.
+    fn blend_cursor(cursor: &Cursor, rect: Rect, tile: Rect, out: &mut [u8]) {
+        let Some(overlap) = rect.intersect(&tile) else {
+            return;
+        };
+
+        for row in overlap.y..overlap.bottom() {
+            for col in overlap.x..overlap.right() {
+                let cx = col - rect.x;
+                let cy = row - rect.y;
+                let src = ((cy as usize) * (cursor.w as usize) + cx as usize) * 4;
+                // Alpha comes from the cursor's mask, so it is 0 or 255: anything
+                // non-zero replaces the pixel underneath.
+                if cursor.pixels[src + 3] == 0 {
+                    continue;
+                }
+                let dst = (((row - tile.y) as usize) * (tile.w as usize)
+                    + (col - tile.x) as usize)
+                    * 3;
+                out[dst] = cursor.pixels[src + 2];
+                out[dst + 1] = cursor.pixels[src + 1];
+                out[dst + 2] = cursor.pixels[src];
             }
         }
     }
@@ -467,6 +593,8 @@ impl Renderer {
             (fb, self.layout.src.x, self.layout.src.y)
         };
 
+        let cursor_rect = self.cursor_rect();
+
         for ty in 0..self.grid.ny {
             for tx in 0..self.grid.nx {
                 let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
@@ -483,6 +611,11 @@ impl Renderer {
                     Rect::new(tile.x + off_x, tile.y + off_y, tile.w, tile.h),
                     &mut self.scratch,
                 );
+                // Borrowed apart from `scratch` on purpose: the cursor and the
+                // buffer both live in `self`.
+                if let (Some(cursor), Some(rect)) = (self.cursor.as_ref(), cursor_rect) {
+                    Self::blend_cursor(cursor, rect, tile, &mut self.scratch);
+                }
 
                 let col = self.layout.origin_col + tx * self.grid.tile_cols;
                 let row = self.layout.origin_row + ty * self.grid.tile_rows;
@@ -761,6 +894,187 @@ mod tests {
         if oy > 0 {
             assert_eq!(l.terminal_px_to_src(ox, oy - 1), None);
         }
+    }
+
+    /// A 2x2 cursor: opaque red, transparent, transparent, opaque blue. BGRA, with
+    /// alpha in the fourth byte, which is what the cursor decoder produces.
+    fn test_cursor(hot_x: u32, hot_y: u32) -> Cursor {
+        Cursor {
+            w: 2,
+            h: 2,
+            hot_x,
+            hot_y,
+            pixels: vec![
+                0, 0, 255, 255, // red, opaque
+                0, 0, 0, 0, // transparent
+                0, 0, 0, 0, // transparent
+                255, 0, 0, 255, // blue, opaque
+            ],
+        }
+    }
+
+    fn native_renderer(m: &Metrics) -> (Renderer, Framebuffer) {
+        let (w, h) = m.image_area();
+        let layout = Layout::compute(m, ScaleMode::Native, w, h, (0, 0));
+        (
+            Renderer::new(layout, false, Transfer::Direct),
+            Framebuffer::new(w, h),
+        )
+    }
+
+    #[test]
+    fn the_cursor_is_drawn_only_where_it_is_opaque() {
+        // Blending is checked directly: going through `compose` would mean reassembling
+        // seventeen base64 chunks to see four pixels.
+        let cursor = test_cursor(0, 0);
+        let tile = Rect::new(0, 0, 4, 2);
+        // Background is RGB here, packed the way a tile is.
+        let mut out = vec![0u8; (tile.w * tile.h * 3) as usize];
+        for px in out.chunks_exact_mut(3) {
+            px.copy_from_slice(&[30, 20, 10]);
+        }
+
+        Renderer::blend_cursor(&cursor, Rect::new(0, 0, 2, 2), tile, &mut out);
+
+        let px = |x: usize, y: usize| {
+            let i = (y * tile.w as usize + x) * 3;
+            (out[i], out[i + 1], out[i + 2])
+        };
+        // The cursor is BGRA; the tile is RGB, so the channels have to be swapped.
+        assert_eq!(px(0, 0), (255, 0, 0), "opaque red should be drawn");
+        assert_eq!(px(1, 1), (0, 0, 255), "opaque blue should be drawn");
+        assert_eq!(px(1, 0), (30, 20, 10), "transparent must not paint");
+        assert_eq!(px(0, 1), (30, 20, 10), "transparent must not paint");
+        assert_eq!(px(3, 0), (30, 20, 10), "outside the cursor is untouched");
+    }
+
+    #[test]
+    fn a_cursor_straddling_a_tile_boundary_draws_only_its_half() {
+        // Each tile is packed separately, so a cursor across a seam has to appear in
+        // both and be clipped to each.
+        let cursor = test_cursor(0, 0);
+        let rect = Rect::new(3, 0, 2, 2); // spans x=3..5
+        let tile = Rect::new(0, 0, 4, 2); // covers x=0..4
+        let mut out = vec![0u8; (tile.w * tile.h * 3) as usize];
+
+        Renderer::blend_cursor(&cursor, rect, tile, &mut out);
+
+        let px = |x: usize, y: usize| {
+            let i = (y * tile.w as usize + x) * 3;
+            (out[i], out[i + 1], out[i + 2])
+        };
+        assert_eq!(px(3, 0), (255, 0, 0), "the half inside this tile is drawn");
+        // The blue pixel is at cursor (1,1), i.e. x=4, which is the next tile's.
+        assert_eq!(px(0, 1), (0, 0, 0), "nothing bleeds into the wrong column");
+    }
+
+    #[test]
+    fn the_cursor_reaches_the_terminal_when_composed() {
+        let m = ghostty();
+        let (mut r, mut fb) = native_renderer(&m);
+        fb.fill(fb.rect(), [10, 20, 30]);
+        r.set_cursor(Some(test_cursor(0, 0)));
+        r.move_cursor(Some((0, 0)));
+
+        let mut out = Vec::new();
+        let stats = r.compose(&fb, &mut out);
+        assert!(stats.tiles > 0, "a cursor with a shape has to produce a frame");
+    }
+
+    #[test]
+    fn moving_the_cursor_damages_where_it_was_and_where_it_went() {
+        // Otherwise the pointer smears a trail of itself across the screen.
+        let m = ghostty();
+        let (mut r, _fb) = native_renderer(&m);
+        r.set_cursor(Some(test_cursor(0, 0)));
+        r.move_cursor(Some((10, 10)));
+        r.commit();
+        assert!(!r.has_work());
+
+        // Far enough to land in another tile: both must be repainted.
+        r.move_cursor(Some((600, 10)));
+        assert_eq!(r.dirty_tiles(), 2, "the old tile and the new one");
+
+        // A move within one tile dirties just that tile.
+        r.commit();
+        r.move_cursor(Some((604, 10)));
+        assert_eq!(r.dirty_tiles(), 1);
+
+        // And a move to the same place is not damage at all.
+        r.commit();
+        r.move_cursor(Some((604, 10)));
+        assert_eq!(r.dirty_tiles(), 0);
+    }
+
+    #[test]
+    fn the_hotspot_places_the_cursor_relative_to_the_pointer() {
+        let m = ghostty();
+        let (mut r, _fb) = native_renderer(&m);
+        // A hotspot in the middle of the image means the image starts above and left.
+        r.set_cursor(Some(test_cursor(1, 1)));
+        r.move_cursor(Some((100, 100)));
+        assert_eq!(r.cursor_rect(), Some(Rect::new(99, 99, 2, 2)));
+
+        // Near the top-left corner it is clamped rather than wrapping around.
+        r.move_cursor(Some((0, 0)));
+        assert_eq!(r.cursor_rect(), Some(Rect::new(0, 0, 2, 2)));
+    }
+
+    #[test]
+    fn a_cursor_at_the_edge_is_clipped_not_fatal() {
+        let m = ghostty();
+        let (mut r, fb) = native_renderer(&m);
+        let (w, h) = m.image_area();
+        r.set_cursor(Some(test_cursor(0, 0)));
+        // Straddling the bottom-right corner: half of it has nowhere to go.
+        r.move_cursor(Some((w - 1, h - 1)));
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn hiding_the_cursor_repairs_what_it_covered() {
+        let m = ghostty();
+        let (mut r, _fb) = native_renderer(&m);
+        r.set_cursor(Some(test_cursor(0, 0)));
+        r.move_cursor(Some((50, 50)));
+        r.commit();
+
+        r.move_cursor(None);
+        assert_eq!(r.dirty_tiles(), 1, "the tile it left has to be repainted");
+        assert!(r.cursor_rect().is_none());
+    }
+
+    #[test]
+    fn a_zero_sized_cursor_is_how_a_server_hides_it() {
+        let m = ghostty();
+        let (mut r, _fb) = native_renderer(&m);
+        r.set_cursor(Some(Cursor {
+            w: 0,
+            h: 0,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: Vec::new(),
+        }));
+        r.move_cursor(Some((10, 10)));
+        assert!(r.cursor_rect().is_none(), "nothing to draw, so nothing drawn");
+    }
+
+    #[test]
+    fn a_cursor_shorter_than_its_dimensions_is_refused() {
+        // A malformed shape must not be indexed into.
+        let m = ghostty();
+        let (mut r, _fb) = native_renderer(&m);
+        r.set_cursor(Some(Cursor {
+            w: 16,
+            h: 16,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0; 4],
+        }));
+        r.move_cursor(Some((10, 10)));
+        assert!(r.cursor_rect().is_none());
     }
 
     #[test]

@@ -84,6 +84,14 @@ need no delete traffic and never flicker. A one-pixel change costs about a kilob
 Tiles are placed with `z=-1`, below text and above the cell background, so the
 status line and help overlay stay readable on top of the remote screen.
 
+The mouse pointer is drawn here rather than by the server: asking for the `Cursor`
+pseudo-encoding gets the shape sent once and stops the server compositing it into the
+framebuffer, so the pointer keeps up with your hand instead of lagging it by a round
+trip. It is blended into each tile as that tile is packed, which leaves the server's
+picture untouched — nothing to save and restore, and a pointer that moves twice between
+frames costs nothing extra. A view-only session does not ask, because there is no local
+pointer worth drawing and the server's own is the only way to see where the real one is.
+
 Update requests are paced against the end of each framebuffer update, so there is
 never more than one in flight and the request goes out the moment the previous update
 finishes — the server encodes the next frame while we are still drawing this one. A
@@ -185,13 +193,3 @@ because an unset bit would otherwise read as "off".
 the spec says Tight does not use JPEG at all unless a quality level is given, so saying
 nothing is the only way to ask for a lossless picture. Setting `--quality` turns JPEG
 on — what you want on a link too slow for lossless, and not otherwise.
-
-## Not done yet
-
-- **Local cursor rendering.** The `Cursor` pseudo-encoding is not requested, so the
-  server draws the pointer into the framebuffer. Correct, marginally laggier.
-- **VeNCrypt/TLS and Apple Remote Desktop auth.**
-- **tmux.** Would need Unicode placeholders.
-- **A half-block fallback** for terminals without graphics.
-- **Whole-frame transmission** when damage covers most of the screen, where one
-  large image would compress better than ninety tiles.

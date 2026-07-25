@@ -315,6 +315,13 @@ where
         self
     }
 
+    /// Add several encodings at once, which lets a caller decide conditionally
+    /// without breaking the builder chain.
+    pub fn add_encodings(mut self, encodings: &[VncEncoding]) -> Self {
+        self.encodings.extend_from_slice(encodings);
+        self
+    }
+
     /// Ask for a JPEG quality level, 0 (worst) to 9 (best).
     ///
     /// Leaving this unset is meaningful: the spec says Tight does not use JPEG at all

@@ -296,13 +296,17 @@ fn requests_the_encodings_it_can_actually_decode() {
                 encodings.contains(&-261),
                 "LED state missing: {encodings:?}"
             );
+            assert!(
+                encodings.contains(&-239),
+                "the cursor shape is what makes a local pointer possible: {encodings:?}"
+            );
 
             // Anything advertised has to be something we can consume. For a data
             // encoding that means a decoder, because rectangles carry no length and a
             // surprise would leave the stream unrecoverable. Fence and
             // ContinuousUpdates are different in kind: they are answered with
             // messages, never rectangles.
-            const DECODABLE_RECTS: [i32; 8] = [0, 1, 7, 16, -223, -224, -261, -308];
+            const DECODABLE_RECTS: [i32; 9] = [0, 1, 7, 16, -223, -224, -239, -261, -308];
             const NEGOTIATION_ONLY: [i32; 2] = [-312, -313];
             for encoding in &encodings {
                 assert!(
@@ -858,6 +862,79 @@ fn a_matching_caps_lock_is_left_alone() {
         "sent a lock-key correction with no LED state to justify it: {:?}",
         server.requests()
     );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn the_cursor_shape_is_requested_and_drawn_locally() {
+    // Asking for the shape is what stops the server compositing the pointer, so the
+    // pointer can then move at local speed rather than at a round trip's.
+    let ext = Extensions {
+        cursor: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+
+    match server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetEncodings(_))
+        })
+        .expect("no encodings negotiated")
+    {
+        Request::SetEncodings(encodings) => assert!(
+            encodings.contains(&-239),
+            "the cursor encoding was not requested: {encodings:?}"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // Moving the pointer has to produce frames without the server sending anything:
+    // the overlay is drawn on this side.
+    let before = count(&term.output(), b"\x1b_Ga=T");
+    for x in (200..500).step_by(30) {
+        term.send(format!("\x1b[<35;{x};200M").as_bytes());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        count(&term.output(), b"\x1b_Ga=T") > before,
+        "moving the pointer redrew nothing, so the cursor is not being composited"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn view_only_leaves_the_cursor_to_the_server() {
+    // With no local pointer worth drawing, the server should keep compositing its own
+    // -- otherwise a view-only session shows no pointer at all.
+    let server = FakeServer::start(800, 600, Resize::Accept);
+    let addr = server.addr.to_string();
+    let mut term = FakeTerm::spawn(
+        COLS,
+        ROWS,
+        PIXELS.0,
+        PIXELS.1,
+        &[&addr, "--view-only", "--scale", "fit", "--fps", "10"],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+
+    match server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetEncodings(_))
+        })
+        .expect("no encodings negotiated")
+    {
+        Request::SetEncodings(encodings) => assert!(
+            !encodings.contains(&-239),
+            "a view-only session should not take the cursor off the server: {encodings:?}"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));

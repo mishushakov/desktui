@@ -358,6 +358,58 @@ fn a_real_server_reports_its_lock_key_state() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn a_real_server_sends_a_cursor_shape() {
+    // TigerVNC only sends the shape once the encoding is requested, so this proves the
+    // pointer is genuinely ours to draw rather than baked into the framebuffer.
+    let log = std::env::temp_dir().join("vnctui-live-cursor.log");
+    let _ = std::fs::remove_file(&log);
+
+    let addr = server();
+    let mut term = FakeTerm::spawn_with_env(
+        COLS,
+        ROWS,
+        PIXELS.0,
+        PIXELS.1,
+        &[
+            addr.as_str(),
+            "--fps",
+            "15",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)));
+
+    // Nudge the pointer: some servers only send the shape once it is over the desktop.
+    for x in (200..500).step_by(50) {
+        term.send(format!("\x1b[<35;{x};200M").as_bytes());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let start = std::time::Instant::now();
+    let mut logged = String::new();
+    while start.elapsed() < Duration::from_secs(15) {
+        logged = std::fs::read_to_string(&log).unwrap_or_default();
+        if logged.contains("cursor shape") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        logged.contains("cursor shape"),
+        "the server never sent a cursor shape, so there is nothing to draw locally. \
+         Log:\n{logged}"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+    let _ = std::fs::remove_file(&log);
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 fn tail(buf: &[u8]) -> String {

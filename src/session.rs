@@ -115,7 +115,15 @@ pub async fn run(
                 backoff = RECONNECT_BACKOFF;
                 client
             }
-            None => match try_connect(addr, password.clone(), args.quality, args.compression).await {
+            None => match try_connect(
+                addr,
+                password.clone(),
+                args.quality,
+                args.compression,
+                !args.view_only,
+            )
+            .await
+            {
                 Ok(client) => {
                     backoff = RECONNECT_BACKOFF;
                     client
@@ -172,13 +180,27 @@ async fn connect(
     password: Option<String>,
     args: &Args,
 ) -> Result<(VncClient, Option<String>)> {
-    match try_connect(addr, password.clone(), args.quality, args.compression).await {
+    match try_connect(
+        addr,
+        password.clone(),
+        args.quality,
+        args.compression,
+        !args.view_only,
+    )
+    .await
+    {
         Ok(client) => Ok((client, password)),
         Err(VncError::NoPassword) => {
             let password = crate::prompt_password(addr)?;
-            let client = try_connect(addr, Some(password.clone()), args.quality, args.compression)
-                .await
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            let client = try_connect(
+                addr,
+                Some(password.clone()),
+                args.quality,
+                args.compression,
+                !args.view_only,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
             Ok((client, Some(password)))
         }
         Err(err) => Err(anyhow::anyhow!("{err}")).with_context(|| format!("connecting to {addr}")),
@@ -190,6 +212,7 @@ async fn try_connect(
     password: Option<String>,
     quality: Option<u8>,
     compression: Option<u8>,
+    local_cursor: bool,
 ) -> Result<VncClient, VncError> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
@@ -202,9 +225,7 @@ async fn try_connect(
         .set_auth_method(async move { password.ok_or(VncError::NoPassword) })
         // Order is preference order. Tight first: it is what every modern server
         // does best, and its JPEG rectangles are the cheapest way to move a busy
-        // screen. Cursor is deliberately absent, which leaves the server to draw
-        // the pointer into the framebuffer where it belongs until local cursor
-        // rendering exists.
+        // screen.
         .add_encoding(VncEncoding::Tight)
         .add_encoding(VncEncoding::Zrle)
         .add_encoding(VncEncoding::CopyRect)
@@ -219,6 +240,16 @@ async fn try_connect(
         // And to tell us its lock-key state, so a caps lock that disagrees with the
         // local keyboard can be corrected instead of shouting.
         .add_encoding(VncEncoding::QemuLedStatePseudo)
+        // Asking for the cursor shape stops the server drawing the pointer into the
+        // framebuffer, which is what lets it move at local speed instead of waiting for
+        // a round trip. Not asked for in a view-only session: there is no local pointer
+        // worth drawing there, and letting the server composite its own is the only way
+        // to see where the real one is.
+        .add_encodings(if local_cursor {
+            &[VncEncoding::CursorPseudo][..]
+        } else {
+            &[]
+        })
         .set_quality(quality)
         .set_compression(compression)
         .allow_shared(true)
@@ -453,9 +484,24 @@ impl Session {
                     tracing::debug!("unsolicited fence response, flags {flags:#x}");
                 }
             }
-            // Requested only once local cursor rendering exists; until then the
-            // server draws the pointer into the framebuffer itself.
-            VncEvent::SetCursor(..) => {}
+            VncEvent::SetCursor(rect, pixels) => {
+                // The rectangle's x and y are the hotspot rather than a position.
+                let cursor = crate::render::Cursor {
+                    w: u32::from(rect.width),
+                    h: u32::from(rect.height),
+                    hot_x: u32::from(rect.x),
+                    hot_y: u32::from(rect.y),
+                    pixels,
+                };
+                tracing::debug!(
+                    "cursor shape {}x{} hotspot {},{}",
+                    cursor.w,
+                    cursor.h,
+                    cursor.hot_x,
+                    cursor.hot_y
+                );
+                self.renderer.set_cursor(Some(cursor));
+            }
             VncEvent::Error(err) => anyhow::bail!("the server connection failed: {err}"),
         }
         Ok(())
@@ -668,6 +714,13 @@ impl Session {
                 }
             }
             Event::Mouse(mouse) => {
+                // Move the drawn cursor first and unconditionally: it is a local
+                // overlay, so it should keep up with the hand even while a frame is in
+                // flight.
+                let (tx, ty) = self.input.terminal_pixel(&mouse, &self.metrics);
+                let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
+                self.renderer.move_cursor(at);
+
                 if !self.view_only {
                     let events = {
                         let layout = *self.renderer.layout();

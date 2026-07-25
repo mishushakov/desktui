@@ -55,6 +55,9 @@ pub struct Extensions {
     pub fence: bool,
     /// Report lock-key state, with caps lock on.
     pub led_caps_on: bool,
+    /// Send a cursor shape, which a server only does once the client has asked for the
+    /// Cursor pseudo-encoding.
+    pub cursor: bool,
 }
 
 pub struct FakeServer {
@@ -184,6 +187,7 @@ fn serve(
                     stream.read_exact(&mut e)?;
                     encodings.push(i32::from_be_bytes(e));
                 }
+                let encodings_seen = encodings.clone();
                 record(&requests, Request::SetEncodings(encodings));
 
                 // The first sight of the ContinuousUpdates encoding is answered with
@@ -204,6 +208,15 @@ fn serve(
                 }
                 if extensions.led_caps_on {
                     send_led_state(&mut stream, true, false)?;
+                }
+                if extensions.cursor {
+                    // Only legal because the client asked: without the encoding the
+                    // server has to composite the pointer itself.
+                    assert!(
+                        encodings_seen.contains(&-239),
+                        "sent a cursor shape to a client that never asked for one"
+                    );
+                    send_cursor(&mut stream)?;
                 }
             }
             3 => {
@@ -354,6 +367,29 @@ fn serve(
         }
     }
     Ok(())
+}
+
+/// A 4x4 cursor with a hotspot in the middle, as a Cursor pseudo-rectangle.
+///
+/// The payload is the pixels followed by a 1-bit-per-pixel mask, which is where the
+/// transparency comes from.
+fn send_cursor(stream: &mut TcpStream) -> std::io::Result<()> {
+    let (w, h) = (4u16, 4u16);
+    let mut msg = vec![0, 0];
+    msg.extend_from_slice(&1u16.to_be_bytes());
+    msg.extend_from_slice(&2u16.to_be_bytes()); // x carries the hotspot
+    msg.extend_from_slice(&2u16.to_be_bytes()); // y carries the hotspot
+    msg.extend_from_slice(&w.to_be_bytes());
+    msg.extend_from_slice(&h.to_be_bytes());
+    msg.extend_from_slice(&(-239i32).to_be_bytes());
+    // Pixels: opaque white, BGRA.
+    for _ in 0..(w as u32 * h as u32) {
+        msg.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+    }
+    // Mask: one byte per row for a 4-wide cursor, top two rows visible.
+    msg.extend_from_slice(&[0xf0, 0xf0, 0x00, 0x00]);
+    stream.write_all(&msg)?;
+    stream.flush()
 }
 
 /// One `FramebufferUpdate` holding a QEMU LED state rectangle.

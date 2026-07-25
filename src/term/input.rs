@@ -275,6 +275,22 @@ impl InputMapper {
         out
     }
 
+    /// The terminal pixel this event happened at.
+    ///
+    /// Mode 1016 reports pixels in the same framing as 1006, so crossterm's column and
+    /// row *are* pixels. Without it, the middle of the cell is as close as cell
+    /// resolution can get.
+    pub fn terminal_pixel(&self, ev: &MouseEvent, metrics: &Metrics) -> (u32, u32) {
+        if self.pixel_mouse {
+            (u32::from(ev.column), u32::from(ev.row))
+        } else {
+            (
+                u32::from(ev.column) * metrics.cell_w + metrics.cell_w / 2,
+                u32::from(ev.row) * metrics.cell_h + metrics.cell_h / 2,
+            )
+        }
+    }
+
     /// Translate a mouse event, returning the pointer events to send.
     ///
     /// Returns nothing when the pointer is outside the drawn image, so a click on
@@ -285,17 +301,7 @@ impl InputMapper {
         layout: &Layout,
         metrics: &Metrics,
     ) -> Vec<ClientMouseEvent> {
-        // Mode 1016 reports pixels in the same framing as 1006, so crossterm's
-        // column and row are pixel coordinates. Without it, aim at the middle of
-        // the cell, which is as close as cell resolution can get.
-        let (tx, ty) = if self.pixel_mouse {
-            (u32::from(ev.column), u32::from(ev.row))
-        } else {
-            (
-                u32::from(ev.column) * metrics.cell_w + metrics.cell_w / 2,
-                u32::from(ev.row) * metrics.cell_h + metrics.cell_h / 2,
-            )
-        };
+        let (tx, ty) = self.terminal_pixel(&ev, metrics);
         let Some((x, y)) = layout.terminal_px_to_src(tx, ty) else {
             return Vec::new();
         };
