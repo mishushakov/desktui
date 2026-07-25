@@ -116,9 +116,9 @@ is not a prerequisite for video.
 ## Development
 
 ```
-make test           # 174 tests, no server or terminal needed
+make test           # no server or terminal needed
 make check          # fmt, clippy, tests
-make test-live      # 4 more, against the real desktop container
+make test-live      # against the real desktop container
 make perf           # time the compose pipeline
 ```
 
