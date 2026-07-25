@@ -472,6 +472,81 @@ fn growing_the_window_fills_the_new_area_on_a_real_server() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn a_real_server_answers_the_latency_probe() {
+    // The number in the status line is only worth showing if a real server bounces the
+    // fence back. TigerVNC sends fences of its own constantly, so it clearly supports
+    // them -- this checks it answers ours.
+    let log = std::env::temp_dir().join("vnctui-live-rtt.log");
+    let _ = std::fs::remove_file(&log);
+
+    let addr = server();
+    let mut term = FakeTerm::spawn_with_env(
+        COLS,
+        ROWS,
+        PIXELS.0,
+        PIXELS.1,
+        &[
+            addr.as_str(),
+            "--fps",
+            "15",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)));
+
+    // A measured round trip appears in the status line as a number of milliseconds.
+    // Before the fix it was there too, but climbing; now it can only appear at all if a
+    // fence came back.
+    let start = std::time::Instant::now();
+    let mut seen = false;
+    while start.elapsed() < Duration::from_secs(20) {
+        let out = term.output();
+        // Two samples a second apart: a real measurement stays small, the old bug grew.
+        if contains(&out, b"ms  Ctrl+") {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        seen,
+        "no round trip was ever measured: {}",
+        tail(&term.output())
+    );
+
+    // And it must not be a figure that only grows. Sample it twice, far apart.
+    let sample = |out: &[u8]| -> Option<u128> {
+        let text = String::from_utf8_lossy(out).into_owned();
+        text.rmatch_indices("ms  Ctrl+").next().and_then(|(i, _)| {
+            let head = &text[..i];
+            let digits: String = head
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.chars().rev().collect::<String>().parse().ok()
+        })
+    };
+    let first = sample(&term.output());
+    std::thread::sleep(Duration::from_secs(3));
+    let second = sample(&term.output());
+    if let (Some(a), Some(b)) = (first, second) {
+        assert!(
+            b < a + 2000,
+            "the round trip is climbing rather than being measured: {a}ms then {b}ms"
+        );
+    }
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+    let _ = std::fs::remove_file(&log);
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 fn tail(buf: &[u8]) -> String {

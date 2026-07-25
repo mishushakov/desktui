@@ -46,6 +46,15 @@ const NOTE_LINGER: Duration = Duration::from_secs(4);
 /// incremental request instantly cannot spin us at full speed.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
 
+/// How often to measure the round trip with a fence, once frames stop being requested.
+const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A probe this old was dropped by the server; stop waiting for it.
+const RTT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Marks a fence as our own latency probe rather than a synchronisation request.
+const RTT_PROBE_MARKER: &[u8] = b"vnctui-rtt";
+
 /// First pause before a reconnect attempt, doubling up to the cap.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
@@ -287,7 +296,19 @@ struct Session {
 
     awaiting_update: bool,
     requested_at: Instant,
-    rtt: Duration,
+    /// Round trip to the server, or `None` while it is unknown.
+    ///
+    /// Optional on purpose: with frames arriving unbidden there is no request to
+    /// measure against, and showing the age of the last request we happened to send
+    /// would be a number that only ever grows.
+    rtt: Option<Duration>,
+    /// The server has sent us a fence, so it understands them and can be asked to
+    /// bounce one back.
+    fence_supported: bool,
+    /// When the outstanding latency probe went out.
+    rtt_probe_at: Option<Instant>,
+    /// When the last measurement completed, to space the probes out.
+    rtt_measured_at: Option<Instant>,
     /// The server pushes updates without being asked, so no requests are sent.
     continuous_updates: bool,
     /// The rectangle continuous updates was last enabled for, so a resize can tell
@@ -344,7 +365,10 @@ impl Session {
             requested_size: None,
             awaiting_update: true, // the engine asks for the first frame itself
             requested_at: Instant::now(),
-            rtt: Duration::ZERO,
+            rtt: None,
+            fence_supported: false,
+            rtt_probe_at: None,
+            rtt_measured_at: None,
             continuous_updates: false,
             continuous_rect: None,
             remote_caps_lock: None,
@@ -416,8 +440,13 @@ impl Session {
             VncEvent::SetResolution(screen) => self.on_remote_size(screen, None).await?,
             VncEvent::DesktopLayout(layout) => self.on_layout(layout).await?,
             VncEvent::FramebufferUpdateEnd => {
+                // Only meaningful when this update answers a request of ours. With
+                // continuous updates there is no pair, and the fence probe measures it
+                // instead.
+                if self.awaiting_update && !self.continuous_updates {
+                    self.rtt = Some(self.requested_at.elapsed());
+                }
                 self.awaiting_update = false;
-                self.rtt = self.requested_at.elapsed();
                 // The first update is also the answer to our capability probe: a
                 // server that supports resizing must have included a layout
                 // rectangle in it.
@@ -468,6 +497,10 @@ impl Session {
                 self.enable_continuous_updates().await?;
             }
             VncEvent::Fence { flags, payload } => {
+                tracing::debug!("fence from server, flags {flags:#x}, {} bytes", payload.len());
+                // A fence at all means the server understands them, which is what makes
+                // the latency probe possible.
+                self.fence_supported = true;
                 // A fence with the request bit set has to come back with that bit
                 // cleared, along with any flag we do not understand. Ours arrive in
                 // order and are handled one at a time, which is what BlockBefore and
@@ -480,6 +513,12 @@ impl Session {
                         payload,
                     })
                     .await?;
+                } else if payload == RTT_PROBE_MARKER {
+                    // Our own probe, back again: the gap is the round trip.
+                    if let Some(sent) = self.rtt_probe_at.take() {
+                        self.rtt = Some(sent.elapsed());
+                        self.rtt_measured_at = Some(Instant::now());
+                    }
                 } else {
                     tracing::debug!("unsolicited fence response, flags {flags:#x}");
                 }
@@ -863,6 +902,10 @@ impl Session {
                 }
             }
 
+        // With frames arriving unbidden there is no request to time, so ask the server
+        // to bounce a fence back and measure that instead.
+        self.probe_round_trip().await?;
+
         // A pointer that stopped moving mid-rate-limit still has to arrive.
         if !self.view_only
             && let Some(pointer) = self.input.flush_motion() {
@@ -948,6 +991,40 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Measure the round trip with a fence, when there are no requests to measure.
+    ///
+    /// Frames pushed by the server carry no timing information: they answer nothing.
+    /// A fence does -- the server bounces it straight back, which is the only honest
+    /// latency figure available once requests stop.
+    async fn probe_round_trip(&mut self) -> Result<()> {
+        if !self.continuous_updates || !self.fence_supported {
+            return Ok(());
+        }
+        // A probe that never came back was dropped; stop waiting on it.
+        if let Some(sent) = self.rtt_probe_at
+            && sent.elapsed() > RTT_PROBE_TIMEOUT
+        {
+            self.rtt_probe_at = None;
+            self.rtt = None;
+        }
+        if self.rtt_probe_at.is_some() {
+            return Ok(());
+        }
+        if let Some(last) = self.rtt_measured_at
+            && last.elapsed() < RTT_PROBE_INTERVAL
+        {
+            return Ok(());
+        }
+
+        self.rtt_probe_at = Some(Instant::now());
+        // No block flags: the server can answer immediately, which is the point.
+        self.send(X11Event::Fence {
+            flags: crate::rfb::fence::REQUEST,
+            payload: RTT_PROBE_MARKER.to_vec(),
+        })
+        .await
     }
 
     /// Ask for the next incremental update, keeping one in flight at a time.
@@ -1046,18 +1123,18 @@ impl Session {
 
         let right = if self.show_stats {
             format!(
-                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>4}ms rtt  {} dropped  Ctrl+{} ? ",
+                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  Ctrl+{} ? ",
                 self.fps.fps(),
                 self.last_stats.tiles,
                 human_bytes(self.last_stats.bytes),
-                self.rtt.as_millis(),
+                format_rtt(self.rtt),
                 self.dropped,
                 self.input.prefix().to_ascii_uppercase(),
             )
         } else {
             format!(
-                "{:>4}ms  Ctrl+{} ? for help ",
-                self.rtt.as_millis(),
+                "{:>6}  Ctrl+{} ? for help ",
+                format_rtt(self.rtt),
                 self.input.prefix().to_ascii_uppercase()
             )
         };
@@ -1113,6 +1190,18 @@ impl Session {
     }
 }
 
+/// The round trip for the status line, or dashes while it is unknown.
+///
+/// Dashes rather than a zero or a stale figure: an unmeasured latency is not a fast
+/// one, and the old code showed the age of the last request it happened to send, which
+/// only ever grew.
+fn format_rtt(rtt: Option<Duration>) -> String {
+    match rtt {
+        Some(rtt) => format!("{}ms", rtt.as_millis()),
+        None => "--".to_string(),
+    }
+}
+
 fn convert(rect: crate::rfb::Rect) -> Rect {
     Rect::new(
         u32::from(rect.x),
@@ -1163,6 +1252,17 @@ mod tests {
         assert!(Resize::Probing.note().is_none());
         assert!(Resize::Native.note().is_none());
         assert!(Resize::Waiting { want: (1, 1) }.note().is_none());
+    }
+
+    #[test]
+    fn an_unmeasured_round_trip_shows_dashes_rather_than_a_number() {
+        // The bug this replaces: with frames arriving unbidden there was no request to
+        // measure against, so the display showed the age of the last request ever sent
+        // and climbed for ever.
+        assert_eq!(format_rtt(None), "--");
+        assert_eq!(format_rtt(Some(Duration::from_millis(0))), "0ms");
+        assert_eq!(format_rtt(Some(Duration::from_millis(23))), "23ms");
+        assert_eq!(format_rtt(Some(Duration::from_millis(1500))), "1500ms");
     }
 
     #[test]

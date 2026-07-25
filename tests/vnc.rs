@@ -998,3 +998,70 @@ fn growing_the_desktop_re_enables_continuous_updates_for_the_new_area() {
     quit(&mut term);
     term.wait(Duration::from_secs(10));
 }
+
+#[test]
+fn the_round_trip_is_measured_with_a_fence_once_frames_are_pushed() {
+    // A pushed frame answers nothing, so there is no request to time against. The
+    // status line used to show the age of the last request ever sent, which climbed for
+    // ever. A fence gives a real figure, because the server bounces it straight back.
+    let ext = Extensions {
+        continuous_updates: true,
+        fence: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+
+    // Our own probe is a fence carrying a marker, distinct from the echo of the
+    // server's own fence.
+    let probe = server
+        .wait_for(Duration::from_secs(10), |r| match r {
+            Request::Fence { payload, .. } => payload == b"vnctui-rtt",
+            _ => false,
+        })
+        .expect("no latency probe was sent");
+    match probe {
+        Request::Fence { flags, .. } => {
+            assert_eq!(
+                flags & (1 << 31),
+                1 << 31,
+                "a probe has to set the request bit or the server will not answer it"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn no_fence_support_means_no_round_trip_figure_rather_than_a_wrong_one() {
+    // Continuous updates without fences: nothing can be measured, so the status line
+    // has to admit it instead of showing a number that grows.
+    let ext = Extensions {
+        continuous_updates: true,
+        fence: false,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+    assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)));
+    std::thread::sleep(Duration::from_secs(2));
+
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::Fence { .. })),
+        "sent a fence to a server that never offered them"
+    );
+    let out = term.output();
+    assert!(
+        contains(&out, b"--"),
+        "the status line should say the round trip is unknown: {}",
+        show(&out)
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
