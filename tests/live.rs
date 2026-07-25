@@ -410,6 +410,68 @@ fn a_real_server_sends_a_cursor_shape() {
     let _ = std::fs::remove_file(&log);
 }
 
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn growing_the_window_fills_the_new_area_on_a_real_server() {
+    // Growing is the direction that used to fail: the server keeps pushing whatever
+    // rectangle it was last told about, so the area beyond it never arrived and stayed
+    // black. Shrinking hid the bug, because the old rectangle still covered everything.
+    let log = std::env::temp_dir().join("vnctui-live-grow.log");
+    let _ = std::fs::remove_file(&log);
+
+    let addr = server();
+    // Start small: 100x25 cells of 8x17 leaves 24 usable rows, so 800x408.
+    let mut term = FakeTerm::spawn_with_env(
+        100,
+        25,
+        800,
+        425,
+        &[
+            addr.as_str(),
+            "--fps",
+            "15",
+            "--scale",
+            "native",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(
+        term.wait_for(b"800x408", Duration::from_secs(30)),
+        "never reached the first size: {}",
+        tail(&term.output())
+    );
+
+    term.resize(200, 50, 1600, 850);
+    assert!(
+        term.wait_for(b"1600x832", Duration::from_secs(30)),
+        "the desktop did not grow: {}",
+        tail(&term.output())
+    );
+
+    // The proof is in the traffic: the pushed region has to be widened to the new size,
+    // or the bottom and right of the screen would never be sent.
+    let start = std::time::Instant::now();
+    let mut logged = String::new();
+    while start.elapsed() < Duration::from_secs(15) {
+        logged = std::fs::read_to_string(&log).unwrap_or_default();
+        if logged.contains("continuous updates enabled for 1600x832") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        logged.contains("continuous updates enabled for 1600x832"),
+        "the pushed region was never widened after the desktop grew. Log:\n{logged}"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(15));
+    let _ = std::fs::remove_file(&log);
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 fn tail(buf: &[u8]) -> String {

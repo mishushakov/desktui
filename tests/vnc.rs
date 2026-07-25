@@ -939,3 +939,62 @@ fn view_only_leaves_the_cursor_to_the_server() {
     quit(&mut term);
     term.wait(Duration::from_secs(10));
 }
+
+#[test]
+fn growing_the_desktop_re_enables_continuous_updates_for_the_new_area() {
+    // The pushed region is remembered by the server, so a desktop that grows needs the
+    // request repeating. Without that, everything outside the old rectangle is never
+    // sent and stays black -- and only *growing* shows it, because a smaller rectangle
+    // still fits inside the one the server already had.
+    let ext = Extensions {
+        continuous_updates: true,
+        ..Extensions::default()
+    };
+    let server = FakeServer::start_with(1024, 768, Resize::Accept, ext);
+    let addr = server.addr.to_string();
+    // Start small: 100x25 cells of 8x17 leaves 24 usable rows, so 800x408.
+    let mut term = FakeTerm::spawn(
+        100,
+        25,
+        800,
+        425,
+        &[&addr, "--fps", "15", "--scale", "native"],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::EnableContinuousUpdates {
+                    enable: true,
+                    width: 800,
+                    height: 408,
+                }
+            ))
+            .is_some(),
+        "never enabled for the first size: {:?}",
+        server.requests()
+    );
+
+    // Now grow it.
+    term.resize(200, 50, 1600, 850);
+
+    assert!(
+        server
+            .wait_for(Duration::from_secs(15), |r| matches!(
+                r,
+                Request::EnableContinuousUpdates {
+                    enable: true,
+                    width: 1600,
+                    height: 832,
+                }
+            ))
+            .is_some(),
+        "the pushed region was never widened, so the new area would stay black: {:?}",
+        server.requests()
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}

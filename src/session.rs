@@ -413,7 +413,7 @@ impl Session {
                     self.renderer.mark(damage);
                 }
             }
-            VncEvent::SetResolution(screen) => self.on_remote_size(screen, None),
+            VncEvent::SetResolution(screen) => self.on_remote_size(screen, None).await?,
             VncEvent::DesktopLayout(layout) => self.on_layout(layout).await?,
             VncEvent::FramebufferUpdateEnd => {
                 self.awaiting_update = false;
@@ -508,10 +508,10 @@ impl Session {
     }
 
     /// Adopt a new remote framebuffer size.
-    fn on_remote_size(&mut self, screen: Screen, note: Option<String>) {
+    async fn on_remote_size(&mut self, screen: Screen, note: Option<String>) -> Result<()> {
         let size = (screen.width, screen.height);
         if size == self.remote || size.0 == 0 || size.1 == 0 {
-            return;
+            return Ok(());
         }
         // A size is four bytes of allocation per pixel, and the protocol allows
         // 65535 in each direction -- seventeen gigabytes. Rust aborts the process
@@ -527,13 +527,10 @@ impl Session {
                 "server reported an implausible size of {}x{}; ignored",
                 size.0, size.1
             ));
-            return;
+            return Ok(());
         }
         tracing::info!("remote framebuffer is now {}x{}", size.0, size.1);
         self.remote = size;
-        // The pushed region is remembered by the server, so a new size means saying
-        // so again or the rest of the screen never arrives.
-        self.continuous_rect = None;
         self.fb
             .resize(u32::from(size.0), u32::from(size.1));
         self.pan = (0, 0);
@@ -541,6 +538,16 @@ impl Session {
         if let Some(note) = note {
             self.set_note(note);
         }
+
+        // The server remembers which rectangle it was told to push, and a resize does
+        // not change its mind. Saying so again is the whole difference between a
+        // desktop that grows and one that grows a black band down two sides: the region
+        // beyond the old rectangle is never sent otherwise.
+        if self.continuous_updates {
+            self.continuous_rect = None;
+            self.enable_continuous_updates().await?;
+        }
+        Ok(())
     }
 
     async fn on_layout(&mut self, layout: ScreenLayout) -> Result<()> {
@@ -555,7 +562,7 @@ impl Session {
             match layout.status {
                 ResizeStatus::Success => {
                     self.resize = Resize::Native;
-                    self.on_remote_size(layout.screen, None);
+                    self.on_remote_size(layout.screen, None).await?;
                     // The terminal may have been resized again while the request
                     // was in flight, so check we are still in sync. A no-op unless
                     // our own target actually moved.
@@ -576,7 +583,7 @@ impl Session {
             }
         } else {
             // Someone else changed it, or this is the initial report.
-            self.on_remote_size(layout.screen, None);
+            self.on_remote_size(layout.screen, None).await?;
             if was_probing {
                 self.resize = Resize::Unsupported; // provisional, refined below
             }
@@ -898,6 +905,7 @@ impl Session {
             },
         })
         .await?;
+        tracing::debug!("continuous updates enabled for {}x{}", size.0, size.1);
         self.continuous_updates = true;
         self.continuous_rect = Some(size);
         // Nothing is outstanding any more: frames arrive unbidden from here.
