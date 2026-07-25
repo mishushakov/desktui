@@ -389,6 +389,92 @@ fn input_reaches_the_server_with_pixel_exact_coordinates() {
 }
 
 #[test]
+fn the_release_chord_stops_input_reaching_the_server() {
+    let (server, mut term) = start(Resize::Accept, (1024, 768));
+    assert!(term.wait_for(b"native 1:1", Duration::from_secs(10)));
+
+    // Ctrl, Alt and Shift down, then up again: the TigerVNC ungrab. Kitty encoding,
+    // which is the only way a terminal reports a modifier in its own right.
+    for down in [b"\x1b[57442u".as_ref(), b"\x1b[57443u", b"\x1b[57441u"] {
+        term.send(down);
+    }
+    for up in [
+        b"\x1b[57441;1:3u".as_ref(),
+        b"\x1b[57443;1:3u",
+        b"\x1b[57442;1:3u",
+    ] {
+        term.send(up);
+    }
+    assert!(
+        term.wait_for(b"INPUT RELEASED", Duration::from_secs(10)),
+        "the chord never released input"
+    );
+
+    // Neither a keystroke nor a click goes anywhere near the server now.
+    let before = server.requests().len();
+    term.send(b"\x1b[120u");
+    term.send(b"\x1b[<0;137;229M");
+    std::thread::sleep(Duration::from_millis(400));
+    let after: Vec<_> = server.requests()[before..].to_vec();
+    assert!(
+        !after.iter().any(|r| matches!(
+            r,
+            Request::Key {
+                keysym: 0x78,
+                down: true
+            }
+        )),
+        "a released keyboard still reached the server"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|r| matches!(r, Request::Pointer { buttons: 1, .. })),
+        "a released pointer still reached the server"
+    );
+    term.send(b"\x1b[<0;137;229m");
+
+    // The same chord takes it back, and typing works again.
+    for down in [b"\x1b[57442u".as_ref(), b"\x1b[57443u", b"\x1b[57441u"] {
+        term.send(down);
+    }
+    for up in [
+        b"\x1b[57441;1:3u".as_ref(),
+        b"\x1b[57443;1:3u",
+        b"\x1b[57442;1:3u",
+    ] {
+        term.send(up);
+    }
+    term.send(b"\x1b[121u");
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::Key {
+                    keysym: 0x79,
+                    down: true
+                }
+            ))
+            .is_some(),
+        "the keyboard was never taken back"
+    );
+    term.send(b"\x1b[<0;201;301M");
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::Pointer { buttons: 1, .. }
+            ))
+            .is_some(),
+        "the pointer was never taken back"
+    );
+    term.send(b"\x1b[<0;201;301m");
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
 fn the_help_overlay_goes_away_on_the_next_key() {
     // The bug this replaces: only the prefix command toggled the overlay, so the
     // "any other key dismisses this" it advertises was untrue and the box stayed
