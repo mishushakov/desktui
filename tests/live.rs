@@ -13,7 +13,7 @@
 //! cargo test --test live -- --ignored --nocapture
 //! ```
 //!
-//! Override the target with `VNCTUI_TEST_SERVER` and `VNCTUI_TEST_PASSWORD`.
+//! Override the target with `DESKTUI_TEST_SERVER` and `DESKTUI_TEST_PASSWORD`.
 
 mod common;
 
@@ -29,11 +29,11 @@ const PIXELS: (u16, u16) = (1600, 850);
 const EXPECTED_SIZE: &str = "1600x832";
 
 fn server() -> String {
-    std::env::var("VNCTUI_TEST_SERVER").unwrap_or_else(|_| "localhost::5901".to_string())
+    std::env::var("DESKTUI_TEST_SERVER").unwrap_or_else(|_| "localhost::5901".to_string())
 }
 
 fn password() -> String {
-    std::env::var("VNCTUI_TEST_PASSWORD").unwrap_or_else(|_| "vnctui".to_string())
+    std::env::var("DESKTUI_TEST_PASSWORD").unwrap_or_else(|_| "desktui".to_string())
 }
 
 fn start(extra: &[&str]) -> FakeTerm {
@@ -288,7 +288,7 @@ fn the_desktop_is_redrawn_in_full_after_a_resize() {
 fn a_real_server_negotiates_continuous_updates() {
     // TigerVNC implements the extension, so this is the one test that proves the
     // negotiation works against something that was not written to agree with us.
-    let mut term = start(&["--scale", "native", "--log-file", "/tmp/vnctui-live.log"]);
+    let mut term = start(&["--scale", "native", "--log-file", "/tmp/desktui-live.log"]);
     assert!(
         term.wait_for(b"continuous updates", Duration::from_secs(30)),
         "the server never enabled continuous updates: {}",
@@ -317,7 +317,7 @@ fn a_real_server_reports_its_lock_key_state() {
     // Without this the caps-lock correction has nothing to compare against, so it is
     // worth knowing that a real server actually sends it rather than only our fake one.
     // The state arrives as a debug event, so the log is where it can be observed.
-    let log = std::env::temp_dir().join("vnctui-live-led.log");
+    let log = std::env::temp_dir().join("desktui-live-led.log");
     let _ = std::fs::remove_file(&log);
 
     let addr = server();
@@ -333,7 +333,7 @@ fn a_real_server_reports_its_lock_key_state() {
             "--log-file",
             log.to_str().unwrap(),
         ],
-        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+        &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)));
@@ -363,7 +363,7 @@ fn a_real_server_reports_its_lock_key_state() {
 fn a_real_server_sends_a_cursor_shape() {
     // TigerVNC only sends the shape once the encoding is requested, so this proves the
     // pointer is genuinely ours to draw rather than baked into the framebuffer.
-    let log = std::env::temp_dir().join("vnctui-live-cursor.log");
+    let log = std::env::temp_dir().join("desktui-live-cursor.log");
     let _ = std::fs::remove_file(&log);
 
     let addr = server();
@@ -379,7 +379,7 @@ fn a_real_server_sends_a_cursor_shape() {
             "--log-file",
             log.to_str().unwrap(),
         ],
-        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+        &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)));
@@ -416,7 +416,7 @@ fn growing_the_window_fills_the_new_area_on_a_real_server() {
     // Growing is the direction that used to fail: the server keeps pushing whatever
     // rectangle it was last told about, so the area beyond it never arrived and stayed
     // black. Shrinking hid the bug, because the old rectangle still covered everything.
-    let log = std::env::temp_dir().join("vnctui-live-grow.log");
+    let log = std::env::temp_dir().join("desktui-live-grow.log");
     let _ = std::fs::remove_file(&log);
 
     let addr = server();
@@ -435,7 +435,7 @@ fn growing_the_window_fills_the_new_area_on_a_real_server() {
             "--log-file",
             log.to_str().unwrap(),
         ],
-        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+        &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(
@@ -478,7 +478,7 @@ fn a_real_server_answers_the_latency_probe() {
     // The number in the status line is only worth showing if a real server bounces the
     // fence back. TigerVNC sends fences of its own constantly, so it clearly supports
     // them -- this checks it answers ours.
-    let log = std::env::temp_dir().join("vnctui-live-rtt.log");
+    let log = std::env::temp_dir().join("desktui-live-rtt.log");
     let _ = std::fs::remove_file(&log);
 
     let addr = server();
@@ -494,7 +494,7 @@ fn a_real_server_answers_the_latency_probe() {
             "--log-file",
             log.to_str().unwrap(),
         ],
-        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+        &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)));
@@ -553,7 +553,7 @@ fn an_idle_resize_completes_without_any_input() {
     // Reported symptom: a resize sometimes only takes effect once the mouse is moved.
     // Nothing but the render tick should be needed, so this resizes and then touches
     // nothing at all, timing how long the new size takes to appear.
-    let log = std::env::temp_dir().join("vnctui-idle-resize.log");
+    let log = std::env::temp_dir().join("desktui-idle-resize.log");
     let _ = std::fs::remove_file(&log);
 
     let addr = server();
@@ -571,7 +571,7 @@ fn an_idle_resize_completes_without_any_input() {
             "--log-file",
             log.to_str().unwrap(),
         ],
-        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+        &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(
@@ -609,7 +609,7 @@ fn an_idle_resize_completes_without_any_input() {
 fn a_dragged_resize_settles_without_any_input() {
     // Closer to how a window is actually resized: dozens of size changes in a second as
     // the edge is dragged, then nothing. The last one has to settle on its own.
-    let log = std::env::temp_dir().join("vnctui-drag-resize.log");
+    let log = std::env::temp_dir().join("desktui-drag-resize.log");
     let _ = std::fs::remove_file(&log);
 
     let addr = server();
@@ -627,7 +627,7 @@ fn a_dragged_resize_settles_without_any_input() {
             "--log-file",
             log.to_str().unwrap(),
         ],
-        &[("VNC_PASSWORD", &password()), ("VNCTUI_LOG", "debug")],
+        &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(term.wait_for(b"800x408", Duration::from_secs(30)));
@@ -672,7 +672,7 @@ fn tail(buf: &[u8]) -> String {
     let text = String::from_utf8_lossy(buf);
     let mut lines: Vec<&str> = text
         .split('\x1b')
-        .filter(|s| s.contains("vnctui") || s.contains("1:1") || s.contains("error"))
+        .filter(|s| s.contains("desktui") || s.contains("1:1") || s.contains("error"))
         .collect();
     lines.dedup();
     let n = lines.len();

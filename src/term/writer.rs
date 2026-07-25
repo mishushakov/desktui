@@ -38,7 +38,7 @@ impl FrameWriter {
         let (done_tx, done_rx) = channel::<()>();
 
         let thread = std::thread::Builder::new()
-            .name("vnctui-writer".into())
+            .name("desktui-writer".into())
             .spawn(move || {
                 let stdout = io::stdout();
                 let mut out = stdout.lock();

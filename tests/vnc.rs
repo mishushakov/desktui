@@ -1031,7 +1031,7 @@ fn the_round_trip_is_measured_with_a_fence_once_frames_are_pushed() {
     // server's own fence.
     let probe = server
         .wait_for(Duration::from_secs(10), |r| match r {
-            Request::Fence { payload, .. } => payload == b"vnctui-rtt",
+            Request::Fence { payload, .. } => payload == b"desktui-rtt",
             _ => false,
         })
         .expect("no latency probe was sent");

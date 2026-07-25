@@ -1,4 +1,4 @@
-//! vnctui: a VNC client that draws the remote desktop with the Kitty graphics
+//! desktui: a VNC client that draws the remote desktop with the Kitty graphics
 //! protocol, one remote pixel per terminal pixel.
 
 mod app;
@@ -26,7 +26,7 @@ fn main() -> std::process::ExitCode {
         Err(err) => {
             // The guard is gone by now, so the terminal is back to normal and
             // this lands on the primary screen where the user can read it.
-            let _ = writeln!(std::io::stderr(), "vnctui: {err:#}");
+            let _ = writeln!(std::io::stderr(), "desktui: {err:#}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -50,7 +50,7 @@ fn run(args: &Args) -> Result<()> {
         anyhow::bail!(
             "this terminal did not answer the Kitty graphics query{}\n\
              \n\
-             vnctui draws the remote screen as real pixels, which needs that \
+             desktui draws the remote screen as real pixels, which needs that \
              protocol.\n\
              Known-good terminals: Ghostty, kitty, WezTerm.\n\
              Run with --force to try anyway, or --print-caps to see what was \
@@ -228,7 +228,7 @@ fn init_logging(args: &Args) {
     else {
         return;
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_env("VNCTUI_LOG")
+    let filter = tracing_subscriber::EnvFilter::try_from_env("DESKTUI_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

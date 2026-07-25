@@ -43,7 +43,7 @@ pub fn draw(out: &mut Vec<u8>, metrics: &Metrics, left: &str, right: &str) {
 pub fn draw_help(out: &mut Vec<u8>, metrics: &Metrics, prefix: char) {
     let p = format!("Ctrl+{}", prefix.to_ascii_uppercase());
     let lines: Vec<String> = vec![
-        "vnctui".to_string(),
+        "desktui".to_string(),
         String::new(),
         format!("{p} then:"),
         "  q          quit".to_string(),

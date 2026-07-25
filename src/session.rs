@@ -53,7 +53,7 @@ const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const RTT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Marks a fence as our own latency probe rather than a synchronisation request.
-const RTT_PROBE_MARKER: &[u8] = b"vnctui-rtt";
+const RTT_PROBE_MARKER: &[u8] = b"desktui-rtt";
 
 /// First pause before a reconnect attempt, doubling up to the cap.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
@@ -1121,7 +1121,7 @@ impl Session {
         let mut left = format!(
             " {}  {}x{}",
             if self.server_name.is_empty() {
-                "vnctui"
+                "desktui"
             } else {
                 self.server_name.as_str()
             },

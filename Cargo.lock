@@ -218,6 +218,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "crossterm",
+ "fast_image_resize",
+ "flate2",
+ "futures",
+ "libc",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -818,26 +838,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vnctui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "crossterm",
- "fast_image_resize",
- "flate2",
- "futures",
- "libc",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
- "zune-jpeg",
-]
 
 [[package]]
 name = "wasi"

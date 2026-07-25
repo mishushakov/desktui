@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 
 /// A pixel-perfect VNC client for terminals that speak the Kitty graphics protocol.
 #[derive(Debug, Parser)]
-#[command(name = "vnctui", version, about, long_about = None)]
+#[command(name = "desktui", version, about, long_about = None)]
 pub struct Args {
     /// VNC server to connect to, as `host`, `host:port` or `host::port`.
     ///

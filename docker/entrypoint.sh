@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-: "${VNC_PASSWORD:=vnctui}"
+: "${VNC_PASSWORD:=desktui}"
 : "${VNC_GEOMETRY:=1280x800}"
 : "${VNC_DISPLAY:=:1}"
 : "${VNC_PORT:=5901}"
@@ -54,7 +54,7 @@ chmod 700 "$XDG_RUNTIME_DIR"
 Xtigervnc "$VNC_DISPLAY" \
     -geometry "$VNC_GEOMETRY" \
     -depth 24 \
-    -desktop vnctui-test \
+    -desktop desktui-test \
     -rfbauth "$HOME/.vnc/passwd" \
     -rfbport "$VNC_PORT" \
     -SecurityTypes VncAuth \

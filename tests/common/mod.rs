@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::{Condvar, LazyLock};
 use std::time::{Duration, Instant};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_vnctui");
+pub const BIN: &str = env!("CARGO_BIN_EXE_desktui");
 
 /// Image id 1893 is 0x765, the id the client probes with.
 pub const GHOSTTY_REPLIES: &[u8] = b"\x1b_Gi=1893;OK\x1b\\\
@@ -177,7 +177,7 @@ impl FakeTerm {
                 Ok(())
             });
         }
-        let child = cmd.spawn().expect("failed to start vnctui");
+        let child = cmd.spawn().expect("failed to start desktui");
 
         // Drain continuously, the way a terminal does.
         let seen = Arc::new(Mutex::new(Vec::new()));

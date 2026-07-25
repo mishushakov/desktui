@@ -1,26 +1,26 @@
-# vnctui
+# desktui
 #
 # `make desktop` brings up a VNC-served XFCE desktop in Docker and prints the
 # command to connect to it. Everything else is the usual cargo work.
 
 SHELL := /bin/bash
 
-IMAGE       ?= vnctui-desktop
-CONTAINER   ?= vnctui-desktop
+IMAGE       ?= desktui-desktop
+CONTAINER   ?= desktui-desktop
 VNC_PORT    ?= 5901
 # 127.0.0.1 on purpose. VNC password authentication is DES with an eight character
 # key and the session that follows is unencrypted, so this stays on the loopback
 # interface; reach a remote one through an ssh tunnel instead.
 BIND_ADDR   ?= 127.0.0.1
 GEOMETRY    ?= 1280x800
-VNC_PASSWORD ?= vnctui
+VNC_PASSWORD ?= desktui
 SERVER      ?= localhost::$(VNC_PORT)
 
 .DEFAULT_GOAL := help
 
 ## help: list the targets
 help:
-	@printf '\nvnctui\n\n'
+	@printf '\ndesktui\n\n'
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /' | awk -F': *' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' | sed 's/^    //'
 	@printf '\nConnecting:\n'
 	@printf '  make desktop && make run\n\n'
@@ -112,7 +112,7 @@ test-live:
 		printf 'the desktop is not running; start it with: make desktop\n' >&2; \
 		exit 1; \
 	}
-	VNCTUI_TEST_SERVER='$(SERVER)' VNCTUI_TEST_PASSWORD='$(VNC_PASSWORD)' \
+	DESKTUI_TEST_SERVER='$(SERVER)' DESKTUI_TEST_PASSWORD='$(VNC_PASSWORD)' \
 		cargo test --test live -- --ignored --test-threads=1
 
 ## perf: time the compose pipeline

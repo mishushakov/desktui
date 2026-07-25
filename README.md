@@ -1,17 +1,41 @@
-# vnctui
+# desktui
 
 A VNC client that draws the remote desktop in your terminal as real pixels, using
 the Kitty graphics protocol — one remote pixel per terminal pixel, not a mosaic of
 half-blocks.
 
 ```
-vnctui desk:1
-vnctui 10.0.0.5::5900 --scale fit
-vnctui --print-caps          # what does this terminal support?
-vnctui --test-pattern        # check the pipeline without a server
+desktui desk:1
+desktui 10.0.0.5::5900 --scale fit
+desktui --print-caps          # what does this terminal support?
+desktui --test-pattern        # check the pipeline without a server
 ```
 
 No server handy? `make desktop` starts one in Docker and `make run` connects to it.
+
+## Installing
+
+Needs a Rust toolchain that speaks edition 2024 (1.85 or newer).
+
+```
+cargo install --git https://github.com/mishushakov/desktui --locked
+```
+
+Or from a checkout:
+
+```
+cargo install --path . --locked
+```
+
+Either one builds with the release profile and puts `desktui` in `~/.cargo/bin`, which
+needs to be on your `PATH`. `--locked` builds against the versions in `Cargo.lock`;
+drop it to let Cargo pick newer ones.
+
+To build without installing:
+
+```
+cargo build --release      # ./target/release/desktui
+```
 
 ## What makes it pixel-exact
 
@@ -161,7 +185,7 @@ Reaching a real server over a network is a job for an SSH tunnel, not an open po
 
 ```
 ssh -f -N -L 5901:localhost:5901 user@host
-VNC_PASSWORD=… vnctui localhost::5901
+VNC_PASSWORD=… desktui localhost::5901
 ```
 
 `--log-file` is the only way to get diagnostics; anything written to stdout would
