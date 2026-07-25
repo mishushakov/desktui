@@ -193,6 +193,58 @@ fn a_wrong_password_fails_clearly() {
     );
 }
 
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn one_client_adopts_a_resize_another_client_asked_for() {
+    // The reason=2 path -- "another client requested this" -- which the unit tests
+    // cover but nothing had exercised against a real server. Two clients attach at
+    // once, which also proves shared sessions work.
+    //
+    // The sizes are chosen so only one of them ever asks: the watcher is in `fit`
+    // mode and never requests anything, so any change it sees came from the other.
+    let mut watcher = FakeTerm::spawn_with_env(
+        120,
+        30,
+        960,
+        510,
+        &[server().as_str(), "--scale", "fit", "--fps", "20"],
+        &[("VNC_PASSWORD", &password())],
+    );
+    watcher.answer_probe(GHOSTTY_REPLIES);
+    assert!(
+        watcher.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)),
+        "the watcher never drew anything: {}",
+        tail(&watcher.output())
+    );
+
+    let mut resizer = start(&["--scale", "native"]);
+    assert!(
+        resizer.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(30)),
+        "the second client never got its size: {}",
+        tail(&resizer.output())
+    );
+
+    // The watcher asked for nothing, so seeing the new size means it took the
+    // change from the server rather than causing it.
+    assert!(
+        watcher.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(20)),
+        "the watcher never noticed the other client's resize: {}",
+        tail(&watcher.output())
+    );
+    // And it kept drawing afterwards rather than wedging on the size change.
+    let before = count(&watcher.output(), b"\x1b_Ga=T");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        count(&watcher.output(), b"\x1b_Ga=T") > before,
+        "the watcher stopped drawing after the resize"
+    );
+
+    quit(&mut resizer);
+    quit(&mut watcher);
+    resizer.wait(Duration::from_secs(15));
+    watcher.wait(Duration::from_secs(15));
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 fn tail(buf: &[u8]) -> String {
