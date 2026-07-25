@@ -135,7 +135,7 @@ against **TigerVNC serving a real XFCE desktop**, so real Tight encoding, real J
 rectangles, and a real answer to `SetDesktopSize`. It needs the container:
 
 ```
-make desktop        # build and start it, ~1 GB image, published to 127.0.0.1 only
+make desktop
 make test-live
 make desktop-stop
 ```
