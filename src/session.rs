@@ -85,10 +85,6 @@ enum Resize {
     Native,
     /// The server said no.
     Refused(ResizeStatus),
-    /// We did not ask. Reshaping the remote desktop changes it for every other
-    /// client connected to it, which is not something a view-only session should
-    /// do -- noVNC takes the same position.
-    Suppressed,
 }
 
 impl Resize {
@@ -96,7 +92,6 @@ impl Resize {
         match self {
             Resize::Unsupported => Some("server cannot resize; scaling instead".into()),
             Resize::Refused(status) => Some(format!("{}; scaling instead", status.describe())),
-            Resize::Suppressed => Some("view-only: not resizing the remote desktop".into()),
             _ => None,
         }
     }
@@ -667,19 +662,6 @@ impl Session {
 
     /// Ask the server to match the terminal exactly.
     async fn request_native_size(&mut self, force: bool) -> Result<()> {
-        // A view-only session must not reshape the remote desktop: it is shared
-        // with whoever else is connected to it.
-        if self.view_only {
-            if self.mode == ScaleMode::Native {
-                self.resize = Resize::Suppressed;
-                if let Some(note) = self.resize.note() {
-                    self.set_note(note);
-                }
-                self.fall_back_from_native();
-            }
-            return Ok(());
-        }
-
         let want = self.target_size();
         if want.0 == 0 || want.1 == 0 {
             return Ok(());
@@ -885,12 +867,6 @@ impl Session {
                 self.view_only = !self.view_only;
                 if self.view_only {
                     self.release_input().await;
-                } else if self.mode != ScaleMode::Native && self.resize == Resize::Suppressed {
-                    // Input is allowed again, so the resize we declined can happen.
-                    self.mode = ScaleMode::Native;
-                    self.resize = Resize::Probing;
-                    self.requested_size = None;
-                    self.request_native_size(true).await?;
                 }
                 self.set_note(
                     if self.view_only {

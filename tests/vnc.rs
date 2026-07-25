@@ -669,9 +669,11 @@ fn without_reconnect_a_dropped_session_exits() {
 }
 
 #[test]
-fn view_only_does_not_reshape_the_remote_desktop() {
-    // The desktop is shared with whoever else is connected, so a session that
-    // promised not to interact must not resize it. noVNC takes the same position.
+fn view_only_still_asks_for_the_terminals_size() {
+    // View-only used to decline the resize, on the grounds that the desktop is
+    // shared. The protocol never says how many clients are attached, so that traded
+    // a pixel-exact picture for a courtesy to a second client that is usually not
+    // there. Not sending input and not reshaping the desktop are separate things.
     let server = FakeServer::start(1024, 768, Resize::Accept);
     let addr = server.addr.to_string();
     let mut term = FakeTerm::spawn(
@@ -688,27 +690,33 @@ fn view_only_does_not_reshape_the_remote_desktop() {
         "{}",
         show(&term.output())
     );
-    // It has to say why it is not doing the thing it was asked to do.
-    assert!(
-        term.wait_for(b"not resizing", Duration::from_secs(10)),
-        "the suppressed resize was not explained: {}",
-        show(&term.output())
-    );
+    let request = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetDesktopSize { .. })
+        })
+        .expect("view-only never asked the server to resize");
+    match request {
+        Request::SetDesktopSize { width, height, .. } => {
+            assert_eq!(
+                (width, height),
+                EXPECTED_REQUEST,
+                "asked for the wrong size"
+            );
+        }
+        other => panic!("unexpected request {other:?}"),
+    }
 
-    std::thread::sleep(Duration::from_millis(500));
+    // Still no input, which is the part view-only is actually about.
+    term.send(b"\x1b[120u");
+    term.send(b"\x1b[<0;137;229M");
+    std::thread::sleep(Duration::from_millis(400));
     assert!(
         !server
             .requests()
             .iter()
-            .any(|r| matches!(r, Request::SetDesktopSize { .. })),
-        "view-only asked the server to resize: {:?}",
+            .any(|r| matches!(r, Request::Key { .. } | Request::Pointer { .. })),
+        "view-only sent input: {:?}",
         server.requests()
-    );
-    // And it still draws, at the size the server chose.
-    assert!(
-        contains(&term.output(), b"1024x768"),
-        "{}",
-        show(&term.output())
     );
 
     quit(&mut term);

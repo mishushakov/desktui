@@ -28,8 +28,8 @@ Arrows pan when the view is cropped.
 copy locally and paste there. On by default, and `--no-clipboard` leaves your clipboard
 alone in both directions.
 
-**Look without touching.** `--view-only` for the session, `Ctrl+A v` to toggle, and
-`Ctrl+A I` to release input temporarily the way TigerVNC's ungrab does.
+**Look without touching.** `--view-only` for the session, `Ctrl+A v` to toggle. It
+stops input reaching the remote and leaves the pointer for the server to draw.
 
 **Survives a flaky link.** `--reconnect` retries with backoff, so a closed lid or a
 Wi-Fi handoff does not end the session.
