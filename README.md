@@ -4,9 +4,8 @@ A VNC client that draws the remote desktop in your terminal as real pixels, usin
 the Kitty graphics protocol — one remote pixel per terminal pixel, not a mosaic of
 half-blocks.
 
-https://github.com/user-attachments/assets/f897d7f1-bd6d-41dc-af56-a9d50dfba15e
-
-No server handy? `make desktop` starts one in Docker and `make run` connects to it.
+<img width="1374" height="1002" alt="Screenshot 2026-07-26 at 05 49 33" src="https://github.com/user-attachments/assets/b8b574da-d750-451f-afde-df45a29503f8" />
+<img width="1374" height="1002" alt="Screenshot 2026-07-26 at 05 45 27" src="https://github.com/user-attachments/assets/f2259bcd-5d61-4451-8bc4-35dd98ceab70" />
 
 > [!NOTE]
 > This was made over a weekend using Claude Code and Opus 5 with xhigh, to test
@@ -84,6 +83,8 @@ desktui 10.0.0.5::5900 --scale fit
 desktui --print-caps          # what does this terminal support?
 desktui --test-pattern        # check the pipeline without a server
 ```
+
+No server handy? `make desktop` starts one in Docker and `make run` connects to it.
 
 ## What makes it pixel-exact
 
