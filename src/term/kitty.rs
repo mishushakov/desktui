@@ -74,6 +74,10 @@ pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x10000;
 /// on so it is composited over it rather than under.
 pub const MENU_HIGHLIGHT_IMAGE_ID: u32 = OVERLAY_IMAGE_ID + 1;
 
+/// Image id for the notification popup's backdrop, above both of the menu's: a note
+/// that arrives while the menu is open belongs on top of it, not under it.
+pub const TOAST_IMAGE_ID: u32 = MENU_HIGHLIGHT_IMAGE_ID + 1;
+
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {

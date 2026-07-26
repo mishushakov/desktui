@@ -115,7 +115,7 @@ fn a_refused_resize_falls_back_and_says_why() {
     // nowhere -- and the reason has to reach the user.
     assert!(
         term.wait_for(b"prohibited", Duration::from_secs(10)),
-        "the refusal was not explained in the status line: {}",
+        "the refusal was not explained in a notification: {}",
         show(&term.output())
     );
     let output = term.output();

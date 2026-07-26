@@ -1,5 +1,5 @@
-//! The command menu: the overlay listing the prefix-key commands, and the one
-//! piece of chrome you can point at.
+//! The command menu: the overlay listing the prefix-key commands, and the piece of
+//! chrome with more than one thing on it you can point at.
 //!
 //! Laid out with ratatui, but not driven by it. A ratatui `Terminal` owns the
 //! screen and diffs its way to the next one, which would put it in charge of the
@@ -139,7 +139,7 @@ fn option_spans(options: &[Option_]) -> Vec<(&Option_, u16, u16)> {
 ///
 /// Right-aligned, like every shortcut, so it starts where it ends up rather than at
 /// a fixed offset. Drawing and hit testing both come through here, or a click would
-/// land next to the word rather than on it.
+/// land next to the button rather than on it.
 fn close_span(close: &str, width: u16) -> (u16, u16) {
     (width.saturating_sub(cells(close)), width)
 }
@@ -225,7 +225,7 @@ impl Menu {
         let entries = vec![
             Entry::Title {
                 name: "Command menu".into(),
-                close: "esc".into(),
+                close: super::CLOSE.into(),
             },
             Entry::Blank,
             Entry::Section("Session".into()),
@@ -333,14 +333,12 @@ impl Menu {
     /// what the cells behind it are coloured -- one function, so the image and the
     /// colour cannot land on different cells.
     ///
-    /// A command's target is its whole row. An option's is the option itself, and the
-    /// title's is the word that dismisses: those rows hold something other than the
-    /// one target, and a bar across all of it would say the pointer is on things it
-    /// is not.
+    /// A command's target is its whole row, and a bar across the row is the answer. An
+    /// option's is the option itself, that row holding several, and a bar across all of it
+    /// would say the pointer is on things it is not. The title's button gets no bar at all.
     fn hover_bar(&self, area: Rect) -> Option<Rect> {
         let (index, command) = self.hover?;
         let y = area.y + PAD_Y + u16::try_from(index).ok()?;
-        let inner = area.width.saturating_sub(PAD_X * 2);
         let span = |start: u16, width: u16| {
             Some(Rect {
                 x: area.x + PAD_X + start,
@@ -356,10 +354,11 @@ impl Menu {
                     .find(|(option, ..)| option.command == command)?;
                 span(start, option.width())
             }
-            Entry::Title { close, .. } => {
-                let (start, end) = close_span(close, inner);
-                span(start, end - start)
-            }
+            // The one target with no bar: it is a button in the palette's own styling,
+            // which lifts by colour alone, and a bar behind it would be a second mark for
+            // one thing -- as well as the one difference between this button and the
+            // popup's, which has no bar to give it (see `theme::Palette::close_button`).
+            Entry::Title { .. } => None,
             _ => Some(Rect {
                 x: area.x,
                 y,
@@ -532,14 +531,10 @@ impl Widget for MenuView<'_> {
                     ))
                     .render(row, buf);
                     // A target, so it lifts under the pointer like everything else
-                    // rather than sitting there as a label that happens to work.
-                    let style = if hovered(Command::Menu) {
-                        Style::new()
-                            .fg(colour(ink.accent))
-                            .add_modifier(Modifier::UNDERLINED)
-                    } else {
-                        Style::new().fg(colour(ink.muted))
-                    };
+                    // rather than sitting there as a label that happens to work. The
+                    // styling is the palette's rather than this file's, the popup
+                    // carrying the same button (see `toast`).
+                    let style = ink.close_button(hovered(Command::Menu));
                     Line::from(Span::styled(close.as_str(), style))
                         .right_aligned()
                         .render(row, buf);
@@ -617,7 +612,8 @@ fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, style: Style, ink
 mod tests {
     use super::*;
     use crate::cli::ScaleMode;
-    use crate::ui::theme::probe::bg;
+    use crate::ui::CLOSE;
+    use crate::ui::theme::probe::{bg, fg};
 
     /// A settled state, for the tests that reason about geometry rather than marks.
     fn state() -> State {
@@ -922,28 +918,51 @@ mod tests {
     }
 
     #[test]
-    fn the_word_in_the_title_is_a_target_and_the_name_beside_it_is_not() {
+    fn the_button_in_the_title_is_a_target_and_the_name_beside_it_is_not() {
         let mut menu = Menu::new('a');
         let m = metrics(100, 40);
         let area = menu.area(&m).unwrap();
         let row = area.y + PAD_Y;
-        // "esc" is pushed against the right edge of the padded area, so it ends there.
+        // The button is pushed against the right edge of the padded area, so it ends
+        // there.
         let end = area.x + area.width - PAD_X;
         let dismiss = Hit::Item {
             index: 0,
             command: Command::Menu,
         };
-        for col in [end - 3, end - 2, end - 1] {
-            assert_eq!(menu.hit(&m, col, row), dismiss, "column {col} of the title");
-        }
+        // One cell of mark and one cell of target: what a click acts on is the cell the
+        // button is drawn on, with nothing either side of it standing in.
+        assert_eq!(menu.hit(&m, end - 1, row), dismiss, "the button");
         // Neither the name at the other end nor the space between them.
         assert_eq!(menu.hit(&m, area.x + PAD_X, row), Hit::Inside, "the name");
-        assert_eq!(menu.hit(&m, end - 4, row), Hit::Inside, "the gap");
+        assert_eq!(menu.hit(&m, end - 2, row), Hit::Inside, "the gap");
 
-        // And the bar covers the word, not the row: the rest of it does nothing.
+        // And it lifts by colour alone: no bar behind it, which would be a second mark for
+        // one thing and the one way this button and the popup's -- which has no bar to be
+        // given -- could look unlike each other.
         menu.set_hover(menu.hit(&m, end - 1, row));
-        let bar = menu.hover_bar(area).expect("nothing highlighted");
-        assert_eq!((bar.x, bar.width, bar.y), (end - 3, 3, row));
+        assert_eq!(
+            menu.hover_bar(area),
+            None,
+            "the title's button should have no bar"
+        );
+
+        let mut out = Vec::new();
+        menu.draw(&mut out, &m, state());
+        let text = String::from_utf8(out).unwrap();
+        let ink = state().theme.palette();
+        assert!(
+            !text.contains(&bg(ink.hover)),
+            "nothing else is hovered, so nothing should carry the lift: {text:?}"
+        );
+        // The accent is the sections' colour too, so it is the run carrying the button
+        // that has to be found rather than the first run in that ink.
+        let lit = text.split(&fg(ink.accent)).any(|run| {
+            run.split("\x1b[0m")
+                .next()
+                .is_some_and(|run| run.contains(CLOSE))
+        });
+        assert!(lit, "the button should be in the accent: {text:?}");
     }
 
     #[test]

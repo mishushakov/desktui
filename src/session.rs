@@ -29,6 +29,7 @@ use crate::term::{Metrics, TerminalGuard, kitty};
 use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
 use crate::ui::theme::Theme;
+use crate::ui::toast::Toast;
 
 /// How long to wait for the TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,9 +43,6 @@ const UPDATE_WATCHDOG: Duration = Duration::from_secs(1);
 /// long after the last one keeps us from asking the server to resize dozens of
 /// times.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
-
-/// How long a note stays in the status line.
-const NOTE_LINGER: Duration = Duration::from_secs(4);
 
 /// Floor on the gap between two update requests, so a server that answers an
 /// incremental request instantly cannot spin us at full speed.
@@ -331,7 +329,8 @@ struct Session {
     /// the image over them does not do it: the image sits below the text.
     clear_menu: bool,
     show_stats: bool,
-    note: Option<(String, Instant)>,
+    /// The notification popup in the top-right corner, and the note it is showing.
+    toast: Toast,
 
     fps: FpsMeter,
     last_stats: FrameStats,
@@ -390,7 +389,7 @@ impl Session {
             show_menu: false,
             clear_menu: false,
             show_stats: false,
-            note: None,
+            toast: Toast::default(),
             fps: FpsMeter::new(),
             last_stats: FrameStats::default(),
             dropped: 0,
@@ -801,11 +800,42 @@ impl Session {
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
 
-                // The menu takes the pointer while it is up. Nothing goes through to
-                // the remote: a click meant for a menu item must not also land on
-                // whatever is behind it.
+                // The popup is offered the pointer before the menu is, because it is
+                // drawn over the menu: half the notes there are arrive from a menu item,
+                // and a click on one leaves the box up, so a cross that the menu could
+                // swallow is a cross that does nothing most of the time it is on screen.
+                //
+                // Only a press on the cross is taken. The rest of the box is not a
+                // target, so the pointer goes on reaching whatever is underneath as it
+                // crosses a note that has already been read -- and a release is never
+                // swallowed, which would leave a button held down over there.
+                let (col, row) = self.input.terminal_cell(&mouse, &self.metrics);
+                let on_close = self.toast.on_close(&self.metrics, col, row);
+                self.toast.set_hover(on_close);
+                let pressed = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                if pressed && let Some(target) = self.toast.close_cells(&self.metrics) {
+                    // A click that missed by a cell and one the popup never saw look the
+                    // same from the outside; this is what tells them apart.
+                    tracing::debug!("click at cell {col},{row}; the cross wants {target:?}");
+                }
+                if on_close && pressed {
+                    if self.toast.dismiss() {
+                        self.renderer.mark_all();
+                    }
+                    return Ok(());
+                }
+
+                // The menu takes the rest of the pointer while it is up. Nothing goes
+                // through to the remote: a click meant for a menu item must not also land
+                // on whatever is behind it.
                 if self.show_menu {
-                    self.on_menu_mouse(mouse).await?;
+                    // Except where the popup covers it: the box lights nothing under a
+                    // pointer that is on the cross drawn over it.
+                    if on_close {
+                        self.menu.clear_hover();
+                    } else {
+                        self.on_menu_mouse(mouse).await?;
+                    }
                     return Ok(());
                 }
 
@@ -1180,8 +1210,13 @@ impl Session {
     }
 
     fn draw(&mut self) -> Result<()> {
+        // A note that has run out has to come off the screen, and the screen it was
+        // over has to be drawn back: work of its own, whether or not a frame arrived.
+        if self.toast.expire() {
+            self.renderer.mark_all();
+        }
         let has_work = self.renderer.has_work();
-        if !has_work && self.note.is_none() && !self.show_menu && !self.clear_menu {
+        if !has_work && !self.toast.is_live() && !self.show_menu && !self.clear_menu {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1199,6 +1234,7 @@ impl Session {
             self.menu.clear(&mut buf, &self.metrics);
             self.clear_menu = false;
         }
+        self.toast.clear(&mut buf);
         let stats = self.renderer.compose(&self.fb, &mut buf);
         if stats.tiles > 0 {
             self.last_stats = stats;
@@ -1207,6 +1243,10 @@ impl Session {
         if self.show_menu {
             self.menu.draw(&mut buf, &self.metrics, self.menu_state());
         }
+        // Last of the chrome, so a note that arrives with the menu open lands on top
+        // of it rather than under it.
+        self.toast
+            .draw(&mut buf, &self.metrics, self.theme.palette());
         if self.caps.sync_output {
             kitty::end_sync(&mut buf);
         }
@@ -1214,6 +1254,7 @@ impl Session {
         match self.writer.submit(buf) {
             Ok(()) => {
                 self.renderer.commit();
+                self.toast.commit();
                 self.fps.tick();
             }
             Err(Busy::Full(buf)) => {
@@ -1242,16 +1283,6 @@ impl Session {
         rest.push_str(&format!("  {}", describe(&layout)));
         if self.view_only {
             rest.push_str("  view-only");
-        }
-
-        // The note comes after the dot below, so it is built here rather than pushed.
-        let mut note = String::new();
-        if let Some((text, at)) = &self.note {
-            if at.elapsed() < NOTE_LINGER {
-                note = format!("  -- {text}");
-            } else {
-                self.note = None;
-            }
         }
 
         // The one binding worth naming, because it opens the menu the rest of them are
@@ -1286,7 +1317,6 @@ impl Session {
         if self.input.is_armed() {
             left.push(ink.accent("  ● CMD"));
         }
-        left.push(ink.text(&note));
 
         status::draw(
             buf,
@@ -1340,9 +1370,15 @@ impl Session {
         self.set_note("remote clipboard copied".into());
     }
 
+    /// Put a note up in the notification popup.
     fn set_note(&mut self, note: String) {
         tracing::debug!("{note}");
-        self.note = Some((note, Instant::now()));
+        // A note landing on top of one already up takes the old box off the screen with
+        // it, and the remote screen under the cells it no longer covers has to come
+        // back -- the same repair the menu asks for when it is dismissed.
+        if self.toast.show(note) {
+            self.renderer.mark_all();
+        }
     }
 }
 
