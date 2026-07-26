@@ -2,10 +2,11 @@
 
 How a remote framebuffer becomes terminal graphics, and why the shape is what it is.
 
-This is a design document as much as a description: the parts already built are marked as
-such at the end, and the rest is where the pipeline is going. Anything here that reads as
-a statement of fact about the code should be checked against
-[the last section](#where-this-stands) first.
+This is a design document as much as a description. Everything below describes the pipeline
+as designed; roughly two thirds of it is built. [Where this stands](#where-this-stands) says
+which parts, and [Not built yet](#not-built-yet) says what the rest costs to build and what
+is not obvious about it. Anything here that reads as a statement of fact about the code
+should be checked against those two first.
 
 ## What the medium dictates
 
@@ -216,12 +217,120 @@ Built:
 - resampling only the region a frame is about to send, grown by the filter's reach
   (`src/render/scale.rs`)
 
-Not built, in the order worth doing:
+## Not built yet
 
-- **the plane as described**: `Content` keys instead of `dirty: Vec<bool>`, `placed` as a
-  rectangle, and `Layout::maps_alike`.
-- **the cursor as a placement** with `X`/`Y`, replacing `blend_cursor`.
-- **the chrome as one diffed plane**, replacing `Toast`'s own stale-cell bookkeeping,
-  `clear_menu`, and `status::clear`.
-- **`Fence` as flow control**, so pushed frames can be bounded instead of declined
-  wholesale with `--no-push`.
+Four things, in the order worth doing. What each one *is* is above; what follows is what
+it costs to build and the parts that are not obvious from the design.
+
+### 1. The plane
+
+Replaces three mechanisms with the one [Plane](#plane) describes: `dirty: Vec<bool>`,
+`placed: (u16, u16)` and `Layout::maps_alike`, all in `src/render/mod.rs`.
+
+Mechanical, once two things are seen:
+
+**`commit` can recompute rather than remember.** The obvious reading is that composing has
+to record what it sent so the commit can promote it, which wants a second structure
+alongside the plane. It does not: `want` is a pure function of the layout, the grid and the
+tile's damage generation, so the commit can compute it again. Every tile is then
+`held = want; placed_at = cell` -- which is what today's `placed = (nx, ny)` already is,
+generalised from an extent to a key.
+
+**The derived count stays.** `has_work` is called every tick and must not walk the grid
+computing keys. So the plane keeps its out-of-date count the way the dirty bitmap does
+today, maintained where the marks happen rather than recomputed: `mark`, `mark_dst`,
+`mark_cells`, `mark_all`, `move_cursor`, `set_cursor`, `relayout`. Those are the paths to
+change, and they are the same paths that carry today's bitmap -- the change is what a mark
+*writes*, not where marks come from.
+
+The padding in `Layout::src_to_dst` stays as it is: it answers which tiles a source pixel
+can reach, which is still the question a damage rectangle asks.
+
+Two behaviours change, both improvements:
+
+- A scaled resize can keep tiles. `maps_alike` refuses all scaling because it compares
+  layouts and cannot tell a tile whose pixels survived from one whose did not; comparing
+  keys can, so a `fit` resize keeps whatever genuinely did not move.
+- The density invariant becomes structural. `placed` as a rectangle is only correct because
+  frames arrive whole; a per-tile key cannot be wrong that way, and a frame that half
+  arrived cannot leave a tile counted as held.
+
+Verification is the existing suite, which is why this is worth doing carefully rather than
+quickly: `growing_the_window_sends_the_new_tiles_and_not_the_rest`,
+`moving_the_picture_costs_placements_and_not_pixels`,
+`a_frame_that_never_reached_the_terminal_leaves_its_tiles_owing` and
+`a_grid_that_only_grows_keeps_the_tiles_that_did_not_move` are the four that would catch a
+mistake. Add one for the case that only the plane can do: a scaled resize where a tile's
+source and size survive is kept.
+
+### 2. The cursor as a placement
+
+Replaces `blend_cursor`, `cursor_rect` and the cursor's dirty-marking in
+`src/render/mod.rs` with one image whose id is above every tile's, placed with sub-cell
+`X`/`Y` offsets and moved with `a=p`.
+
+**Answer this first.** The protocol says semi-transparent placements that overlap are
+blended, and that at equal `z` the higher id is on top. Whether Ghostty actually blends an
+RGBA (`f=32`) placement over another placement -- rather than compositing it against the
+cell background, or drawing it opaque -- is not something the docs settle, and getting it
+wrong means a black rectangle over the pointer. Test it with a two-line script against
+Ghostty and kitty before writing any of the rest.
+
+If it holds, the rest is small. `X`/`Y` must be smaller than the cell, so the placement
+cell is `hotspot / cell_size` and the offset is the remainder. Motion becomes one release
+plus one `a=p`, about forty bytes, against two tile retransmissions today.
+
+It also fixes a wart nobody has reported: `cursor_at` is in destination pixels, and a
+resize changes what a given screen position maps to, but nothing re-derives it -- so after
+a resize the pointer is drawn at a stale spot until it next moves. A placement is
+re-placed from the new map as a matter of course.
+
+### 3. The chrome as one diffed plane
+
+Replaces `Toast::drawn`/`stale`/`moved`, `Session::clear_menu`, `status::clear` and
+`Menu::clear` with a private cell buffer, double buffered and diffed per frame.
+
+The rule that makes it correct is the one `src/ui/mod.rs` already states: never touch a
+cell we did not write. A renderer that owns the whole screen is wrong here because it would
+repaint the cells our placements live in; owning one plane and diffing that is the same
+idea with the boundary in the right place. `ui::paint::write_cells` is most of the emit
+side already, including the wide-glyph handling that a naive diff gets wrong.
+
+Two things fall out rather than being added: the diff yields the cells the chrome has
+vacated, which is exactly the damage `mark_cells` wants, so the "erased chrome is damage"
+rule stops being a thing to remember; and erases precede placements because that is the
+order the emit does it in, rather than because three call sites each remember to.
+
+The overlay backdrops stay as images. A cell background cannot serve -- it is painted below
+the picture, so a colour set there is never seen.
+
+### 4. Fence as flow control
+
+`--no-push` declines continuous updates wholesale, at a round trip per frame. Fence exists
+to bound in-flight work without giving that up: the server answers one when it reaches that
+point in its stream, so a client can hold a frame's worth of credit and let the server run
+exactly as far ahead as it can draw.
+
+Needs a real server to tune against, and one trap: fences are already used for the latency
+probe, marked by `RTT_PROBE_MARKER` in `src/remote/vnc.rs`. A flow-control fence has to be
+distinguishable from a probe, or the round-trip figure becomes a measurement of the frame
+queue.
+
+`--no-push` stays regardless -- it is the fallback for a server without Fence, and the
+thing to reach for when the question is "is the server the problem?".
+
+### Considered and rejected
+
+**Damage patches above the tiles.** A placement can display a source rectangle of a
+transmitted image, so a frame could send its coalesced damage as one patch image above the
+tile layer and fold patches into tiles later. A caret blink would cost 256 bytes instead of
+a 128x136 tile. Rejected: it buys nothing for the case that actually hurts, since a
+scrolling page dirties everything either way, and it costs patch lifetime, ordering and
+fold-in policy. It profiles well on the case we are already fast at.
+
+**Tile size as a constant.** `TILE_TARGET_PX = 128` is a tuning parameter dressed as a law:
+whole-screen scrolling wants larger tiles to amortise the escape and syscall overhead, a
+caret wants smaller. Choosing it from the layout, or from the damage pattern, is a real
+improvement -- but measure first. With one shared memory object per frame the per-tile
+syscall cost that motivated it is gone, so the remaining argument is escape overhead, which
+is small.
