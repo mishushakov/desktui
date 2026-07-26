@@ -21,6 +21,12 @@
 //!   cell as dropping the placement under it needs -- and it is impossible to forget,
 //!   because the flush returns them whether the caller wants them or not.
 //!
+//! What a diff rests on is knowing what is on screen, and there is one moment when we do
+//! not: a resize. What a terminal leaves on the alternate screen after the window changed
+//! shape is not specified, so [`Chrome::begin`] reports the change and the caller erases,
+//! after which the frame says all of its chrome again rather than the difference from a
+//! screen it is only assuming.
+//!
 //! Overlay *images* -- the menu's backdrop, its hover bar, a note's paper -- are placements
 //! rather than cells, so they cannot be diffed. They are declared each frame instead, and
 //! whatever was placed last frame and is not wanted this one is deleted.
@@ -53,35 +59,30 @@ impl Chrome {
 
     /// Start a frame: blank everything, and adopt the terminal's size.
     ///
-    /// `shown` keeps its contents cell by cell, because that is what is actually on the
-    /// screen -- a window that grew still has the old bar on the row it was drawn on, and
-    /// the diff has to see it there to blank it. `next` is reset, so anything not drawn this
-    /// frame is absent by default rather than by being taken down.
+    /// Returns true when the geometry changed, which means nothing about the screen can be
+    /// trusted and the caller owes it an erase -- see [`Chrome::flush`].
     ///
-    /// Cell by cell rather than `Buffer::resize`, which truncates the flat vector without
-    /// reflowing it: change the *width* and every row after the first is reinterpreted at
-    /// the wrong offset, so the diff compares against a screen that never existed and the
-    /// old bar is never blanked.
-    pub fn begin(&mut self, metrics: &Metrics) {
+    /// A diff rests on knowing what is on screen, and across a resize it does not. Carrying
+    /// the old cells over by coordinate looks right and is a guess: what a terminal does to
+    /// the alternate screen when the window changes shape is not specified, and a client
+    /// that assumes wrong leaves fragments of the old chrome stranded wherever the guess
+    /// missed -- which is exactly what a resize with the menu open looked like. So a resize
+    /// forgets the screen instead, and the frame that adopts the new geometry says
+    /// everything again.
+    pub fn begin(&mut self, metrics: &Metrics) -> bool {
         let area = Rect::new(0, 0, metrics.cols, metrics.rows);
+        // An empty `shown` is the first frame, not a resize: nothing has been drawn, so
+        // there is nothing on screen to distrust and nothing to erase.
+        let resized = self.shown.area != area && !self.shown.area.is_empty();
         if self.shown.area != area {
-            let mut moved = Buffer::empty(area);
-            let rows = self.shown.area.height.min(area.height);
-            let cols = self.shown.area.width.min(area.width);
-            for y in 0..rows {
-                for x in 0..cols {
-                    if let Some(was) = self.shown.cell((x, y)).cloned()
-                        && let Some(cell) = moved.cell_mut((x, y))
-                    {
-                        *cell = was;
-                    }
-                }
-            }
-            self.shown = moved;
+            self.shown = Buffer::empty(area);
             self.next = Buffer::empty(area);
+            // Whatever the terminal did with our overlays, they are not where we think.
+            self.placed.clear();
         }
         self.next.reset();
         self.wanted.clear();
+        resized
     }
 
     /// The buffer this frame's chrome renders into.
@@ -97,6 +98,9 @@ impl Chrome {
 
     /// Write what changed, drop the overlays that are no longer wanted, and say which cells
     /// were vacated so the picture under them can be drawn back.
+    ///
+    /// After a [`Chrome::begin`] that reported a resize, the caller has to have erased the
+    /// screen first: this then writes the whole of the new chrome, having forgotten the old.
     ///
     /// Nothing is committed here: [`Chrome::commit`] is called once the frame has actually
     /// reached the terminal, because a frame the writer was too busy for did not happen and
@@ -212,57 +216,60 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_changed_width_still_blanks_the_row_the_chrome_left() {
-        // The trap: `Buffer::resize` truncates the flat vector without reflowing it, so a
-        // change of width reinterprets every row after the first at the wrong offset and the
-        // diff compares against a screen that never existed.
+    fn a_resize_is_reported_and_says_the_whole_chrome_again() {
+        // The screen's contents do not survive a resize as far as we are concerned, so the
+        // frame that adopts the new size writes all of its chrome rather than a diff against
+        // where the old chrome used to be. Guessing that instead -- carrying the old cells
+        // over by coordinate -- is what stranded fragments of a menu across the screen.
         let narrow = metrics(20, 5);
         let mut chrome = Chrome::new();
         frame(&mut chrome, &narrow, Some((0, 4, "bar")));
 
+        // Unchanged geometry: still a diff, still nothing to say.
+        assert!(!chrome.begin(&narrow), "the same size is not a resize");
+
         let wide = metrics(40, 8);
-        chrome.begin(&wide);
+        assert!(chrome.begin(&wide), "a new size has to be reported");
         chrome.buffer().set_string(0, 7, "bar", Style::new());
         let mut out = Vec::new();
         let vacated = chrome.flush(&mut out);
         chrome.commit();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("\x1b[8;1Hbar"),
-            "drawn on the new row: {text:?}"
+            text.contains("\x1b[8;1H") && text.contains("bar"),
+            "the bar is written in full, on the new last row: {text:?}"
         );
         assert!(
-            text.contains("\x1b[5;1H"),
-            "and the row it left blanked: {text:?}"
+            !text.contains("\x1b[5;1H"),
+            "and nothing is blanked at the old coordinates, which the caller's erase has \
+             already taken care of: {text:?}"
         );
-        assert_eq!(vacated.len(), 3, "three cells of it");
+        assert!(
+            vacated.is_empty(),
+            "with the screen erased there is no cell that went blank"
+        );
     }
 
     #[test]
-    fn a_window_that_grew_still_blanks_the_row_the_chrome_left() {
-        // The resize case, which used to need the old metrics kept and the widgets asked
-        // to erase themselves at them.
-        let small = metrics(20, 5);
+    fn a_resize_forgets_the_overlays_rather_than_deleting_them() {
+        // A placement whose cells were erased is not somewhere we can reason about, and the
+        // frame re-places everything it wants anyway. Emitting a delete for it would be
+        // guessing in the other direction.
+        let m = metrics(20, 5);
         let mut chrome = Chrome::new();
-        frame(&mut chrome, &small, Some((0, 4, "bar")));
-
-        // Grown: the bar belongs on the new last row, so row 4 has to be blanked.
-        let big = metrics(20, 8);
-        chrome.begin(&big);
-        chrome.buffer().set_string(0, 7, "bar", Style::new());
-        let mut out = Vec::new();
-        let vacated = chrome.flush(&mut out);
+        chrome.begin(&m);
+        chrome.keep(kitty::OVERLAY_IMAGE_ID);
+        chrome.flush(&mut Vec::new());
         chrome.commit();
-        let text = String::from_utf8(out).unwrap();
+
+        chrome.begin(&metrics(30, 9));
+        let mut out = Vec::new();
+        chrome.flush(&mut out);
         assert!(
-            text.contains("\x1b[8;1Hbar"),
-            "drawn on the new row: {text:?}"
+            !String::from_utf8_lossy(&out).contains("a=d"),
+            "nothing to delete across a resize: {:?}",
+            String::from_utf8_lossy(&out)
         );
-        assert!(
-            text.contains("\x1b[5;1H"),
-            "and the old row blanked: {text:?}"
-        );
-        assert_eq!(vacated.len(), 3, "three cells of it");
     }
 
     #[test]

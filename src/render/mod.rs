@@ -667,6 +667,28 @@ impl Renderer {
         }
     }
 
+    /// Put every tile the terminal holds back on its cells, without sending a pixel.
+    ///
+    /// For a frame that has just erased the screen. Whether erasing cells also drops the
+    /// placements on them is not something the protocol settles and terminals disagree
+    /// about, so this makes the question moot: a placement that survived is replaced by an
+    /// identical one, and one that did not comes back. The image data is untouched either
+    /// way -- an erase is about cells -- so this is forty bytes a tile and no pixels.
+    pub fn replace_all(&mut self, out: &mut Vec<u8>) {
+        for ty in 0..self.grid.ny {
+            for tx in 0..self.grid.nx {
+                let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
+                if self.tiles[idx].held.is_none() {
+                    // Never sent, so there is nothing to put back: the compose will send it.
+                    continue;
+                }
+                let (col, row) = self.cell_of(tx, ty);
+                place_existing(out, self.grid.id(tx, ty), col, row);
+                self.tiles[idx].placed_at = Some((col, row));
+            }
+        }
+    }
+
     /// Mark the tiles under a rectangle of terminal cells, zero-based and absolute.
     ///
     /// For chrome that has been erased. A terminal may treat clearing a cell as dropping

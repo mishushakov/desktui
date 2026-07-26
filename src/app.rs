@@ -216,7 +216,10 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         buf.extend_from_slice(&cleanup);
 
         // The chrome, diffed against what is on screen, before the tiles: see `session`.
-        chrome.begin(&metrics);
+        let resized = chrome.begin(&metrics);
+        if resized {
+            buf.extend_from_slice(b"\x1b[2J");
+        }
         let layout = *renderer.layout();
         let rest = format!(
             "  {}x{} {}  {} tiles",
@@ -245,6 +248,9 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         menu_shown = show_menu;
         for cells in chrome.flush(&mut buf) {
             renderer.mark_cells(cells.x, cells.y, cells.width, cells.height);
+        }
+        if resized {
+            renderer.replace_all(&mut buf);
         }
 
         let stats = renderer.compose(&fb, &mut buf);

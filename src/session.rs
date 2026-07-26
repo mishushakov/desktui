@@ -1187,11 +1187,23 @@ impl<B: Backend> Session<B> {
         // come back as damage, which is what the tiles under them need. Before the tiles
         // because a terminal may treat clearing a cell as dropping the placement under it;
         // the text still lands above them, z-index deciding that rather than write order.
-        self.chrome.begin(&self.metrics);
+        let resized = self.chrome.begin(&self.metrics);
+        if resized {
+            // The geometry changed, so what is on screen is a guess and the guess has been
+            // wrong: erase the text and say all of it again. Inside the frame that redraws,
+            // so nothing is ever seen blank -- which is the whole difference between this
+            // and the wipe that used to go out on its own.
+            buf.extend_from_slice(b"\x1b[2J");
+        }
         self.render_chrome(&mut buf);
         for cells in self.chrome.flush(&mut buf) {
             self.renderer
                 .mark_cells(cells.x, cells.y, cells.width, cells.height);
+        }
+        if resized {
+            // And put the picture back on its cells, in case the erase took the placements
+            // with it. Pixels, not placements, are what a resize is expensive in.
+            self.renderer.replace_all(&mut buf);
         }
 
         let stats = self.renderer.compose(&self.fb, &mut buf);

@@ -382,15 +382,36 @@ pub fn assert_a_relayout_never_blanks_the_screen(term: &FakeTerm, before: usize)
         "the new layout was never drawn: {}",
         show(seen)
     );
-    assert!(
-        !contains(seen, ERASE_SCREEN),
-        "a layout change erased the whole screen: {}",
-        show(seen)
-    );
-
     let opens = offsets(seen, BEGIN_SYNC);
     let closes = offsets(seen, END_SYNC);
-    for taken in [ERASE_SCREEN, ERASE_ROW, DELETE_IMAGE] {
+
+    // A resize does erase the screen -- what a terminal leaves on the alternate screen after
+    // the window changed shape is not something we can claim to know -- so the property is
+    // not that it never happens but that it is never *seen*: the block that erases has to be
+    // the block that puts the picture back. Erases before the first block are the setup
+    // entering the alternate screen, with nothing drawn yet to lose.
+    for at in offsets(seen, ERASE_SCREEN) {
+        let Some(open) = opens.iter().copied().rfind(|o| *o < at) else {
+            continue;
+        };
+        // `None < Some(_)`, so an open marker before it with no close since means the erase
+        // is inside that block rather than after it ended.
+        let since = closes.iter().copied().rfind(|c| *c < at);
+        assert!(
+            since < Some(open),
+            "the screen was erased at {at} outside a synchronised block \
+             (last open {open}, last close {since:?}): {}",
+            show(seen)
+        );
+        let close = closes.iter().copied().find(|c| *c > at).unwrap_or(seen.len());
+        assert!(
+            contains(&seen[open..close], session::DREW),
+            "the screen was erased at {at} in a block that drew nothing back: {}",
+            show(&seen[open..close])
+        );
+    }
+
+    for taken in [ERASE_ROW, DELETE_IMAGE] {
         for at in offsets(seen, taken) {
             let open = opens.iter().copied().rfind(|o| *o < at);
             let close = closes.iter().copied().rfind(|c| *c < at);

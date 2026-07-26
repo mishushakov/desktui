@@ -193,13 +193,19 @@ per motion event, where a placement is forty bytes.
    settled on, TigerVNC having moved deliberately away from a longer idle period because
    waiting for a drag to finish makes maximising feel like it did not take.
 2. Query the metrics; compute the new map.
-3. Re-lay out the chrome. Its diff hands back the cells it vacated; the plane takes them
-   as damage.
-4. Reconcile the plane against the new map.
+3. Erase the screen's text, and re-lay out the chrome in full. This is the one place a diff
+   cannot be trusted: what a terminal leaves on the alternate screen after the window
+   changed shape is not specified, so a client that assumes its cells kept their coordinates
+   is guessing, and the guess showed -- fragments of an old command menu stranded around the
+   screen. Cheap to be certain instead, because chrome is text.
+4. Reconcile the plane against the new map, then put every tile the terminal still holds
+   back on its cells with `a=p`. Forty bytes each and no pixels, and it settles the other
+   half of the same question: whether erasing a cell drops the placement under it.
 5. In native mode, ask the server for the new size -- one request in flight at a time, so
    a drag cannot pile them up.
-6. Emit one frame. **Nothing erases the screen.** Tiles are dropped by id and text is
-   diffed, so there is never a moment with less on screen than before.
+6. Emit one frame. The erase is **inside** it, in the same synchronised block that draws the
+   new layout, so the screen is never seen with less on it than before -- which is the whole
+   difference between this and the wipe that used to go out on its own.
 7. The server's new desktop size arrives as a complete update, producing a new map and a
    second reconciliation. Interior tiles survive it if their content key does.
 
@@ -211,6 +217,7 @@ per motion event, where a placement is forty bytes.
 | caret blink | one tile |
 | window grown two cells, 1:1 | the new column and row, plus the edge tiles that were clipped |
 | window re-centred | one `a=p` per tile, no pixels |
+| any resize, on top of the above | one erase and the chrome said again, plus one `a=p` per surviving tile |
 | scaled resize | every tile, and one resample |
 | font size change | every tile |
 | full-screen frame, shared memory | five system calls per tile, one pass over the pixels |
@@ -244,7 +251,8 @@ Built:
 
 - positional tile ids, `TILE_ID_STRIDE` (`src/render/mod.rs`)
 - atomic frames, one write per frame inside DEC 2026 (`src/session.rs`, `src/term/writer.rs`)
-- no screen erase on relayout: per-id drops, targeted chrome erases (`src/render/mod.rs`, `src/ui/status.rs`)
+- no screen erase *outside a frame*: per-id tile drops, and a resize's erase carried into the
+  synchronised block that redraws (`src/render/mod.rs`, `src/ui/chrome.rs`, `src/session.rs`)
 - moves as `a=p` for a picture that only shifted (`src/term/kitty.rs`)
 - damage published at the update boundary (`src/session.rs`)
 - resize rate limit, leading edge (`src/session.rs`)

@@ -450,13 +450,11 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
         "the bar should be on the last row: {:?}",
         screen.row(49)
     );
-    assert_eq!(
-        count(&out, b"\x1b[2J"),
-        1,
-        "the only erase of the whole screen is the setup sequence entering the \
-         alternate screen; a relayout added one: {}",
-        show(&out)
-    );
+    // A relayout does erase the screen, because what a terminal leaves on the alternate
+    // screen when the window changes shape is not ours to assume -- but never on its own:
+    // the block that erases is the block that draws the new layout, so nothing is seen
+    // blank. That is the property, and it holds for every erase in the run.
+    common::assert_a_relayout_never_blanks_the_screen(&term, 0);
 
     // And it stays that way: the rows the bar left do not come back, and the row it is on
     // keeps saying what it says. Nothing asserts that the bar is *rewritten*, because an
@@ -544,4 +542,83 @@ fn focus_reporting_is_enabled_so_held_keys_can_be_released() {
         contains(&term.output(), b"\x1b[?1004l"),
         "focus reporting was left on at exit"
     );
+}
+
+#[test]
+fn resizing_with_the_menu_up_leaves_nothing_of_the_old_one() {
+    // Reported: resize while the menu is open and the box comes out scrambled, with
+    // fragments of the old layout stranded around the screen. The menu is centred and its
+    // rows are laid out against the width, so every resize puts all of it somewhere else --
+    // which is the hardest case for a diff to get right, and the one that says whether the
+    // plane really knows what is on screen.
+    let mut term = FakeTerm::spawn(200, 50, 1600, 850, &["--test-pattern", "--fps", "20"]);
+    term.answer_probe(GHOSTTY_REPLIES);
+    assert!(
+        term.wait_for(b"\x1b_Ga=T", Duration::from_secs(10)),
+        "nothing was drawn"
+    );
+    term.send(b"h");
+    assert!(
+        term.wait_for(b"Renegotiate the remote size", Duration::from_secs(10)),
+        "the menu never appeared: {}",
+        show(&term.output())
+    );
+    let opened = term.output().len();
+
+    // A drag, as a window manager reports it: several sizes in quick succession, some
+    // smaller and some larger, with the menu up throughout. All of them big enough to hold
+    // the box, so every frame here owes a menu -- a window too small for one is
+    // `menu_fits_or_is_skipped`'s case, not this one.
+    for (cols, rows) in [(160u16, 44u16), (196, 48), (170, 46), (190, 50), (200, 50)] {
+        term.resize(cols, rows, cols * 8, rows * 17);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    std::thread::sleep(Duration::from_millis(600));
+
+    // The mechanism, in the stream: a resize erases the screen and says the whole menu
+    // again, in the same block. A diff against where the old box used to be would emit
+    // neither, and that is the bug -- a fake terminal applies our coordinates exactly as we
+    // meant them, so it can only check that we stopped relying on them, not what a real
+    // terminal does with the alternate screen when the window changes shape.
+    let out = term.output();
+    let seen = &out[opened..];
+    let erases = offsets(seen, ERASE_SCREEN);
+    assert!(
+        erases.len() >= 3,
+        "each resize should have erased the screen, got {} for five: {}",
+        erases.len(),
+        show(seen)
+    );
+    let closes = offsets(seen, END_SYNC);
+    for at in &erases {
+        let close = closes
+            .iter()
+            .copied()
+            .find(|c| c > at)
+            .unwrap_or(seen.len());
+        assert!(
+            contains(&seen[*at..close], b"Renegotiate the remote size"),
+            "the block that erased at {at} did not say the menu again: {}",
+            show(&seen[*at..close])
+        );
+    }
+
+    // One menu, and nothing of any earlier one. The title is unmistakable and appears once
+    // per box, so counting it counts boxes.
+    let screen = Screen::replay(&out, 200, 50);
+    let titles = (0..50)
+        .filter(|row| screen.row(*row).contains("Command menu"))
+        .count();
+    assert_eq!(
+        titles, 1,
+        "expected exactly one menu on screen, rows read:\n{}",
+        (0..50)
+            .map(|row| format!("{row:>3}|{}", screen.row(row)))
+            .filter(|line| line.len() > 4)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    term.send(b"q");
+    term.wait(Duration::from_secs(10));
 }
