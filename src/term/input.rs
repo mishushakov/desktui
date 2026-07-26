@@ -61,7 +61,8 @@ pub enum Command {
     Pan(i32, i32),
     ToggleViewOnly,
     ToggleStats,
-    Help,
+    /// Show the command menu, or put it away if it is already up.
+    Menu,
     /// The prefix was pressed twice: send it through to the server.
     SendPrefix,
 }
@@ -477,7 +478,10 @@ fn command_for(code: KeyCode) -> Option<Command> {
         KeyCode::Char('m') => Command::CycleMode,
         KeyCode::Char('v') => Command::ToggleViewOnly,
         KeyCode::Char('c') => Command::ToggleStats,
-        KeyCode::Char('h') | KeyCode::Char('?') => Command::Help,
+        // Nothing else opens the menu, and the menu is where the rest of these are
+        // listed, so this is the one binding worth remembering -- which is why it is
+        // the one the status line names.
+        KeyCode::Char('p') => Command::Menu,
         KeyCode::Left => Command::Pan(-1, 0),
         KeyCode::Right => Command::Pan(1, 0),
         KeyCode::Up => Command::Pan(0, -1),
@@ -738,6 +742,18 @@ mod tests {
             command_for(KeyCode::Char('v')),
             Some(Command::ToggleViewOnly)
         );
+        assert_eq!(command_for(KeyCode::Char('c')), Some(Command::ToggleStats));
+        // The menu, and the only key that opens it.
+        assert_eq!(command_for(KeyCode::Char('p')), Some(Command::Menu));
+        assert!(
+            ('a'..='z')
+                .filter(|c| command_for(KeyCode::Char(*c)) == Some(Command::Menu))
+                .eq(['p']),
+            "more than one key opens the menu, or none does"
+        );
+        for gone in ['h', '?'] {
+            assert_eq!(command_for(KeyCode::Char(gone)), None, "{gone} still binds");
+        }
     }
 
     #[test]

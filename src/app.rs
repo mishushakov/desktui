@@ -92,8 +92,8 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     // Listed, not clickable: none of the prefix commands mean anything to a loop
     // with no server behind it.
     let menu = Menu::new(args.prefix_char());
-    let mut show_help = false;
-    let mut clear_help = false;
+    let mut show_menu = false;
+    let mut clear_menu = false;
     let mut last_stats = crate::render::FrameStats::default();
     let mut dropped: u64 = 0;
 
@@ -110,7 +110,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             }
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    let was_showing = show_help;
+                    let was_showing = show_menu;
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Char('c')
@@ -118,13 +118,13 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                         {
                             return Ok(());
                         }
-                        KeyCode::Char('h') | KeyCode::Char('?') => show_help = !show_help,
-                        _ => show_help = false,
+                        KeyCode::Char('h') | KeyCode::Char('?') => show_menu = !show_menu,
+                        _ => show_menu = false,
                     }
-                    // The overlay leaves text and a backdrop image behind it, and
+                    // The menu leaves text and a backdrop image behind it, and
                     // neither is undone by drawing the pattern again.
-                    if was_showing && !show_help {
-                        clear_help = true;
+                    if was_showing && !show_menu {
+                        clear_menu = true;
                         renderer.mark_all();
                     }
                 }
@@ -188,7 +188,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         for r in &damage {
             renderer.mark(*r);
         }
-        if !renderer.has_work() && !show_help && !clear_help {
+        if !renderer.has_work() && !show_menu && !clear_menu {
             continue;
         }
 
@@ -196,9 +196,9 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         if caps.sync_output {
             kitty::begin_sync(&mut buf);
         }
-        if clear_help {
+        if clear_menu {
             menu.clear(&mut buf, &metrics);
-            clear_help = false;
+            clear_menu = false;
         }
         let stats = renderer.compose(&fb, &mut buf);
         if stats.tiles > 0 {
@@ -214,14 +214,14 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             renderer.tile_count(),
         );
         let right = format!(
-            "{:>5.1} fps  {:>3} tiles/f  {:>6}/f  {} dropped  q quit  h help ",
+            "{:>5.1} fps  {:>3} tiles/f  {:>6}/f  {} dropped  q quit  h menu ",
             fps.fps(),
             last_stats.tiles,
             human_bytes(last_stats.bytes),
             dropped,
         );
         status::draw(&mut buf, &metrics, &left, &right);
-        if show_help {
+        if show_menu {
             menu.draw(&mut buf, &metrics, args.scale);
         }
         if caps.sync_output {

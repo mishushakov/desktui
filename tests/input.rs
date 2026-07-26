@@ -4,7 +4,7 @@
 //! answer for the keyboard protocol and owe a release for every press, some report
 //! nothing and have their releases synthesised. On top of that sit the things the
 //! client swallows rather than forwards -- the prefix chord, the key that dismisses the
-//! help overlay -- and the corrections it inserts, like a caps lock the server disagrees
+//! command menu -- and the corrections it inserts, like a caps lock the server disagrees
 //! with.
 
 mod common;
@@ -85,31 +85,31 @@ fn input_reaches_the_server_with_pixel_exact_coordinates() {
 }
 
 #[test]
-fn the_help_overlay_goes_away_on_the_next_key() {
-    // The bug this replaces: only the prefix command toggled the overlay, so the
+fn the_command_menu_goes_away_on_the_next_key() {
+    // The bug this replaces: only the prefix command toggled the menu, so the
     // "any other key dismisses this" it advertises was untrue and the box stayed
     // on screen for the rest of the session.
     let (server, mut term) = start(Resize::Accept, (1024, 768));
     assert_pixel_exact(&term, Duration::from_secs(10));
 
-    // Ctrl+A then ? raises it.
+    // Ctrl+A then p raises it.
     term.send(&[0x01]);
     std::thread::sleep(Duration::from_millis(50));
-    term.send(b"?");
+    term.send(b"p");
     assert!(
         term.wait_for(b"Renegotiate the remote size", Duration::from_secs(10)),
-        "the overlay never appeared"
+        "the menu never appeared"
     );
 
     // While it is up it is redrawn every frame, so a tail of the output that no
-    // longer mentions it is the overlay being gone rather than merely not resent.
+    // longer mentions it is the menu being gone rather than merely not resent.
     let mark = term.output().len();
     term.send(b"\x1b[120u");
     std::thread::sleep(Duration::from_millis(500));
     let since = term.output()[mark..].to_vec();
     assert!(
         !contains(&since, b"Renegotiate the remote size"),
-        "the overlay was still being drawn after a dismissing key"
+        "the menu was still being drawn after a dismissing key"
     );
 
     // Stopping the redraw is not the same as taking it off the screen. The glyphs
@@ -118,10 +118,10 @@ fn the_help_overlay_goes_away_on_the_next_key() {
     // an image by id, which makes it the thing to look for.
     assert!(
         contains(&since, b"a=d,d=I,i="),
-        "the overlay was never cleared, so it is still on screen"
+        "the menu was never cleared, so it is still on screen"
     );
 
-    // The key that dismisses is swallowed rather than passed on: the overlay
+    // The key that dismisses is swallowed rather than passed on: the menu
     // said it dismisses, not that it types.
     assert!(
         !server.requests().iter().any(|r| matches!(
@@ -155,10 +155,10 @@ fn clicking_a_scaling_option_selects_that_one() {
         tail(&term.output())
     );
 
-    // Ctrl+A then ? raises the menu.
+    // Ctrl+A then p raises the menu.
     term.send(&[0x01]);
     std::thread::sleep(Duration::from_millis(50));
-    term.send(b"?");
+    term.send(b"p");
     assert!(
         term.wait_for(b"Scaling", Duration::from_secs(10)),
         "the menu never appeared: {}",

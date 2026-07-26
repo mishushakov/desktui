@@ -117,6 +117,7 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 
 | `Ctrl+A` then | |
 |---|---|
+| `p` | the command menu |
 | `q` | quit |
 | `f` | full screen refresh |
 | `r` | renegotiate the remote size |
@@ -124,14 +125,15 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
 | `c` | toggle statistics (fps, tiles, bytes per frame, server RTT) |
-| `h` `?` | help |
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
-The help overlay is a menu: the row under the pointer lights up and a click runs it.
-The scaling row is a select — the mode in force is bracketed, and clicking another goes
-straight to it, where the key can only step to the next one. `Esc` closes the menu, as
-does any other key or a click off the box. While it is open the pointer belongs to the
-menu, so nothing you click on reaches the remote desktop.
+`Ctrl+A p` is the only one worth remembering, because the rest are listed in what it
+opens, each beside the keys that reach it. The row under the pointer lights up and a
+click runs it, so nothing in there needs a binding to be reachable. The scaling row is
+a select: the mode in force is bracketed, and clicking another goes straight to it,
+where the key can only step to the next one. `Esc` closes the menu, as does any other
+key or a click off the box. While it is open the pointer belongs to the menu, so
+nothing you click on reaches the remote desktop.
 
 Clipboard works in both directions: paste into the terminal and it reaches the
 remote clipboard; the remote clipboard arrives locally through OSC 52.
@@ -154,7 +156,7 @@ re-sending an id replaces the image and its placement atomically, so partial upd
 need no delete traffic and never flicker. A one-pixel change costs about a kilobyte.
 
 Tiles are placed with `z=-1`, below text and above the cell background, so the
-status line and help overlay stay readable on top of the remote screen.
+status line and command menu stay readable on top of the remote screen.
 
 The mouse pointer is drawn here rather than by the server: asking for the `Cursor`
 pseudo-encoding gets the shape sent once and stops the server compositing it into the

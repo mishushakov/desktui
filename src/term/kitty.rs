@@ -27,7 +27,7 @@
 //!   would answer every tile and we would have to drain those answers out of
 //!   the input stream.
 //! * `z=-1` puts the image below text but above the cell background, so the
-//!   status line and the help overlay stay legible on top of the remote screen.
+//!   status line and the command menu stay legible on top of the remote screen.
 //!   At the default `z=0` the image would cover them.
 //!
 //! Animation frames (`a=f`) are deliberately unused: they exist for

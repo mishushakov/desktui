@@ -320,10 +320,10 @@ struct Session {
     no_clipboard: bool,
     /// The command menu, and where the pointer is on it.
     menu: Menu,
-    show_help: bool,
+    show_menu: bool,
     /// The menu was dismissed and its cells still have to be blanked. Drawing
     /// the image over them does not do it: the image sits below the text.
-    clear_help: bool,
+    clear_menu: bool,
     show_stats: bool,
     note: Option<(String, Instant)>,
 
@@ -380,8 +380,8 @@ impl Session {
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
             menu: Menu::new(args.prefix_char()),
-            show_help: false,
-            clear_help: false,
+            show_menu: false,
+            clear_menu: false,
             show_stats: false,
             note: None,
             fps: FpsMeter::new(),
@@ -740,12 +740,12 @@ impl Session {
     async fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) => {
-                // The overlay promises that any other key dismisses it, so the key
+                // The menu promises that any other key dismisses it, so the key
                 // is caught here rather than interpreted. Presses only: the releases
-                // belonging to the chord that opened the overlay are still to come,
+                // belonging to the chord that opened the menu are still to come,
                 // and would otherwise close it before it could be read.
-                if self.show_help && key.kind == KeyEventKind::Press {
-                    self.dismiss_help();
+                if self.show_menu && key.kind == KeyEventKind::Press {
+                    self.dismiss_menu();
                     return Ok(());
                 }
                 let locks = self.input.lock_state(&key);
@@ -775,7 +775,7 @@ impl Session {
                 // The menu takes the pointer while it is up. Nothing goes through to
                 // the remote: a click meant for a menu item must not also land on
                 // whatever is behind it.
-                if self.show_help {
+                if self.show_menu {
                     self.on_menu_mouse(mouse).await?;
                     return Ok(());
                 }
@@ -881,11 +881,11 @@ impl Session {
                 );
             }
             Command::ToggleStats => self.show_stats = !self.show_stats,
-            Command::Help => {
-                if self.show_help {
-                    self.dismiss_help();
+            Command::Menu => {
+                if self.show_menu {
+                    self.dismiss_menu();
                 } else {
-                    self.show_help = true;
+                    self.show_menu = true;
                 }
             }
         }
@@ -923,9 +923,9 @@ impl Session {
                     // toggles the menu would otherwise be handed a menu that is
                     // already down and turn it back on.
                     self.on_command(command).await?;
-                    self.dismiss_help();
+                    self.dismiss_menu();
                 }
-                Hit::Outside => self.dismiss_help(),
+                Hit::Outside => self.dismiss_menu(),
                 Hit::Inside => {}
             },
             _ => {}
@@ -940,9 +940,9 @@ impl Session {
     /// outlives any repaint until the cells themselves are erased. The tiles are
     /// marked too, for a terminal that treats an erase as dropping the placements
     /// underneath it.
-    fn dismiss_help(&mut self) {
-        self.show_help = false;
-        self.clear_help = true;
+    fn dismiss_menu(&mut self) {
+        self.show_menu = false;
+        self.clear_menu = true;
         // Or the row the pointer happened to be on would be lit the next time the
         // menu opens, before the pointer has moved to say so.
         self.menu.clear_hover();
@@ -1132,7 +1132,7 @@ impl Session {
 
     fn draw(&mut self) -> Result<()> {
         let has_work = self.renderer.has_work();
-        if !has_work && self.note.is_none() && !self.show_help && !self.clear_help {
+        if !has_work && self.note.is_none() && !self.show_menu && !self.clear_menu {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1146,16 +1146,16 @@ impl Session {
         }
         // Text first, then images, exactly as a relayout does it: erasing cells may
         // take the placements under them with it, so the tiles have to go out after.
-        if self.clear_help {
+        if self.clear_menu {
             self.menu.clear(&mut buf, &self.metrics);
-            self.clear_help = false;
+            self.clear_menu = false;
         }
         let stats = self.renderer.compose(&self.fb, &mut buf);
         if stats.tiles > 0 {
             self.last_stats = stats;
         }
         self.draw_status(&mut buf);
-        if self.show_help {
+        if self.show_menu {
             self.menu.draw(&mut buf, &self.metrics, self.mode);
         }
         if self.caps.sync_output {
@@ -1207,22 +1207,20 @@ impl Session {
             }
         }
 
+        // The one binding worth naming, because it opens the menu the rest of them
+        // are listed in. Shortened when the statistics are up and the room is gone.
+        let prefix = self.input.prefix().to_ascii_uppercase();
         let right = if self.show_stats {
             format!(
-                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  Ctrl+{} ? ",
+                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  Ctrl+{prefix} p ",
                 self.fps.fps(),
                 self.last_stats.tiles,
                 human_bytes(self.last_stats.bytes),
                 format_rtt(self.rtt),
                 self.dropped,
-                self.input.prefix().to_ascii_uppercase(),
             )
         } else {
-            format!(
-                "{:>6}  Ctrl+{} ? for help ",
-                format_rtt(self.rtt),
-                self.input.prefix().to_ascii_uppercase()
-            )
+            format!("{:>6}  Ctrl+{prefix} p for cmd ", format_rtt(self.rtt))
         };
         status::draw(buf, &self.metrics, &left, &right);
     }

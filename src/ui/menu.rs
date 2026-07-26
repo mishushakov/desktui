@@ -194,9 +194,13 @@ impl Menu {
             command,
         };
         let entries = vec![
-            Entry::Title("Commands".into(), "esc".into()),
+            Entry::Title("Command menu".into(), "esc".into()),
             Entry::Blank,
             Entry::Section("Session".into()),
+            // First, and the only line that names the binding that opened the box.
+            // Clicking it closes the box, which is what toggling something already
+            // showing means.
+            item("Toggle command menu", format!("{p} p"), Command::Menu),
             item("Quit", format!("{p} q"), Command::Quit),
             Entry::Blank,
             Entry::Section("Screen".into()),
@@ -640,7 +644,7 @@ mod tests {
         );
         // The backdrop goes down before the text that sits on it.
         let backdrop = text.find("\x1b_Ga=T").expect("no backdrop");
-        assert!(backdrop < text.find("Commands").expect("no title"));
+        assert!(backdrop < text.find("Command menu").expect("no title"));
     }
 
     #[test]
@@ -792,8 +796,20 @@ mod tests {
         let menu = Menu::new('a');
         let m = metrics(100, 40);
         let area = menu.area(&m).unwrap();
+        // The menu's own toggle comes first, so the binding that opened the box is
+        // the first thing in it.
+        assert_eq!(
+            menu.hit(&m, area.x, area.y + PAD_Y + 3),
+            Hit::Item {
+                index: 3,
+                command: Command::Menu
+            },
+            "the first item is no longer the menu's own toggle"
+        );
 
         for (label, want) in [
+            // The first row, and the only one whose command acts on the menu itself.
+            ("Toggle command menu", Command::Menu),
             ("Quit", Command::Quit),
             ("Toggle view-only", Command::ToggleViewOnly),
             ("Refresh in full", Command::FullRefresh),
