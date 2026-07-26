@@ -213,12 +213,13 @@ Built:
   update, measured by `make perf`
 - shared memory swept by presence and a byte budget rather than a deadline
   (`src/term/shm.rs`)
+- resampling only the region a frame is about to send, grown by the filter's reach
+  (`src/render/scale.rs`)
 
 Not built, in the order worth doing:
 
 - **the plane as described**: `Content` keys instead of `dirty: Vec<bool>`, `placed` as a
   rectangle, and `Layout::maps_alike`.
-- **resample only the dirty region** in scaled modes.
 - **the cursor as a placement** with `X`/`Y`, replacing `blend_cursor`.
 - **the chrome as one diffed plane**, replacing `Toast`'s own stale-cell bookkeeping,
   `clear_menu`, and `status::clear`.

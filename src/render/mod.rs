@@ -716,6 +716,45 @@ impl Renderer {
         self.grid.len()
     }
 
+    /// The destination pixels a frame is going to send, as one rectangle, grown by the
+    /// filter's reach and clipped to the image.
+    ///
+    /// One rectangle rather than a resample per tile: the union costs a little more
+    /// resampling than the tiles strictly need and saves an edge between every pair of
+    /// them, each of which would have to be grown and thrown away separately.
+    ///
+    /// The growing is what makes a region resampled alone match the same pixels resampled
+    /// with the whole screen. In destination pixels, so the reach -- which is a count of
+    /// destination pixels one source pixel touches -- has to be scaled up when the picture
+    /// is being magnified.
+    fn dirty_region(&self, filter: Filter) -> Option<Rect> {
+        let mut region: Option<Rect> = None;
+        for ty in 0..self.grid.ny {
+            for tx in 0..self.grid.nx {
+                if !self.dirty[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)] {
+                    continue;
+                }
+                let tile = self.grid.tile_rect(tx, ty);
+                region = Some(match region {
+                    None => tile,
+                    Some(so_far) => {
+                        let x = so_far.x.min(tile.x);
+                        let y = so_far.y.min(tile.y);
+                        Rect::new(
+                            x,
+                            y,
+                            so_far.right().max(tile.right()) - x,
+                            so_far.bottom().max(tile.bottom()) - y,
+                        )
+                    }
+                });
+            }
+        }
+        region?
+            .expand(filter.dst_reach(self.layout.scale))
+            .intersect(&Rect::new(0, 0, self.layout.dst_w, self.layout.dst_h))
+    }
+
     /// Packed bytes the dirty tiles come to, which is the size of a frame's object.
     fn dirty_bytes(&self) -> usize {
         let mut total = 0;
@@ -740,19 +779,34 @@ impl Renderer {
         }
         let before = out.len();
 
-        // Resample once per frame, not once per tile.
+        // Resample once per frame, and only the part of the picture being sent. A caret
+        // blinking in a scaled session used to cost a whole screen of resampling for one
+        // tile's worth of pixels.
         if self.layout.needs_scaling() {
             if self.scaled.width() != self.layout.dst_w || self.scaled.height() != self.layout.dst_h
             {
                 self.scaled.resize(self.layout.dst_w, self.layout.dst_h);
             }
             let filter = self.layout.filter();
-            if let Err(err) = self
-                .scaler
-                .resize(fb, self.layout.src, &mut self.scaled, filter)
-            {
-                tracing::warn!("resample failed: {err:#}");
-                return stats;
+            if let Some(region) = self.dirty_region(filter) {
+                // The source rectangle this region came from, in fractional pixels: the
+                // ratio is the one the layout actually achieved rather than its rounded
+                // scale, or the region would land a fraction of a pixel off the rest.
+                let per_x = f64::from(self.layout.src.w) / f64::from(self.layout.dst_w);
+                let per_y = f64::from(self.layout.src.h) / f64::from(self.layout.dst_h);
+                let crop = (
+                    f64::from(self.layout.src.x) + f64::from(region.x) * per_x,
+                    f64::from(self.layout.src.y) + f64::from(region.y) * per_y,
+                    f64::from(region.w) * per_x,
+                    f64::from(region.h) * per_y,
+                );
+                if let Err(err) =
+                    self.scaler
+                        .resize_region(fb, crop, &mut self.scaled, region, filter)
+                {
+                    tracing::warn!("resample failed: {err:#}");
+                    return stats;
+                }
             }
         }
 
