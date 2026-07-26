@@ -483,7 +483,9 @@ fn a_pasted_selection_goes_to_the_remote_clipboard() {
     assert_drew(&term, Duration::from_secs(10));
 
     // Bracketed paste, as a terminal delivers it.
-    term.send(b"\x1b[200~hello there\x1b[201~");
+    paste(&mut term, "hello there", &server, |r| {
+        matches!(r, Request::CutText(_))
+    });
     let cut = server
         .wait_for(Duration::from_secs(10), |r| {
             matches!(r, Request::CutText(_))
@@ -568,16 +570,22 @@ fn a_pasted_selection_is_announced_first_and_sent_when_asked() {
         other => panic!("unexpected request {other:?}"),
     }
 
-    term.send("\x1b[200~Привет, мир\x1b[201~".as_bytes());
-
+    // The server's own capabilities have arrived by now, which is what decides how a paste
+    // goes out: without them the client falls back to Latin-1 cut text, correctly, and
+    // nothing would ever announce anything. `assert_drew` above is the wait for them --
+    // they answer the `SetEncodings`, so no frame can have overtaken them.
+    paste(&mut term, "Привет, мир", &server, |r| {
+        // Either way it went, so that a fallback fails the assertion below rather than
+        // being taken for a paste that never arrived and said again.
+        matches!(r, Request::ClipboardNotify | Request::CutText(_))
+    });
     assert!(
         server
-            .wait_for(Duration::from_secs(10), |r| matches!(
-                r,
-                Request::ClipboardNotify
-            ))
-            .is_some(),
-        "the paste was never announced"
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::ClipboardNotify)),
+        "the paste was never announced: {:?}",
+        server.requests()
     );
     // The fake server answers a notify with a request, so the text should follow --
     // whole, which is the other half of what the extension is for.
@@ -643,7 +651,9 @@ fn a_paste_outside_latin1_is_substituted_not_silently_shortened() {
     let (server, mut term) = start(Resize::Accept, (800, 600));
     assert_drew(&term, Duration::from_secs(10));
 
-    term.send("\x1b[200~caf\u{e9} \u{2615} tea\x1b[201~".as_bytes());
+    paste(&mut term, "caf\u{e9} \u{2615} tea", &server, |r| {
+        matches!(r, Request::CutText(_))
+    });
     let cut = server
         .wait_for(Duration::from_secs(10), |r| {
             matches!(r, Request::CutText(_))

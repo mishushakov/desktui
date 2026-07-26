@@ -119,6 +119,14 @@ only holds while the steps keep to schedule. It also asserts that the drag had m
 than that ceiling, so a machine too slow to produce a drag at all says so instead of
 passing for want of evidence.
 
+One input can be lost rather than late, and it is worth knowing which: a bracketed paste
+whose first `\x1b` lands alone in a read is delivered as the *Escape key*, that byte being
+both the key and the start of every sequence, so the library guesses — and with no more
+input in hand it guesses key. The rest arrives as ordinary characters and the paste is
+gone. `session::paste` says it again for that reason, which costs a run nothing when the
+first one landed. The ambiguity is the client's, not the harness's: worth remembering if a
+paste is ever reported lost in real use.
+
 Output *after* the client exits is the harness's business rather than each test's.
 `FakeTerm::wait` closes its own end of the pty slave and waits for the drain thread to
 reach end-of-file, so a status back means everything the client said has arrived as well.

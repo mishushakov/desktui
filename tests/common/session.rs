@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::server::{Extensions, FakeServer, Resize};
+use super::server::{Extensions, FakeServer, Request, Resize};
 use super::{FakeTerm, GHOSTTY_REPLIES, contains, count, tail};
 
 /// A 200x50 terminal of 8x17 cells: 1600x850 pixels, of which 49 rows are usable.
@@ -79,6 +79,40 @@ pub fn quit(term: &mut FakeTerm) {
     term.send(&[0x01]);
     std::thread::sleep(Duration::from_millis(50));
     term.send(b"q");
+}
+
+/// Paste `text` as a terminal does, in brackets, and keep saying it until the client acts
+/// on it -- `acted` naming the request that would say so.
+///
+/// A paste can be lost on the way in, and the loss is nothing to do with the clipboard.
+/// The bytes are `\x1b[200~text\x1b[201~`, and if a read happens to end after that first
+/// `\x1b` alone, the terminal library delivers it as the *Escape key*: the byte is both
+/// the key and the start of every sequence, so it has to guess, and with no more input in
+/// hand it guesses key. The rest then arrives as ordinary characters and the paste is
+/// gone -- which is how `a_pasted_selection_is_announced_first_and_sent_when_asked` failed
+/// on a macOS runner, where a frame crosses the pty in several reads. Saying it again is
+/// all that is needed, and it costs a run nothing when the first one landed.
+///
+/// The ambiguity itself belongs to the client, which cannot tell the two apart either.
+/// Worth remembering when a paste is reported lost in real use.
+#[track_caller]
+pub fn paste(
+    term: &mut FakeTerm,
+    text: &str,
+    server: &FakeServer,
+    acted: impl Fn(&Request) -> bool,
+) {
+    for attempt in 1..=3 {
+        term.send(format!("\x1b[200~{text}\x1b[201~").as_bytes());
+        if server.wait_for(Duration::from_secs(2), &acted).is_some() {
+            return;
+        }
+        eprintln!("the paste was not read as one; saying it again (attempt {attempt})");
+    }
+    panic!(
+        "three pastes reached the client and none of them was acted on: {}",
+        tail(&term.output())
+    );
 }
 
 // ----------------------------------------------------------------- shared claims
