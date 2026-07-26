@@ -158,9 +158,20 @@ impl ClientMsg {
                 //   | 4            | U32          | length       |
                 //   | length       | U8 array     | text         |
                 //   +--------------+--------------+--------------+
+                // The text is Latin-1: one byte per character, not UTF-8. Writing
+                // `as_bytes()` sends U+0080..U+00FF as their two-byte UTF-8 form,
+                // which a server reading Latin-1 turns "café" into "cafÃ©" -- and
+                // the length no longer matches the character count either. Anything
+                // above U+00FF cannot be sent at all; the caller substitutes it
+                // already, and doing so here too keeps the wire well formed for
+                // callers that did not rather than truncating into a stray byte.
+                let latin1: Vec<u8> = s
+                    .chars()
+                    .map(|c| if (c as u32) > 0xff { b'?' } else { c as u8 })
+                    .collect();
                 let mut payload = vec![6_u8, 0, 0, 0];
-                payload.write_u32(s.len() as u32).await?;
-                payload.write_all(s.as_bytes()).await?;
+                payload.write_u32(latin1.len() as u32).await?;
+                payload.write_all(&latin1).await?;
                 writer.write_all(&payload).await?;
                 Ok(())
             }
@@ -393,6 +404,23 @@ mod client_msg_tests {
         assert_eq!(up, vec![4, 0, 0, 0, 0x00, 0x00, 0x00, 0x61]);
         let pointer = encode(ClientMsg::PointerEvent(1599, 832, 0b101)).await;
         assert_eq!(pointer, vec![5, 0b101, 0x06, 0x3f, 0x03, 0x40]);
+    }
+
+    #[tokio::test]
+    async fn cut_text_goes_out_as_latin1_not_utf8() {
+        // The e-acute is one byte, 0xe9 -- not the 0xc3 0xa9 that UTF-8 would make of
+        // it, which a server decoding Latin-1 would show as two characters.
+        let bytes = encode(ClientMsg::ClientCutText("caf\u{e9}".into())).await;
+        assert_eq!(bytes, vec![6, 0, 0, 0, 0, 0, 0, 4, b'c', b'a', b'f', 0xe9]);
+    }
+
+    #[tokio::test]
+    async fn cut_text_outside_latin1_is_substituted_rather_than_truncated() {
+        // Callers substitute before they get here so they can report how much they
+        // changed; this is the floor under them. Truncating `c as u8` would send the
+        // coffee cup as 0x15, an unrelated control character.
+        let bytes = encode(ClientMsg::ClientCutText("\u{2615}".into())).await;
+        assert_eq!(bytes, vec![6, 0, 0, 0, 0, 0, 0, 1, b'?']);
     }
 }
 

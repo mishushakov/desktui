@@ -282,9 +282,12 @@ fn serve(
                 let len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
                 let mut text = vec![0u8; len];
                 stream.read_exact(&mut text)?;
+                // Latin-1, as the protocol says -- one byte per character. Decoding
+                // this as UTF-8 would accept the client sending UTF-8 too, which is
+                // exactly the bug the paste tests are here to catch.
                 record(
                     &requests,
-                    Request::CutText(String::from_utf8_lossy(&text).into_owned()),
+                    Request::CutText(text.iter().map(|&b| b as char).collect()),
                 );
             }
             150 => {
