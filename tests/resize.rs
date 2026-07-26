@@ -490,8 +490,8 @@ fn a_resize_goes_out_while_the_server_is_idle() {
 
 #[test]
 fn a_single_resize_is_acted_on_at_once() {
-    // A lone resize should not sit out the debounce: the delay is there to coalesce a
-    // drag, and making a single one wait made the window look like it had not taken.
+    // A lone resize should not wait out the interval: the limit is there to thin a drag,
+    // and making a single one wait made the window look like it had not taken.
     let (server, mut term) = start(Resize::Accept, (1024, 768));
     assert!(
         server
@@ -523,7 +523,7 @@ fn a_single_resize_is_acted_on_at_once() {
     let took = at.elapsed();
     assert!(
         took < Duration::from_millis(250),
-        "a single resize waited {took:?} for the debounce it does not need"
+        "a single resize waited {took:?} for a rate limit that had nothing to thin"
     );
 
     quit(&mut term);
@@ -533,7 +533,7 @@ fn a_single_resize_is_acted_on_at_once() {
 /// Live counterpart: `live::a_dragged_resize_settles_without_any_input`.
 #[test]
 // The coalescing it checks for only happens while the resizes arrive faster than
-// the debounce window, so a runner that stretches the 30ms steps defeats the
+// the rate limit, so a runner that stretches the 30ms steps defeats the
 // thing under test rather than finding a fault in it. Run it with --ignored.
 #[ignore = "wall-clock sensitive: unreliable on shared CI runners"]
 fn a_drag_is_still_coalesced_into_a_few_requests() {
@@ -568,8 +568,10 @@ fn a_drag_is_still_coalesced_into_a_few_requests() {
         .filter(|r| matches!(r, Request::SetDesktopSize { .. }))
         .count()
         - before;
+    // Twenty steps over six hundred milliseconds, thinned to one every hundred: seven at
+    // the very most, and one more for the size it settles on.
     assert!(
-        asks <= 6,
+        asks <= 8,
         "a drag should coalesce into a handful of requests, not one per step: saw {asks}"
     );
     // And the last size still has to be the one it settles on.

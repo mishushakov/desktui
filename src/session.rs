@@ -43,10 +43,17 @@ use crate::ui::toast::Toast;
 /// stop redrawing.
 const UPDATE_WATCHDOG: Duration = Duration::from_secs(1);
 
-/// Terminal resizes arrive in a stream while a window is dragged. Waiting this
-/// long after the last one keeps us from asking the server to resize dozens of
-/// times.
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Shortest gap between two resizes being acted on.
+///
+/// Terminal resizes arrive in a stream while a window is dragged, and each one adopted
+/// is a relayout and a request to the server. A rate limit rather than a quiet period:
+/// the first resize after a lull is acted on at once and the stream behind it is thinned
+/// to this, so a drag is answered as it happens instead of after it.
+///
+/// The same hundred milliseconds TigerVNC and noVNC settled on -- and TigerVNC
+/// deliberately moved *away* from a 500ms idle period, because waiting for a drag to
+/// finish makes maximising or going full screen feel like it did not take.
+const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Floor on the gap between two update requests, so a server that answers an
 /// incremental request instantly cannot spin us at full speed.
@@ -266,8 +273,8 @@ struct Session<B: Backend> {
     last_stats: FrameStats,
     dropped: u64,
     pending_metrics: Option<Instant>,
-    /// When a resize was last acted on, so the first one after a quiet spell can be
-    /// acted on at once rather than waiting out the debounce.
+    /// When a resize was last acted on, which is what [`RESIZE_INTERVAL`] is measured
+    /// from: the first after a lull goes through at once, and a stream is thinned.
     metrics_applied_at: Option<Instant>,
     quit: bool,
 }
@@ -926,17 +933,18 @@ impl<B: Backend> Session<B> {
     }
 
     async fn on_tick(&mut self) -> Result<()> {
-        // A resize has settled: adopt the new geometry, and ask the server to
-        // match it if it is willing to.
-        // Leading edge, then trailing: the first resize after a quiet spell is acted on
-        // at once, and only a continuing stream of them is held back. Waiting out the
-        // debounce for a single resize makes the window feel like it did not take, which
-        // is the whole reason the delay was noticeable.
-        let quiet_before = self
+        // A resize is waiting: adopt the new geometry, and ask the server to match it if
+        // it is willing to.
+        //
+        // Rate limited, not deferred. The first resize after a lull goes through at once
+        // and a continuing stream is thinned to one every `RESIZE_INTERVAL`, so a drag is
+        // answered while it happens. The second arm is the tail of a stream that stopped
+        // before the interval was up, which nothing else would come back for.
+        let due = self
             .metrics_applied_at
-            .is_none_or(|last| last.elapsed() >= RESIZE_DEBOUNCE);
+            .is_none_or(|last| last.elapsed() >= RESIZE_INTERVAL);
         if let Some(at) = self.pending_metrics
-            && (quiet_before || at.elapsed() >= RESIZE_DEBOUNCE)
+            && (due || at.elapsed() >= RESIZE_INTERVAL)
         {
             self.pending_metrics = None;
             self.metrics_applied_at = Some(Instant::now());
