@@ -8,7 +8,7 @@
 //! itself must not be written twice: two copies drift, and the live half is `#[ignore]`d,
 //! so nothing would say when it had.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::server::{Extensions, FakeServer, Resize};
 use super::{FakeTerm, GHOSTTY_REPLIES, contains, count, tail};
@@ -28,6 +28,25 @@ pub const EXPECTED_SIZE: &str = "1600x832";
 
 /// The escape that carries one tile to the terminal. Counting these counts drawing.
 pub const DREW: &[u8] = b"\x1b_Ga=T";
+
+/// The image ids the client's overlays take: `kitty::IMAGE_ID_BASE + 0x10000` for the
+/// menu's backdrop, and one each above it for the bar under the pointer and the
+/// notification popup. Worked out here the way the client works them out, because a
+/// test reads the numbers off the wire rather than the constants behind them.
+pub const MENU_ID: u32 = 0x7600 + 0x10000;
+pub const MENU_HIGHLIGHT_ID: u32 = MENU_ID + 1;
+pub const TOAST_ID: u32 = MENU_HIGHLIGHT_ID + 1;
+
+/// The escape that takes one of those off the screen.
+///
+/// The id is the point, and `a=d,d=I` on its own will not do: a delete by id also goes
+/// out on every frame where the pointer is on no row of the menu, to drop the highlight
+/// bar, so the bare form is satisfied by the menu being *up* rather than by its having
+/// gone. Deleting is also the only way an overlay leaves: its glyphs outlive any repaint
+/// of the image below them, and its backdrop outranks every tile.
+pub fn deleted(id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=I,i={id}").into_bytes()
+}
 
 /// A fake server of the given size, and a client pointed at it in native mapping.
 pub fn start(resize: Resize, remote: (u16, u16)) -> (FakeServer, FakeTerm) {
@@ -117,12 +136,24 @@ pub fn tiles_drawn(term: &FakeTerm) -> usize {
 /// More tiles arrived than `before`, so the picture is still moving. `after` names what
 /// was supposed to have caused it, because "nothing was drawn" on its own never says
 /// which prod failed.
+///
+/// Waits, like the claims above it. It used to compare on the spot, which left every
+/// caller to sleep first and made each of those sleeps a deadline for the client to
+/// answer within -- a fixed window that a loaded machine misses without anything being
+/// wrong with what it drew.
 #[track_caller]
-pub fn assert_kept_drawing(term: &FakeTerm, before: usize, after: &str) {
-    let now = tiles_drawn(term);
-    assert!(
-        now > before,
-        "the screen never changed after {after} ({before} -> {now} tiles): {}",
-        tail(&term.output())
-    );
+pub fn assert_kept_drawing(term: &FakeTerm, before: usize, after: &str, timeout: Duration) {
+    let began = Instant::now();
+    loop {
+        let now = tiles_drawn(term);
+        if now > before {
+            return;
+        }
+        assert!(
+            began.elapsed() < timeout,
+            "the screen never changed after {after} ({before} -> {now} tiles): {}",
+            tail(&term.output())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

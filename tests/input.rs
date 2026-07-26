@@ -21,6 +21,13 @@ use common::*;
 #[test]
 fn input_reaches_the_server_with_pixel_exact_coordinates() {
     let (server, mut term) = start(Resize::Accept, (1024, 768));
+    // The negotiated size first, and the mapping only after it. Pixel-exact is true of
+    // the 1024x768 desktop the session opens on as well -- drawn 1:1, letterboxed in the
+    // middle of the area -- so on its own it says nothing about where a terminal pixel
+    // lands. A click aimed at the desktop that fills the area falls in that letterbox
+    // instead, outside the image, where the client drops it rather than reporting it as a
+    // click on the nearest edge.
+    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(10));
     assert_pixel_exact(&term, Duration::from_secs(10));
 
     // SGR-pixel mouse report: button 0 pressed at pixel 137,229. In native
@@ -104,13 +111,19 @@ fn the_command_menu_holds_the_focus_until_escape() {
         "the menu never appeared"
     );
 
-    // An ordinary key changes nothing. It is redrawn every frame while it is up, so
-    // a tail that still mentions it is the box still being there.
-    let mark = term.output().len();
+    // An ordinary key changes nothing. The box is redrawn every frame while it is up, so
+    // a later frame that still holds it is the box still being there.
+    //
+    // The wait is not a deadline for an answer -- there is no answer to wait for -- but
+    // long enough for a wrong one to have gone out in, after which what the client is
+    // drawing *now* is what settles it.
     term.send(b"\x1b[120u");
     std::thread::sleep(Duration::from_millis(500));
+    let since = term
+        .drawn_after(term.output().len(), 2, Duration::from_secs(10))
+        .expect("the client stopped drawing with the menu up");
     assert!(
-        contains(&term.output()[mark..], b"Renegotiate the remote size"),
+        contains(&since, b"Renegotiate the remote size"),
         "an ordinary key put the menu away"
     );
 
@@ -129,19 +142,28 @@ fn the_command_menu_holds_the_focus_until_escape() {
 
     // Escape is the way out. Stopping the redraw is not the same as taking it off the
     // screen: the glyphs outlive any repaint of the image below them, and the backdrop
-    // outranks every tile, so both have to be taken off explicitly -- and only the
-    // teardown deletes an image by id, which makes it the thing to look for.
+    // outranks every tile, so both have to be taken off explicitly -- and the delete of
+    // the backdrop is what says the teardown ran, which makes it the thing to wait for.
     let mark = term.output().len();
     term.send(b"\x1b");
-    std::thread::sleep(Duration::from_millis(500));
-    let since = term.output()[mark..].to_vec();
+    let cleared = term
+        .wait_for_after(mark, &deleted(MENU_ID), Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "the menu was never cleared, so it is still on screen: {}",
+                tail(&term.output())
+            )
+        });
+
+    // And it stays away. Watched from the clearing rather than from the keystroke,
+    // because the frame in flight when the escape went out had been composed before the
+    // client had seen it, and holds the box for that reason alone.
+    let since = term
+        .drawn_after(cleared, 2, Duration::from_secs(10))
+        .expect("the client stopped drawing once the menu was dismissed");
     assert!(
         !contains(&since, b"Renegotiate the remote size"),
         "escape did not put the menu away"
-    );
-    assert!(
-        contains(&since, b"a=d,d=I,i="),
-        "the menu was never cleared, so it is still on screen"
     );
 
     quit(&mut term);
@@ -199,18 +221,20 @@ fn clicking_a_scaling_option_selects_that_one() {
     term.send(b"\x1b[<0;717;485M");
     term.send(b"\x1b[<0;717;485m");
 
-    assert!(
-        term.wait_for(b"scaling: scaled", Duration::from_secs(10)),
-        "the click did not select fit: {}",
-        tail(&term.output())
-    );
+    let selected = term
+        .wait_for_after(mark, b"scaling: scaled", Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("the click did not select fit: {}", tail(&term.output())));
 
     // The menu stays up, and shows the choice it just made: the brackets mark the mode
     // in force, so they move to fit. Only the dismissal takes the box down, which is
     // what makes the row a control you can watch rather than one that ends the session
     // with the menu.
-    std::thread::sleep(Duration::from_millis(500));
-    let since = term.output()[mark..].to_vec();
+    //
+    // Watched from the selection on, so that a frame composed before the click cannot
+    // stand in for the box having stayed.
+    let since = term
+        .drawn_after(selected, 2, Duration::from_secs(10))
+        .expect("the client stopped drawing after the click");
     assert!(
         contains(&since, b"Renegotiate the remote size"),
         "the menu went away on a click that was not the dismissal"
@@ -280,14 +304,21 @@ fn clicking_the_close_button_puts_the_notification_away() {
     let mark = out.len();
     term.send(b"\x1b[<0;1561;35M");
     term.send(b"\x1b[<0;1561;35m");
-    std::thread::sleep(Duration::from_millis(600));
 
-    let since = term.output()[mark..].to_vec();
-    assert!(
-        contains(&since, b"a=d,d=I,i="),
-        "the popup's backdrop was never deleted, so the box is still there: {}",
-        tail(&since)
-    );
+    // Two seconds is far more than the frame or two the client needs and still well
+    // inside the note's four-second linger, so what took the box off was the click
+    // rather than time running out on it.
+    let cleared = term
+        .wait_for_after(mark, &deleted(TOAST_ID), Duration::from_secs(2))
+        .unwrap_or_else(|| {
+            panic!(
+                "the popup's backdrop was never deleted, so the box is still there: {}",
+                tail(&term.output())
+            )
+        });
+    let since = term
+        .drawn_after(cleared, 2, Duration::from_secs(10))
+        .expect("the client stopped drawing once the note was closed");
     assert!(
         !contains(&since, b"full refresh requested"),
         "the message is still being redrawn: {}",
@@ -343,12 +374,23 @@ fn the_close_button_answers_while_the_menu_is_up() {
     let mark = term.output().len();
     term.send(b"\x1b[<0;1561;35M");
     term.send(b"\x1b[<0;1561;35m");
-    std::thread::sleep(Duration::from_millis(600));
 
-    let since = term.output()[mark..].to_vec();
+    // As in `clicking_the_close_button_puts_the_notification_away`: inside the linger, so
+    // the delete is the click's work and not the clock's.
+    let cleared = term
+        .wait_for_after(mark, &deleted(TOAST_ID), Duration::from_secs(2))
+        .unwrap_or_else(|| {
+            panic!(
+                "the menu swallowed the click on the popup drawn over it: {}",
+                tail(&term.output())
+            )
+        });
+    let since = term
+        .drawn_after(cleared, 2, Duration::from_secs(10))
+        .expect("the client stopped drawing once the note was closed");
     assert!(
         !contains(&since, b"full refresh requested"),
-        "the menu swallowed the click on the popup drawn over it: {}",
+        "the message is still being redrawn: {}",
         tail(&since)
     );
     // And the menu is still up: the cross closes the note, not the box behind it.

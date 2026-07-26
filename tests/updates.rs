@@ -331,9 +331,6 @@ fn no_fence_support_means_no_round_trip_figure_rather_than_a_wrong_one() {
 
 /// Live counterpart: `live::a_real_server_sends_a_cursor_shape`.
 #[test]
-// Needs the redraw to land inside a fixed 400ms window, which a loaded shared
-// runner misses. Passes on a real machine; run it with --ignored.
-#[ignore = "wall-clock sensitive: unreliable on shared CI runners"]
 fn the_cursor_shape_is_requested_and_drawn_locally() {
     // Asking for the shape is what stops the server compositing the pointer, so the
     // pointer can then move at local speed rather than at a round trip's.
@@ -358,17 +355,18 @@ fn the_cursor_shape_is_requested_and_drawn_locally() {
     }
 
     // Moving the pointer has to produce frames without the server sending anything:
-    // the overlay is drawn on this side.
+    // the overlay is drawn on this side. How long that takes is the machine's business;
+    // that it happens at all is the client's.
     let before = tiles_drawn(&term);
     for x in (200..500).step_by(30) {
         term.send(format!("\x1b[<35;{x};200M").as_bytes());
         std::thread::sleep(Duration::from_millis(30));
     }
-    std::thread::sleep(Duration::from_millis(400));
     assert_kept_drawing(
         &term,
         before,
         "moving the pointer, so the cursor is not being composited locally",
+        Duration::from_secs(10),
     );
 
     quit(&mut term);

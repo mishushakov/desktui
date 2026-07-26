@@ -3,7 +3,6 @@
 ```
 make test           # everything that needs neither a server nor a real terminal
 make check          # fmt, clippy, test
-make test-timing    # the wall-clock sensitive tests
 make test-live      # against the real desktop container
 make perf           # time the compose pipeline
 ```
@@ -93,19 +92,45 @@ claim; the rest are complementary — `a_real_server_reports_its_lock_key_state`
 the precondition for `input::a_disagreeing_caps_lock_is_corrected_before_the_keystroke`,
 not the same thing — and a matching name would assert an equivalence that does not hold.
 
+## Claims about a change, not about a deadline
+
+Every integration test reads a stream that is still arriving while it is being read, which
+makes *when* a claim is made as easy to get wrong as the claim itself. Three rules, each
+learnt from a test that failed on a loaded macOS runner and nowhere else.
+
+**Wait for the answer rather than sleeping and looking.** `FakeTerm::wait_for_after` takes
+an offset and gives back where the needle ended, so the next claim begins where the last
+one's evidence finished. A sleep in that position is a deadline for the client to answer
+within, and a busy machine misses it without anything being wrong with the answer.
+
+**An absence claim opens on a frame boundary.** `FakeTerm::drawn_after` waits for whole
+frames past a point and hands back what they said. Marking the output and reading the tail
+after a sleep looks like the same thing and is not: the mark usually lands partway through
+a frame the client had already composed — before it had seen the keystroke, so what it
+holds answers nothing. `input::the_command_menu_holds_the_focus_until_escape` failed that
+way, and the platform was no coincidence: macOS splits a frame across several pty reads
+where Linux hands it over in one.
+
+**A duration that is part of the client's behaviour belongs in the arithmetic, not in the
+test's schedule.** The resize debounce really is a quarter of a second, so
+`resize::a_drag_is_still_coalesced_into_a_few_requests` times its drag and works the
+ceiling out from what the drag turned out to be, rather than asserting a fixed count that
+only holds while the steps keep to schedule. It also asserts that the drag had more steps
+than that ceiling, so a machine too slow to produce a drag at all says so instead of
+passing for want of evidence.
+
+Output *after* the client exits is the harness's business rather than each test's.
+`FakeTerm::wait` closes its own end of the pty slave and waits for the drain thread to
+reach end-of-file, so a status back means everything the client said has arrived as well.
+Reading `output()` the moment `try_wait` succeeded used to miss the teardown and the line
+saying why the session stopped.
+
 ## What is skipped, and why
 
 **`live.rs`** needs the container, so it is `#[ignore]`d and out of CI.
 
 **`perf.rs`** is a measurement, not an assertion. A shared runner cannot make it
 honestly.
-
-**The wall-clock sensitive tests** —
-`resize::a_drag_is_still_coalesced_into_a_few_requests` and
-`updates::the_cursor_shape_is_requested_and_drawn_locally` — need work to land inside a
-fixed window. On a loaded runner the drag test stops exercising coalescing at all rather
-than finding a fault in it. They pass on a real machine — `make test-timing` — and
-making them wait on conditions instead of the clock is the actual fix.
 
 **Fragmented delivery is not tested**, on purpose. noVNC feeds its decoders a byte at a
 time to break code that assumes a whole message arrived, because it hand-rolls a receive
