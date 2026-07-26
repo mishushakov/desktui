@@ -183,17 +183,12 @@ impl KittyEncoder {
     /// point: nothing is base64-encoded but a short string. The `m` key is
     /// meaningless for a local medium, so there is never more than one command.
     ///
-    /// `at_byte` and `bytes` are the `O=` and `S=` keys: where in the object this
-    /// tile's pixels start and how many of them to read. One object holds a whole
-    /// frame, so every tile but the first has an offset.
-    pub fn place_shm(
-        &mut self,
-        out: &mut Vec<u8>,
-        at: Placement,
-        name: &str,
-        at_byte: u32,
-        bytes: u32,
-    ) {
+    /// The object holds exactly this tile and nothing else, so there are no `O=`/`S=`
+    /// keys. The protocol has them, and one object per frame with an offset per tile
+    /// would be five system calls a frame rather than five a tile -- but Ghostty draws
+    /// nothing for a placement carrying them, and with `q=2` it does not say why. Until
+    /// that is understood, a frame is an object per tile.
+    pub fn place_shm(&mut self, out: &mut Vec<u8>, at: Placement, name: &str) {
         let Placement { id, col, row, w, h } = at;
         if w == 0 || h == 0 {
             return;
@@ -204,8 +199,7 @@ impl KittyEncoder {
         BASE64.encode_string(name.as_bytes(), &mut self.b64);
         let _ = write!(
             out,
-            "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},p={PLACEMENT_ID},s={w},v={h},\
-             O={at_byte},S={bytes};"
+            "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},p={PLACEMENT_ID},s={w},v={h};"
         );
         out.extend_from_slice(self.b64.as_bytes());
         out.extend_from_slice(b"\x1b\\");
@@ -395,13 +389,7 @@ mod tests {
         let mut enc = KittyEncoder::new(true);
         let mut out = Vec::new();
         enc.place_rgb(&mut out, place(IMAGE_ID_BASE, 0, 0, 2, 2), &[7; 2 * 2 * 3]);
-        enc.place_shm(
-            &mut out,
-            place(IMAGE_ID_BASE + 1, 0, 0, 2, 2),
-            "/vt1-2",
-            0,
-            12,
-        );
+        enc.place_shm(&mut out, place(IMAGE_ID_BASE + 1, 0, 0, 2, 2), "/vt1-2");
         place_solid(&mut out, OVERLAY_IMAGE_ID, 1, 1, 4, 2, (0, 0, 0));
 
         let transmits: Vec<_> = commands(&out)
@@ -431,13 +419,7 @@ mod tests {
             }),
             ("shm", {
                 let mut out = Vec::new();
-                enc.place_shm(
-                    &mut out,
-                    place(IMAGE_ID_BASE + 5, 0, 0, 2, 2),
-                    "/vt1-2",
-                    0,
-                    12,
-                );
+                enc.place_shm(&mut out, place(IMAGE_ID_BASE + 5, 0, 0, 2, 2), "/vt1-2");
                 out
             }),
         ] {

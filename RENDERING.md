@@ -23,7 +23,7 @@ Every design decision below follows from one of these.
 | `a=d,d=I` frees one image and its placements | a tile the grid no longer reaches is dropped by name, not by erasing the screen |
 | at equal `z`, the higher image id composites above | the cursor and the overlay backdrops sit above the picture without a second z-layer |
 | `z=-1` is below text and above the cell background | the status line and the menu stay legible over the picture, and a blank cell does not hide it |
-| `t=s` takes `O=` and `S=`, an offset and a length | one shared memory object per *frame*, not per tile |
+| `t=s` takes `O=` and `S=`, an offset and a length | one object could hold a whole frame -- except that Ghostty draws nothing for a placement carrying them, so it is an object per tile |
 | DEC 2026 brackets an atomic update | a frame is one write, and the screen never shows half of one |
 | `Fence` synchronises | in-flight work can be bounded without giving up pushed frames |
 
@@ -130,9 +130,10 @@ reached the terminal cannot leave a tile counted as held.
 1. **Reconcile** the plane against the map: drops, moves, sends.
 2. **Resample**, if the map scales, only the union of the sends' source rectangles plus a
    margin for the filter's support -- not the whole screen because one tile changed.
-3. **Pack** each send straight into the frame's shared memory object, at its own offset.
-   One pass over the pixels, and one object per frame rather than one per tile: a
-   full-screen frame is five system calls instead of five hundred tiles' worth.
+3. **Pack** each send straight into the shared memory object the terminal will read, so a
+   frame is one pass over its pixels rather than a pack followed by a copy. An object per
+   tile: the protocol would allow one per frame with an offset per tile, five system calls
+   instead of five per tile, but see [the offset finding](#the-o-finding).
 4. **Emit**, in this order, into one buffer: drops, chrome erases, moves, sends, chrome
    draws. Erases precede placements because a terminal may treat clearing a cell as
    dropping the placement under it.
@@ -189,7 +190,7 @@ per motion event, where a placement is forty bytes.
 | window re-centred | one `a=p` per tile, no pixels |
 | scaled resize | every tile, and one resample |
 | font size change | every tile |
-| full-screen frame, shared memory | five system calls, one pass over the pixels |
+| full-screen frame, shared memory | five system calls per tile, one pass over the pixels |
 
 ## What to measure
 
@@ -209,9 +210,9 @@ Built:
 - moves as `a=p` for a picture that only shifted (`src/term/kitty.rs`)
 - damage published at the update boundary (`src/session.rs`)
 - resize rate limit, leading edge (`src/session.rs`)
-- one shared memory object per frame, `O=`/`S=` offsets, packed straight into the mapping
-  (`src/term/shm.rs`, `src/render/framebuffer.rs`) -- 1.5 ms/frame to 0.7 on a full-screen
-  update, measured by `make perf`
+- tiles packed straight into the shared memory object the terminal reads, rather than into
+  a buffer for a copy to follow (`src/term/shm.rs`, `src/render/framebuffer.rs`) --
+  1.5 ms/frame to 0.9 on a full-screen update, measured by `make perf`
 - shared memory swept by presence and a byte budget rather than a deadline
   (`src/term/shm.rs`)
 - resampling only the region a frame is about to send, grown by the filter's reach
@@ -319,6 +320,38 @@ queue.
 `--no-push` stays regardless -- it is the fallback for a server without Fence, and the
 thing to reach for when the question is "is the server the problem?".
 
+### The `O=` finding
+
+One object per frame, with every tile placed out of it at an offset, was built and then
+taken out again. It is worth writing down so it is not built a second time by accident.
+
+The protocol has the keys. The spec says a client "can also specify a size and offset to
+tell the terminal emulator to only read a part of the specified file... using the `S` and
+`O` keys", and its own example uses them with `t=s`:
+`_Gs=10,v=2,t=s,S=80,O=10;<encoded name>`. What was emitted matched that shape, with
+`S = w * h * 3` for `f=24`.
+
+Ghostty drew nothing for it. The screen was black with the occasional tile appearing as
+the pointer moved -- consistent with the one placement per frame that carries `O=0` being
+accepted and every other one being dropped, though that was not confirmed. And it was
+silent, because `q=2` suppresses the reply that would have said why.
+
+To take it up again, in this order:
+
+1. Reproduce it deliberately with `q=0` and read what the terminal answers. That turns a
+   guess into a fact, and it is two lines of shell against a hand-made object.
+2. Try kitty as well. If it works there, this is a Ghostty gap worth reporting rather than
+   a misreading of the spec.
+3. Whatever the answer, gate it on the capability probe rather than on the terminal's name.
+   `src/term/caps.rs` already probes `t=s` with `a=q`, which validates a transmission
+   without storing anything -- the same probe with `S=` and `O=` set answers this question
+   at startup, and the answer decides whether a frame is one object or one per tile.
+
+The prize, measured by `make perf` on a full-screen update: 0.9 ms/frame against 0.6, most
+of it system calls. Worth having, not worth guessing at.
+`pixels_travel_through_shared_memory_when_the_terminal_offers_it` asserts that no `O=`
+appears in a placement, so this cannot come back without someone reading this first.
+
 ### Considered and rejected
 
 **Damage patches above the tiles.** A placement can display a source rectangle of a
@@ -331,6 +364,6 @@ fold-in policy. It profiles well on the case we are already fast at.
 **Tile size as a constant.** `TILE_TARGET_PX = 128` is a tuning parameter dressed as a law:
 whole-screen scrolling wants larger tiles to amortise the escape and syscall overhead, a
 caret wants smaller. Choosing it from the layout, or from the damage pattern, is a real
-improvement -- but measure first. With one shared memory object per frame the per-tile
-syscall cost that motivated it is gone, so the remaining argument is escape overhead, which
-is small.
+improvement -- but measure first, and note that the per-tile system calls are still there,
+so the argument for larger tiles is stronger than it looked when one object per frame
+seemed to be on the table.

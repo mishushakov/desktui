@@ -110,7 +110,7 @@ Also used when the terminal offers it:
 | Mouse mode 1016 (SGR-pixel) | pointer position in pixels | pointer snaps to cell centres |
 | Mode 2026 (synchronised output) | a frame commits without tearing | multi-tile frames may tear |
 | Kitty keyboard protocol | real key releases, bare modifier keys | a release is synthesised after each press |
-| `t=s` shared memory | frames skip base64 and zlib, and a whole frame travels in one object: ~20x the throughput on a full-screen update, and the default when offered | base64 + zlib, capped near 70 fps for full-screen motion |
+| `t=s` shared memory | frames skip base64 and zlib, and pixels are packed straight into the object the terminal reads: ~15x the throughput on a full-screen update, and the default when offered | base64 + zlib, capped near 70 fps for full-screen motion |
 
 Run `--print-caps` to see what your terminal answered. It reports the pixel geometry
 from both `TIOCGWINSZ` and `CSI 14 t`, and warns when they disagree — that
@@ -182,17 +182,20 @@ Measured on a 1600x832 update in 91 tiles, single threaded
 
 | stage | per frame | ceiling |
 |---|---|---|
-| pack BGRA → RGB into a buffer | 1.1 ms | 899 fps |
+| pack BGRA → RGB into a buffer | 1.0 ms | 988 fps |
 | `direct`: + zlib + base64 | 13.7 ms | **73 fps** |
-| `shm`: an object per tile | 1.5 ms | **670 fps** |
-| `shm`: one object per frame | 0.7 ms | **1479 fps** |
+| `shm`: an object per tile, packed then copied | 1.5 ms | **654 fps** |
+| `shm`: an object per tile, packed in place | 0.9 ms | **1171 fps** |
 
 zlib is the whole story on the direct path: compression and base64 cost twelve
-milliseconds that shared memory does not pay at all. On the shared memory path it was
-syscalls — an object per tile is five of them per tile, where one object for the whole
-frame is five in total, with each tile placed out of it at an offset (`O=`/`S=`). Packing
-straight into that mapping also removes the copy that used to follow the pack, which is
-why the last row comes in below the buffered pack above it.
+milliseconds that shared memory does not pay at all. On the shared memory path it is the
+pack — writing straight into the mapping the terminal will read, rather than into a buffer
+for a copy to follow, which is why the last row comes in below the buffered pack above it.
+
+One object for the whole frame instead of one per tile would be faster still, five system
+calls rather than five per tile, and the protocol has the keys for it (`O=`/`S=`). Ghostty
+draws nothing for a placement carrying them, so that is not what this does —
+[`RENDERING.md`](RENDERING.md) has the details.
 
 So on a local terminal, full-screen motion is not CPU-bound on this side; over SSH, where
 shared memory cannot work, expect the compression ceiling. Server-side encoding and JPEG

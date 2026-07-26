@@ -337,9 +337,12 @@ fn pixels_travel_through_shared_memory_when_the_terminal_offers_it() {
         show(&output)
     );
 
-    // One object per frame, not per tile: every tile of a frame is placed out of the same
-    // object at an offset of its own, which is what keeps a full-screen frame to five
-    // system calls instead of five per tile.
+    // An object per tile, each holding only that tile, and no `O=`/`S=` keys.
+    //
+    // The protocol has them, and one object per frame with an offset per tile would be
+    // five system calls a frame rather than five a tile -- but Ghostty draws nothing at
+    // all for a placement carrying them, and with `q=2` it does not say why. This asserts
+    // the shape that works, so the other one cannot come back without an answer.
     let frame = frame_containing(&output, b"f=24,t=s,i=").expect("no frame carried a tile");
     let placements = shm_placements(frame);
     assert!(
@@ -350,17 +353,13 @@ fn pixels_travel_through_shared_memory_when_the_terminal_offers_it() {
     let names: HashSet<&[u8]> = placements.iter().map(|(name, _)| name.as_slice()).collect();
     assert_eq!(
         names.len(),
-        1,
-        "expected {} tiles to share one object, saw {} names: {}",
         placements.len(),
-        names.len(),
+        "each tile has an object of its own: {}",
         show(frame)
     );
-    let starts: HashSet<&[u8]> = placements.iter().map(|(_, at)| at.as_slice()).collect();
-    assert_eq!(
-        starts.len(),
-        placements.len(),
-        "every tile needs its own offset into the object: {}",
+    assert!(
+        placements.iter().all(|(_, at)| at.is_empty()),
+        "an offset into a shared object is not drawn by Ghostty: {}",
         show(frame)
     );
 

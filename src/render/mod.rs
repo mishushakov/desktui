@@ -755,19 +755,6 @@ impl Renderer {
             .intersect(&Rect::new(0, 0, self.layout.dst_w, self.layout.dst_h))
     }
 
-    /// Packed bytes the dirty tiles come to, which is the size of a frame's object.
-    fn dirty_bytes(&self) -> usize {
-        let mut total = 0;
-        for ty in 0..self.grid.ny {
-            for tx in 0..self.grid.nx {
-                if self.dirty[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)] {
-                    total += tile_bytes(self.grid.tile_rect(tx, ty));
-                }
-            }
-        }
-        total
-    }
-
     /// Compose the dirty tiles into `out`.
     ///
     /// The caller wraps this in synchronised-output markers and adds its own
@@ -820,25 +807,6 @@ impl Renderer {
 
         let cursor_rect = self.cursor_rect();
 
-        // One object for the whole frame, sized before anything is packed: its length is
-        // fixed at creation, so the tiles have to be measured first. Five system calls a
-        // frame instead of five a tile, and the pack writes into it rather than into a
-        // buffer for a copy to follow.
-        let mut shm = if self.transfer == Transfer::Shm && !self.shm_failed {
-            match self.shm.frame(self.dirty_bytes()) {
-                Ok(frame) => Some(frame),
-                Err(err) => {
-                    // One complaint, then carry on the slow way for the rest of the
-                    // session.
-                    tracing::warn!("shared memory unavailable, using base64: {err}");
-                    self.shm_failed = true;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         for ty in 0..self.grid.ny {
             for tx in 0..self.grid.nx {
                 let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
@@ -862,19 +830,30 @@ impl Renderer {
                 };
                 let bytes = tile_bytes(tile);
 
-                // Packed straight into the frame's object where there is one, and into a
-                // buffer to be encoded where there is not.
+                // Packed straight into an object of its own where shared memory is in
+                // play, and into a buffer to be encoded where it is not.
                 let mut sent = false;
-                if let Some(frame) = shm.as_mut()
-                    && let Some((at_byte, into)) = frame.next(bytes)
-                {
-                    source.pack_rgb_into(from, into);
-                    if let (Some(cursor), Some(rect)) = (self.cursor.as_ref(), cursor_rect) {
-                        Self::blend_cursor(cursor, rect, tile, into);
+                if self.transfer == Transfer::Shm && !self.shm_failed {
+                    match self.shm.frame(bytes) {
+                        Ok(mut object) => {
+                            if let Some((_, into)) = object.next(bytes) {
+                                source.pack_rgb_into(from, into);
+                                if let (Some(cursor), Some(rect)) =
+                                    (self.cursor.as_ref(), cursor_rect)
+                                {
+                                    Self::blend_cursor(cursor, rect, tile, into);
+                                }
+                                self.enc.place_shm(out, at, object.name());
+                                sent = true;
+                            }
+                        }
+                        Err(err) => {
+                            // One complaint, then carry on the slow way for the rest of
+                            // the session.
+                            tracing::warn!("shared memory unavailable, using base64: {err}");
+                            self.shm_failed = true;
+                        }
                     }
-                    self.enc
-                        .place_shm(out, at, frame.name(), at_byte, bytes as u32);
-                    sent = true;
                 }
                 if !sent {
                     self.scratch.clear();

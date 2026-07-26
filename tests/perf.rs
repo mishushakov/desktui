@@ -124,6 +124,50 @@ fn pack_tile_into(frame: &[u8], tile: (u32, u32, u32, u32), out: &mut [u8]) {
     }
 }
 
+/// An object per tile, packed straight into the mapping. What the renderer does: the
+/// per-tile system calls of `publish_shm` without the copy that followed its pack.
+fn publish_shm_in_place(
+    frame: &[u8],
+    tile: (u32, u32, u32, u32),
+    counter: u64,
+    len: usize,
+) -> usize {
+    let name = format!("/vtperfp{counter:x}");
+    let cname = CString::new(name).unwrap();
+    // SAFETY: a valid NUL-terminated name; O_EXCL so a collision is reported.
+    let fd = unsafe {
+        libc::shm_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600 as libc::c_uint,
+        )
+    };
+    assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
+    // SAFETY: sizing and mapping an object we just created and own; the slice is of the
+    // length we mapped.
+    unsafe {
+        assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED);
+        pack_tile_into(
+            frame,
+            tile,
+            std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len),
+        );
+        libc::munmap(ptr, len);
+        libc::close(fd);
+        libc::shm_unlink(cname.as_ptr());
+    }
+    len
+}
+
 /// One object for a whole frame's tiles, packed straight into the mapping: the whole
 /// per-*frame* cost of the `t=s` medium, against `publish_shm`'s per-tile one.
 fn publish_shm_frame(
@@ -244,9 +288,28 @@ fn full_screen_compose_throughput() {
     }
     report("shm: object per tile", start.elapsed(), ROUNDS, total);
 
-    // And the way it is done: one object for the frame, every tile packed straight into
-    // the mapping at an offset of its own. Five system calls a frame rather than five a
-    // tile, and one pass over the pixels rather than a pack and a copy.
+    // The way it is done: still an object per tile, but packed into the mapping rather
+    // than into a buffer for a copy to follow.
+    let start = Instant::now();
+    let mut total = 0;
+    for frame in &frames {
+        for &tile in &tiles {
+            counter += 1;
+            let bytes = (tile.2 * tile.3 * 3) as usize;
+            total += publish_shm_in_place(frame, tile, counter, bytes);
+        }
+    }
+    report(
+        "shm: per tile, packed in place",
+        start.elapsed(),
+        ROUNDS,
+        total,
+    );
+
+    // And the way it would be done if `O=` worked: one object for the frame, every tile
+    // packed into it at an offset of its own. Five system calls a frame rather than five a
+    // tile -- but Ghostty draws nothing for a placement carrying an offset, so this is a
+    // measurement of the road not taken. See RENDERING.md.
     let frame_bytes: usize = tiles.iter().map(|&(_, _, w, h)| (w * h * 3) as usize).sum();
     let start = Instant::now();
     let mut total = 0;
@@ -260,7 +323,9 @@ fn full_screen_compose_throughput() {
     println!("Ceilings are this stage alone, single threaded, with every tile dirty.");
     println!(
         "The pack row appends into a buffer, which is what the direct medium still does;\n\
-         one object per frame packs into the mapping instead, so it comes out below it."
+         the rows below it pack into the mapping instead, so they come out under it.\n\
+         One object per frame is what `O=` would buy: see RENDERING.md for why it is not\n\
+         what the renderer does."
     );
     println!("A partial update costs proportionally less. Server-side encoding, JPEG");
     println!("decode and the terminal's own work all come on top.");
