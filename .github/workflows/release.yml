@@ -1,0 +1,139 @@
+name: Release
+
+# Tagging is the release. Bump the version in Cargo.toml, commit, then:
+#
+#   git tag v0.1.1 && git push origin v0.1.1
+#
+# Nothing reaches crates.io until every target has compiled, because a publish
+# cannot be taken back — a version can be yanked, never replaced or reused.
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag and Cargo.toml are the two places the version is written, and
+      # only one of them is checked by cargo. If they disagree, the tag says
+      # v0.1.1 while crates.io gets whatever the manifest happened to hold —
+      # so stop here rather than publish a version nobody asked for.
+      - id: version
+        run: |
+          manifest=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      # Every target has a native runner, so none of this is cross-compiled and
+      # no linker needs arranging. arm64 Linux runners are free on public repos.
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # shasum rather than sha256sum: it is present on both macOS and Ubuntu
+      # runners, so the same line works across the matrix.
+      - name: package
+        run: |
+          name=desktui-${{ needs.verify.outputs.version }}-${{ matrix.target }}
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/desktui LICENSE README.md "$name"/
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktui-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish to crates.io
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # Trusted publishing trades this OIDC token for a short-lived crates.io
+      # one, which the action revokes when the job ends. No registry credential
+      # is stored in the repository.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    name: github release
+    needs: [verify, build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: desktui-*
+          merge-multiple: true
+
+      # Last, and the only reversible step of the three: a GitHub release can be
+      # edited or deleted afterwards, so it is safe to leave until the end.
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            *.tar.gz
+            *.sha256
+          generate_release_notes: true
+          body: |
+            ```
+            cargo install desktui@${{ needs.verify.outputs.version }} --locked
+            ```
+
+            Or download a binary below. Each tarball carries the binary, the
+            licence and the readme, with a `.sha256` beside it.
