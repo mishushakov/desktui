@@ -27,7 +27,12 @@
 //!   four gigabytes on request.
 //! * `uninit_vec` handed out `Vec<u8>` whose contents were uninitialised memory.
 //! * A decoder that failed mid-rectangle left its zlib stream taken out of its
-//!   slot, so the next rectangle unwrapped a `None`.
+//!   slot, so the next rectangle unwrapped a `None`. Tight was fixed where it takes
+//!   the stream. ZRLE needed its tile loop moved out of line as well: every `?` in
+//!   the loop returned past the restore at the end of `decode`, so one malformed
+//!   rectangle left the decoder with no stream and every later one in the session
+//!   failed. A palette index off the end or an undefined subencoding is a single
+//!   byte the server picks, so that was reachable from the network too.
 //! * Two `std::mem::transmute` calls turned arbitrary integers into enums.
 //!
 //! The TRLE decoder was dropped rather than fixed: it read a 32-bit length
