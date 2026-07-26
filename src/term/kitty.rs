@@ -83,6 +83,13 @@ pub const MENU_HIGHLIGHT_IMAGE_ID: u32 = OVERLAY_IMAGE_ID + 1;
 /// that arrives while the menu is open belongs on top of it, not under it.
 pub const TOAST_IMAGE_ID: u32 = MENU_HIGHLIGHT_IMAGE_ID + 1;
 
+/// Image id for the mouse pointer, above everything.
+///
+/// It is what you are aiming with, so nothing should be able to cover it -- including the
+/// menu, whose items are clicked with it. Blended into the tiles, as it used to be, it
+/// went under the menu's backdrop and could not be seen while the menu was open.
+pub const CURSOR_IMAGE_ID: u32 = TOAST_IMAGE_ID + 1;
+
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
@@ -219,6 +226,82 @@ impl KittyEncoder {
 /// `a=T` that follows is about to replace it anyway.
 fn release_placement(out: &mut Vec<u8>, id: u32) {
     let _ = write!(out, "\x1b_Ga=d,d=i,i={id},p={PLACEMENT_ID},q=2\x1b\\");
+}
+
+/// Where a placement sits: the cell, and how far into it.
+///
+/// `X`/`Y` are pixel offsets *within* the first cell and must be smaller than one, which is
+/// what lets the pointer sit between cells instead of snapping to a corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct At {
+    pub col: u16,
+    pub row: u16,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// Transmit `rgba` and place it, keeping its alpha.
+///
+/// `f=32` rather than the tiles' `f=24`, because this is for the pointer, whose shape is a
+/// mask: the alpha decides what of the picture underneath shows through. Overlapping
+/// placements blend, and at equal `z` the higher id is on top, which is why the pointer's
+/// id is the highest of ours.
+///
+/// Not compressed. A pointer is a few kilobytes and is sent once per shape, where zlib
+/// costs a pass over it every time.
+pub fn place_rgba(out: &mut Vec<u8>, id: u32, at: At, w: u32, h: u32, rgba: &[u8]) {
+    debug_assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+    if w == 0 || h == 0 || rgba.is_empty() {
+        return;
+    }
+    let mut b64 = String::new();
+    BASE64.encode_string(rgba, &mut b64);
+
+    release_placement(out, id);
+    let _ = write!(out, "\x1b[{};{}H", at.row as u32 + 1, at.col as u32 + 1);
+
+    let bytes = b64.as_bytes();
+    let mut chunks = bytes.chunks(CHUNK);
+    let first = chunks.next().unwrap_or(b"");
+    let mut remaining = bytes.len().saturating_sub(first.len());
+
+    let _ = write!(
+        out,
+        "\x1b_Ga=T,q=2,C=1,z=-1,f=32,i={id},p={PLACEMENT_ID},s={w},v={h},X={},Y={}",
+        at.x, at.y
+    );
+    if remaining > 0 {
+        out.extend_from_slice(b",m=1");
+    }
+    out.push(b';');
+    out.extend_from_slice(first);
+    out.extend_from_slice(b"\x1b\\");
+    for chunk in chunks {
+        remaining -= chunk.len();
+        let more = if remaining > 0 { 1 } else { 0 };
+        let _ = write!(out, "\x1b_Gm={more},q=2;");
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+}
+
+/// Move an image the terminal already holds, sub-cell offsets and all.
+pub fn place_existing_at(out: &mut Vec<u8>, id: u32, at: At) {
+    release_placement(out, id);
+    let _ = write!(out, "\x1b[{};{}H", at.row as u32 + 1, at.col as u32 + 1);
+    let _ = write!(
+        out,
+        "\x1b_Ga=p,q=2,C=1,z=-1,i={id},p={PLACEMENT_ID},X={},Y={}\x1b\\",
+        at.x, at.y
+    );
+}
+
+/// Take an image off the screen, keeping its data for the next time it is placed.
+///
+/// For the pointer leaving the window: the shape has not changed, so re-sending it when it
+/// comes back would be a transmission where a placement will do.
+pub fn hide_image(out: &mut Vec<u8>, id: u32) {
+    release_placement(out, id);
 }
 
 /// Put an image the terminal already holds on different cells, without sending a pixel.

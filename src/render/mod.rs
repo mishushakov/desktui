@@ -15,7 +15,10 @@ pub mod testpattern;
 
 use crate::cli::ScaleMode;
 use crate::term::Metrics;
-use crate::term::kitty::{IMAGE_ID_BASE, KittyEncoder, Placement, delete_image, place_existing};
+use crate::term::kitty::{
+    At, CURSOR_IMAGE_ID, IMAGE_ID_BASE, KittyEncoder, Placement, delete_image, hide_image,
+    place_existing, place_existing_at, place_rgba,
+};
 use crate::term::shm::ShmPool;
 use framebuffer::Framebuffer;
 use scale::{Filter, Scaler};
@@ -457,6 +460,12 @@ pub struct Renderer {
     cursor: Option<Cursor>,
     /// Where the cursor's hotspot is, in destination pixels.
     cursor_at: Option<(u32, u32)>,
+    /// The terminal holds this shape's pixels, so moving it is a placement.
+    cursor_sent: bool,
+    /// Where its placement currently sits, if it has one.
+    cursor_placed: Option<At>,
+    /// It has moved, changed shape or gone, and the next frame owes it something.
+    cursor_owing: bool,
     transfer: Transfer,
     shm: ShmPool,
     /// Set once, if shared memory turns out not to work, so the warning is not
@@ -480,6 +489,9 @@ impl Renderer {
             scratch: Vec::with_capacity(TILE_TARGET_PX as usize * TILE_TARGET_PX as usize * 3),
             cursor: None,
             cursor_at: None,
+            cursor_sent: false,
+            cursor_placed: None,
+            cursor_owing: false,
             transfer,
             shm: ShmPool::new(),
             shm_failed: false,
@@ -557,6 +569,10 @@ impl Renderer {
         } else {
             self.scaled.resize(0, 0);
         }
+
+        // The pointer is placed against the terminal's grid, which has just moved under it.
+        self.cursor_owing = true;
+        self.cursor_placed = None;
 
         // And now what is owed, which is the same reckoning a damaged frame does: the
         // pixels a tile holds against the pixels it would be sent. A tile whose content
@@ -670,32 +686,28 @@ impl Renderer {
         ));
     }
 
-    /// Adopt a new cursor shape. The old one has to be repaired over.
+    /// Adopt a new cursor shape.
+    ///
+    /// The pointer is an image of its own rather than pixels blended into the tiles, so a
+    /// new shape is a transmission and nothing else -- no tile is disturbed by it.
     pub fn set_cursor(&mut self, cursor: Option<Cursor>) {
-        if let Some(old) = self.cursor_rect() {
-            self.mark_dst(old);
-        }
         self.cursor = cursor;
-        if let Some(new) = self.cursor_rect() {
-            self.mark_dst(new);
-        }
+        self.cursor_sent = false;
+        self.cursor_owing = true;
     }
 
     /// Move the cursor, in destination pixels. `None` hides it.
     ///
-    /// Both the rectangle it left and the one it arrived at need repainting, or the
-    /// pointer smears a trail across the screen.
+    /// A placement, so this costs one escape however far it moves. Blended into the tiles,
+    /// as it used to be, the same movement retransmitted the tile it left and the tile it
+    /// arrived at -- two to four tiles of fifty kilobytes, sixty times a second, for a
+    /// picture that had not changed.
     pub fn move_cursor(&mut self, at: Option<(u32, u32)>) {
         if self.cursor_at == at {
             return;
         }
-        if let Some(old) = self.cursor_rect() {
-            self.mark_dst(old);
-        }
         self.cursor_at = at;
-        if let Some(new) = self.cursor_rect() {
-            self.mark_dst(new);
-        }
+        self.cursor_owing = true;
     }
 
     /// Where the cursor sits in destination pixels, if it is being drawn at all.
@@ -715,33 +727,55 @@ impl Renderer {
         ))
     }
 
-    /// Blend the cursor into one packed RGB tile.
+    /// Where the pointer's image belongs on the terminal's own grid.
     ///
-    /// Drawing at composition time rather than into the framebuffer keeps the server's
-    /// picture untouched: there is nothing to save and restore, and a cursor that moves
-    /// twice between frames costs nothing extra.
-    fn blend_cursor(cursor: &Cursor, rect: Rect, tile: Rect, out: &mut [u8]) {
-        let Some(overlap) = rect.intersect(&tile) else {
+    /// Destination pixels are relative to the image's corner, so the origin goes back on
+    /// before the cell is worked out; the remainder is the sub-cell offset, which is what
+    /// lets the pointer sit between cells rather than snapping to a corner.
+    fn cursor_at_cell(&self) -> Option<At> {
+        let rect = self.cursor_rect()?;
+        let (cell_w, cell_h) = (self.layout.cell_w.max(1), self.layout.cell_h.max(1));
+        let x = u32::from(self.layout.origin_col) * cell_w + rect.x;
+        let y = u32::from(self.layout.origin_row) * cell_h + rect.y;
+        Some(At {
+            col: (x / cell_w) as u16,
+            row: (y / cell_h) as u16,
+            x: x % cell_w,
+            y: y % cell_h,
+        })
+    }
+
+    /// Draw, move or hide the pointer, whichever it is owed.
+    ///
+    /// Called after the tiles so it lands on top of them. Its id is above every tile's, so
+    /// the terminal composites it there regardless of order, but keeping the order honest
+    /// costs nothing.
+    fn compose_cursor(&mut self, out: &mut Vec<u8>) {
+        if !self.cursor_owing {
+            return;
+        }
+        self.cursor_owing = false;
+        let Some(at) = self.cursor_at_cell() else {
+            // Off the screen or hidden by the server. The data stays in the terminal, so
+            // coming back is a placement rather than another transmission.
+            if self.cursor_placed.take().is_some() {
+                hide_image(out, CURSOR_IMAGE_ID);
+            }
             return;
         };
-
-        for row in overlap.y..overlap.bottom() {
-            for col in overlap.x..overlap.right() {
-                let cx = col - rect.x;
-                let cy = row - rect.y;
-                let src = ((cy as usize) * (cursor.w as usize) + cx as usize) * 4;
-                // Alpha comes from the cursor's mask, so it is 0 or 255: anything
-                // non-zero replaces the pixel underneath.
-                if cursor.pixels[src + 3] == 0 {
-                    continue;
-                }
-                let dst =
-                    (((row - tile.y) as usize) * (tile.w as usize) + (col - tile.x) as usize) * 3;
-                out[dst] = cursor.pixels[src + 2];
-                out[dst + 1] = cursor.pixels[src + 1];
-                out[dst + 2] = cursor.pixels[src];
+        let cursor = self.cursor.as_ref().expect("a rect means a cursor");
+        if !self.cursor_sent {
+            // BGRA on the wire, RGBA in the protocol.
+            let mut rgba = Vec::with_capacity(cursor.pixels.len());
+            for px in cursor.pixels.chunks_exact(4) {
+                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
+            place_rgba(out, CURSOR_IMAGE_ID, at, cursor.w, cursor.h, &rgba);
+            self.cursor_sent = true;
+        } else if self.cursor_placed != Some(at) {
+            place_existing_at(out, CURSOR_IMAGE_ID, at);
         }
+        self.cursor_placed = Some(at);
     }
 
     pub fn mark_all(&mut self) {
@@ -754,7 +788,7 @@ impl Renderer {
     }
 
     pub fn has_work(&self) -> bool {
-        self.owing > 0
+        self.owing > 0 || self.cursor_owing
     }
 
     #[cfg(test)]
@@ -821,10 +855,14 @@ impl Renderer {
     /// chrome; nothing here writes to the terminal directly.
     pub fn compose(&mut self, fb: &Framebuffer, out: &mut Vec<u8>) -> FrameStats {
         let mut stats = FrameStats::default();
+        let before = out.len();
         if self.owing == 0 || self.grid.len() == 0 {
+            // No tile is owed anything, but the pointer may be: it is a placement of its
+            // own now, and a frame that carries nothing else still has to carry that.
+            self.compose_cursor(out);
+            stats.bytes = out.len() - before;
             return stats;
         }
-        let before = out.len();
 
         // Resample once per frame, and only the part of the picture being sent. A caret
         // blinking in a scaled session used to cost a whole screen of resampling for one
@@ -865,8 +903,6 @@ impl Renderer {
             (fb, self.layout.src.x, self.layout.src.y)
         };
 
-        let cursor_rect = self.cursor_rect();
-
         for ty in 0..self.grid.ny {
             for tx in 0..self.grid.nx {
                 let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
@@ -899,11 +935,6 @@ impl Renderer {
                         Ok(mut object) => {
                             if let Some((_, into)) = object.next(bytes) {
                                 source.pack_rgb_into(from, into);
-                                if let (Some(cursor), Some(rect)) =
-                                    (self.cursor.as_ref(), cursor_rect)
-                                {
-                                    Self::blend_cursor(cursor, rect, tile, into);
-                                }
                                 self.enc.place_shm(out, at, object.name());
                                 sent = true;
                             }
@@ -919,11 +950,6 @@ impl Renderer {
                 if !sent {
                     self.scratch.clear();
                     source.pack_rgb(from, &mut self.scratch);
-                    // Borrowed apart from `scratch` on purpose: the cursor and the
-                    // buffer both live in `self`.
-                    if let (Some(cursor), Some(rect)) = (self.cursor.as_ref(), cursor_rect) {
-                        Self::blend_cursor(cursor, rect, tile, &mut self.scratch);
-                    }
                     self.enc.place_rgb(out, at, &self.scratch);
                 }
 
@@ -931,6 +957,11 @@ impl Renderer {
                 stats.pixels += tile.area();
             }
         }
+
+        // After the tiles, so the pointer is written over the picture it sits on. Its id is
+        // above every tile's, so the terminal would composite it there whatever the order,
+        // but a frame that reads in the order it draws is easier to follow.
+        self.compose_cursor(out);
 
         stats.bytes = out.len() - before;
         stats
@@ -1220,49 +1251,106 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_is_drawn_only_where_it_is_opaque() {
-        // Blending is checked directly: going through `compose` would mean reassembling
-        // seventeen base64 chunks to see four pixels.
-        let cursor = test_cursor(0, 0);
-        let tile = Rect::new(0, 0, 4, 2);
-        // Background is RGB here, packed the way a tile is.
-        let mut out = vec![0u8; (tile.w * tile.h * 3) as usize];
-        for px in out.chunks_exact_mut(3) {
-            px.copy_from_slice(&[30, 20, 10]);
-        }
+    fn the_pointer_is_sent_once_and_then_only_moved() {
+        // The whole point of it being a placement. Blended into the tiles, every motion
+        // event retransmitted the tile it left and the tile it arrived at.
+        let m = ghostty();
+        let (mut r, fb) = native_renderer(&m);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        r.commit();
 
-        Renderer::blend_cursor(&cursor, Rect::new(0, 0, 2, 2), tile, &mut out);
+        r.set_cursor(Some(test_cursor(0, 0)));
+        r.move_cursor(Some((40, 40)));
+        assert!(r.has_work(), "a pointer that has moved is work to do");
+        out.clear();
+        r.compose(&fb, &mut out);
+        r.commit();
+        let first = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            first.contains(&format!("f=32,i={CURSOR_IMAGE_ID},")),
+            "the shape should have been transmitted as RGBA: {first:?}"
+        );
+        assert_eq!(r.dirty_tiles(), 0, "and no tile disturbed by it");
 
-        let px = |x: usize, y: usize| {
-            let i = (y * tile.w as usize + x) * 3;
-            (out[i], out[i + 1], out[i + 2])
-        };
-        // The cursor is BGRA; the tile is RGB, so the channels have to be swapped.
-        assert_eq!(px(0, 0), (255, 0, 0), "opaque red should be drawn");
-        assert_eq!(px(1, 1), (0, 0, 255), "opaque blue should be drawn");
-        assert_eq!(px(1, 0), (30, 20, 10), "transparent must not paint");
-        assert_eq!(px(0, 1), (30, 20, 10), "transparent must not paint");
-        assert_eq!(px(3, 0), (30, 20, 10), "outside the cursor is untouched");
+        // Moving it again is a placement and nothing else.
+        r.move_cursor(Some((48, 44)));
+        out.clear();
+        r.compose(&fb, &mut out);
+        r.commit();
+        let moved = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            moved.contains(&format!("a=p,q=2,C=1,z=-1,i={CURSOR_IMAGE_ID},")),
+            "moving should be a placement: {moved:?}"
+        );
+        assert!(
+            !moved.contains("f=32"),
+            "moving must not send the shape again: {moved:?}"
+        );
+        assert!(
+            !moved.contains("a=T"),
+            "and must not send a tile either: {moved:?}"
+        );
+        assert!(
+            moved.len() < 120,
+            "a move is a few bytes: {} of them",
+            moved.len()
+        );
     }
 
     #[test]
-    fn a_cursor_straddling_a_tile_boundary_draws_only_its_half() {
-        // Each tile is packed separately, so a cursor across a seam has to appear in
-        // both and be clipped to each.
-        let cursor = test_cursor(0, 0);
-        let rect = Rect::new(3, 0, 2, 2); // spans x=3..5
-        let tile = Rect::new(0, 0, 4, 2); // covers x=0..4
-        let mut out = vec![0u8; (tile.w * tile.h * 3) as usize];
+    fn the_pointer_sits_between_cells() {
+        // What `X`/`Y` are for: a pointer that could only land on a cell corner would jump
+        // eight pixels at a time across a 8x17 grid.
+        let m = ghostty();
+        let (mut r, _fb) = native_renderer(&m);
+        r.set_cursor(Some(test_cursor(0, 0)));
 
-        Renderer::blend_cursor(&cursor, rect, tile, &mut out);
+        // Origin is the top-left corner in a native layout, so destination pixels are
+        // terminal pixels: 19 across is cell 2 with 3 left over, 40 down is row 2 with 6.
+        r.move_cursor(Some((19, 40)));
+        let at = r.cursor_at_cell().expect("the pointer should be placed");
+        assert_eq!((at.col, at.x), (2, 3));
+        assert_eq!((at.row, at.y), (2, 6));
+        assert!(
+            at.x < m.cell_w && at.y < m.cell_h,
+            "the offsets have to be inside one cell"
+        );
+    }
 
-        let px = |x: usize, y: usize| {
-            let i = (y * tile.w as usize + x) * 3;
-            (out[i], out[i + 1], out[i + 2])
-        };
-        assert_eq!(px(3, 0), (255, 0, 0), "the half inside this tile is drawn");
-        // The blue pixel is at cursor (1,1), i.e. x=4, which is the next tile's.
-        assert_eq!(px(0, 1), (0, 0, 0), "nothing bleeds into the wrong column");
+    #[test]
+    fn a_pointer_that_leaves_is_taken_off_without_forgetting_its_shape() {
+        // Coming back should be a placement, not another transmission.
+        let m = ghostty();
+        let (mut r, fb) = native_renderer(&m);
+        let mut out = Vec::new();
+        r.set_cursor(Some(test_cursor(0, 0)));
+        r.move_cursor(Some((40, 40)));
+        r.compose(&fb, &mut out);
+        r.commit();
+
+        r.move_cursor(None);
+        out.clear();
+        r.compose(&fb, &mut out);
+        r.commit();
+        let gone = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            gone.contains(&format!("a=d,d=i,i={CURSOR_IMAGE_ID},")),
+            "the placement should be released: {gone:?}"
+        );
+        assert!(
+            !gone.contains("d=I"),
+            "but the data kept, so the shape need not travel again: {gone:?}"
+        );
+
+        r.move_cursor(Some((40, 40)));
+        out.clear();
+        r.compose(&fb, &mut out);
+        let back = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            back.contains("a=p") && !back.contains("f=32"),
+            "coming back is a placement: {back:?}"
+        );
     }
 
     #[test]
@@ -1282,28 +1370,29 @@ mod tests {
     }
 
     #[test]
-    fn moving_the_cursor_damages_where_it_was_and_where_it_went() {
-        // Otherwise the pointer smears a trail of itself across the screen.
+    fn moving_the_cursor_costs_no_tile_at_all() {
+        // It used to damage the tile it left and the tile it arrived at, which is what made
+        // moving the mouse the most expensive thing a still screen could do.
         let m = ghostty();
-        let (mut r, _fb) = native_renderer(&m);
+        let (mut r, fb) = native_renderer(&m);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
         r.set_cursor(Some(test_cursor(0, 0)));
         r.move_cursor(Some((10, 10)));
+        r.compose(&fb, &mut out);
         r.commit();
         assert!(!r.has_work());
 
-        // Far enough to land in another tile: both must be repainted.
+        // Far enough to land in another tile, which is no longer any concern of the tiles.
         r.move_cursor(Some((600, 10)));
-        assert_eq!(r.dirty_tiles(), 2, "the old tile and the new one");
+        assert_eq!(r.dirty_tiles(), 0, "no tile is owed anything");
+        assert!(r.has_work(), "but the frame is: the pointer has moved");
 
-        // A move within one tile dirties just that tile.
+        // A move to where it already is asks for nothing.
+        r.compose(&fb, &mut out);
         r.commit();
-        r.move_cursor(Some((604, 10)));
-        assert_eq!(r.dirty_tiles(), 1);
-
-        // And a move to the same place is not damage at all.
-        r.commit();
-        r.move_cursor(Some((604, 10)));
-        assert_eq!(r.dirty_tiles(), 0);
+        r.move_cursor(Some((600, 10)));
+        assert!(!r.has_work());
     }
 
     #[test]
@@ -1334,15 +1423,18 @@ mod tests {
     }
 
     #[test]
-    fn hiding_the_cursor_repairs_what_it_covered() {
+    fn hiding_the_cursor_takes_it_off_without_touching_a_tile() {
         let m = ghostty();
-        let (mut r, _fb) = native_renderer(&m);
+        let (mut r, fb) = native_renderer(&m);
+        let mut out = Vec::new();
         r.set_cursor(Some(test_cursor(0, 0)));
         r.move_cursor(Some((50, 50)));
+        r.compose(&fb, &mut out);
         r.commit();
 
         r.move_cursor(None);
-        assert_eq!(r.dirty_tiles(), 1, "the tile it left has to be repainted");
+        assert_eq!(r.dirty_tiles(), 0, "the picture underneath never changed");
+        assert!(r.has_work(), "but the placement has to come off");
         assert!(r.cursor_rect().is_none());
     }
 

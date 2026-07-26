@@ -162,9 +162,11 @@ status line and command menu stay readable on top of the remote screen.
 The mouse pointer is drawn here rather than by the server: asking for the `Cursor`
 pseudo-encoding gets the shape sent once and stops the server compositing it into the
 framebuffer, so the pointer keeps up with your hand instead of lagging it by a round
-trip. It is blended into each tile as that tile is packed, which leaves the server's
-picture untouched — nothing to save and restore, and a pointer that moves twice between
-frames costs nothing extra. A view-only session does not ask, because there is no local
+trip. It is an image of its own with an id above every tile's, placed with sub-cell offsets and
+moved with a placement rather than a transmission — so moving the mouse costs about forty
+bytes, where blending it into each tile it touched used to retransmit two to four of them
+per frame. Being above every tile also means it stays visible over the command menu, which
+is what you click its items with. A view-only session does not ask, because there is no local
 pointer worth drawing and the server's own is the only way to see where the real one is.
 
 Update requests are paced against the end of each framebuffer update, so there is

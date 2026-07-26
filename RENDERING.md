@@ -229,7 +229,7 @@ the protocol seam; getting at it wants a counting reader in the vendored client.
 time is not separable from wire time yet: `rtt` is measured from the request to `FrameEnd`,
 so it contains the server's encoding. Splitting them wants a fence sent behind the update
 request, whose reply says the server reached that point in its stream -- worth doing
-alongside [pushing turned off and on again](#2-pushing-turned-off-and-on-again-rather-than-declined),
+alongside [pushing turned off and on again](#1-pushing-turned-off-and-on-again-rather-than-declined),
 which needs the same fence bookkeeping.
 
 ## Where this stands
@@ -253,58 +253,19 @@ Built:
   megapixels per update -- next to ours (`src/session.rs`)
 - the plane: per-tile content keys in place of a dirty bitmap, a placed extent and a
   layout comparison (`src/render/mod.rs`)
+- the pointer as its own placement, moved with `a=p` and sub-cell `X`/`Y`, above every tile
+  (`src/term/kitty.rs`, `src/render/mod.rs`) -- verified against Ghostty with
+  `make blend-probe` before a line of it was written
 
 ## Not built yet
 
-Three things, ordered by what each is worth rather than by how tidy it would be. What each
-one *is* is above; what follows is what it costs to build and the parts that are not
-obvious from the design.
+Two things. What each one *is* is above; what follows is what it costs to build and the
+parts that are not obvious from the design.
 
-The first two are felt immediately; the third is structural, worth building for the bugs it
-makes impossible rather than for anything measurable.
+The first is felt immediately and is the one to be careful with; the second is structural,
+worth building for the bugs it makes impossible rather than for anything measurable.
 
-### 1. The cursor as a placement
-
-Replaces `blend_cursor`, `cursor_rect` and the cursor's dirty-marking in
-`src/render/mod.rs` with one image whose id is above every tile's, placed with sub-cell
-`X`/`Y` offsets and moved with `a=p`.
-
-**Answer this first: `make blend-probe`.** The protocol says semi-transparent placements
-that overlap are blended, and that at equal `z` the higher id is on top. Whether Ghostty
-actually blends an RGBA (`f=32`) placement over another placement -- rather than compositing
-it against the cell background, or drawing it opaque, or dropping it -- is not something the
-docs settle, and getting it wrong means a black or solid rectangle where the pointer should
-be.
-
-`docker/blend-probe.sh` draws a green square with a half-transparent red one over its
-middle, at the same `z` and a higher id, positioned with the `X`/`Y` sub-cell offsets this
-plan also depends on. An olive middle means blended and the plan is sound. Solid red means
-opaque, black means composited against the cell background, and nothing means the placement
-was dropped -- all three mean the cursor stays blended into tiles and this needs rethinking
-rather than writing. Run it on Ghostty and on kitty; a difference between them is a bug
-report rather than a misreading of the spec.
-
-This is not caution for its own sake. One shared memory object per frame was built from the
-spec without a terminal to try it against, and the answer was a black screen -- see
-[the offset finding](#the-o-finding).
-
-If it holds, the rest is small. `X`/`Y` must be smaller than the cell, so the placement
-cell is `hotspot / cell_size` and the offset is the remainder.
-
-What it is worth: moving the pointer marks the tile it left and the tile it arrived at, and
-a cursor straddling a boundary touches four. So a frame while the mouse is moving
-retransmits two to four tiles, at fifty-odd kilobytes packed each, up to sixty times a
-second -- **six to twelve megabytes a second of shared memory traffic, and hundreds of
-system calls, for moving a pointer over a picture that has not changed**. As a placement it
-is one release and one `a=p`: about forty bytes. It also takes the cursor out of the tile
-hot path, where `blend_cursor` currently runs over every tile it touches on every frame.
-
-It also fixes a wart nobody has reported: `cursor_at` is in destination pixels, and a
-resize changes what a given screen position maps to, but nothing re-derives it -- so after
-a resize the pointer is drawn at a stale spot until it next moves. A placement is
-re-placed from the new map as a matter of course.
-
-### 2. Pushing turned off and on again, rather than declined
+### 1. Pushing turned off and on again, rather than declined
 
 This item said "Fence as flow control", on the reasoning that a client could hold a frame's
 worth of credit and let the server run exactly as far ahead as it can draw. That is the
@@ -337,7 +298,7 @@ worse failure than the flat-out pushing it replaces. It wants sustained load to 
 against, which `make desktop` plus a scrolling browser gives and a test does not. Build the
 policy behind a flag, default off, until it has been watched for a while.
 
-### 3. The chrome as one diffed plane
+### 2. The chrome as one diffed plane
 
 Replaces `Toast::drawn`/`stale`/`moved`, `Session::clear_menu`, `status::clear` and
 `Menu::clear` with a private cell buffer, double buffered and diffed per frame.

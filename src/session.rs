@@ -281,6 +281,8 @@ struct Session<B: Backend> {
     /// How long a frame is allowed, from `--fps`. What the render tick is paced by, and
     /// what says whether a frame is owed when an update finishes arriving.
     frame_time: Duration,
+    /// Where the pointer is, in terminal pixels, so it can be put back after a resize.
+    pointer_px: Option<(u32, u32)>,
     /// A rectangle of the update being received has been applied and the update is not
     /// over. Drawing now would put half of one picture on the screen and half of
     /// another -- which on a page being scrolled is half of it at each scroll position.
@@ -360,6 +362,7 @@ impl<B: Backend> Session<B> {
             fps: FpsMeter::new(),
             frame_time: Duration::from_micros(1_000_000 / u64::from(args.fps)),
             mid_update: false,
+            pointer_px: None,
             update_started: None,
             update_pixels: 0,
             updates: FpsMeter::new(),
@@ -788,6 +791,10 @@ impl<B: Backend> Session<B> {
                 // overlay, so it should keep up with the hand even while a frame is in
                 // flight.
                 let (tx, ty) = self.input.terminal_pixel(&mouse, &self.metrics);
+                // Kept in terminal pixels, not the destination pixels the renderer wants:
+                // a resize changes what a destination pixel means, and the pointer has to
+                // be re-derived from where it actually is rather than left where it was.
+                self.pointer_px = Some((tx, ty));
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
 
@@ -1318,6 +1325,12 @@ impl<B: Backend> Session<B> {
             self.pan,
         );
         let cleanup = self.renderer.relayout(layout);
+        // The pointer is placed against the terminal's grid, which has just changed under
+        // it. Its screen position has not, so put it back where it actually is.
+        if let Some((tx, ty)) = self.pointer_px {
+            let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
+            self.renderer.move_cursor(at);
+        }
         // Held for the next frame rather than written now, and appended: a relayout
         // names the tiles it has dropped, and a second one before that frame goes out
         // names different ones. Each lowers what the renderer believes is placed, so no

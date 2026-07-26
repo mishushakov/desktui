@@ -75,6 +75,30 @@ fn a_frame_is_never_composed_from_half_an_update() {
     term.wait(Duration::from_secs(10));
 }
 
+/// The first image id that is not a tile's. Above it are the overlay backdrops and the
+/// pointer, which are transmitted like tiles and are not tiles.
+const OVERLAY_ID: u32 = 0x7600 + 0x40000;
+
+/// Every image id transmitted in `out`, tiles and overlays alike.
+fn transmitted_ids(out: &[u8]) -> Vec<u32> {
+    let mut found = Vec::new();
+    for at in offsets(out, b"\x1b_Ga=T") {
+        let rest = &out[at..];
+        let Some(key) = find(rest, b"i=") else {
+            continue;
+        };
+        let digits: Vec<u8> = rest[key + 2..]
+            .iter()
+            .copied()
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        if let Ok(id) = String::from_utf8_lossy(&digits).parse() {
+            found.push(id);
+        }
+    }
+    found
+}
+
 /// The image id of the tile covering a pixel, for the 1:1 layout the session harness
 /// negotiates: 8x17 cells make tiles of 128x136, numbered by where they sit.
 fn tile_id((x, y): (u16, u16)) -> u32 {
@@ -560,9 +584,6 @@ fn no_fence_support_means_no_round_trip_figure_rather_than_a_wrong_one() {
 
 /// Live counterpart: `live::a_real_server_sends_a_cursor_shape`.
 #[test]
-// Needs the redraw to land inside a fixed 400ms window, which a loaded shared
-// runner misses. Passes on a real machine; run it with --ignored.
-#[ignore = "wall-clock sensitive: unreliable on shared CI runners"]
 fn the_cursor_shape_is_requested_and_drawn_locally() {
     // Asking for the shape is what stops the server compositing the pointer, so the
     // pointer can then move at local speed rather than at a round trip's.
@@ -586,18 +607,52 @@ fn the_cursor_shape_is_requested_and_drawn_locally() {
         other => panic!("unexpected {other:?}"),
     }
 
-    // Moving the pointer has to produce frames without the server sending anything:
-    // the overlay is drawn on this side.
-    let before = tiles_drawn(&term);
+    // Moving the pointer has to reach the screen without the server sending anything: the
+    // overlay is drawn on this side. And it has to cost a placement rather than a tile --
+    // the pointer is an image of its own now, where it used to be blended into every tile
+    // it touched, so a frame while the mouse moves retransmitted two to four of them.
+    // Wait for the screen to stop changing first. The note the client puts up at startup
+    // marks everything when it goes, and a redraw arriving mid-measurement would be read as
+    // the pointer having cost tiles.
+    let mut quiet = 0;
+    let mut last = tiles_drawn(&term);
+    for _ in 0..80 {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = tiles_drawn(&term);
+        quiet = if now == last { quiet + 1 } else { 0 };
+        if quiet >= 3 {
+            break;
+        }
+        last = now;
+    }
+
+    let bytes_before = term.output().len();
     for x in (200..500).step_by(30) {
         term.send(format!("\x1b[<35;{x};200M").as_bytes());
         std::thread::sleep(Duration::from_millis(30));
     }
     std::thread::sleep(Duration::from_millis(400));
-    assert_kept_drawing(
-        &term,
-        before,
-        "moving the pointer, so the cursor is not being composited locally",
+
+    let out = term.output();
+    let since = &out[bytes_before.min(out.len())..];
+    assert!(
+        contains(since, b"f=32,i="),
+        "the pointer should be an RGBA image of its own: {}",
+        show(since)
+    );
+    assert!(
+        contains(since, b"a=p,q=2"),
+        "and moving it should be a placement: {}",
+        show(since)
+    );
+    let tiles: Vec<u32> = transmitted_ids(since)
+        .into_iter()
+        .filter(|id| *id < OVERLAY_ID)
+        .collect();
+    assert!(
+        tiles.is_empty(),
+        "moving the pointer retransmitted {} tiles: {tiles:?}",
+        tiles.len()
     );
 
     quit(&mut term);
