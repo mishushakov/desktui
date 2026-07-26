@@ -7,7 +7,9 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval};
@@ -24,7 +26,9 @@ use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
+use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
+use crate::ui::theme::Theme;
 
 /// How long to wait for the TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -317,10 +321,15 @@ struct Session {
 
     view_only: bool,
     no_clipboard: bool,
-    show_help: bool,
-    /// The overlay was dismissed and its cells still have to be blanked. Drawing
+    /// Which palette the chrome wears. Dark to start, the bar having been that colour
+    /// before there was a choice.
+    theme: Theme,
+    /// The command menu, and where the pointer is on it.
+    menu: Menu,
+    show_menu: bool,
+    /// The menu was dismissed and its cells still have to be blanked. Drawing
     /// the image over them does not do it: the image sits below the text.
-    clear_help: bool,
+    clear_menu: bool,
     show_stats: bool,
     note: Option<(String, Instant)>,
 
@@ -376,8 +385,10 @@ impl Session {
             remote_num_lock: None,
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
-            show_help: false,
-            clear_help: false,
+            theme: Theme::Dark,
+            menu: Menu::new(args.prefix_char()),
+            show_menu: false,
+            clear_menu: false,
             show_stats: false,
             note: None,
             fps: FpsMeter::new(),
@@ -736,12 +747,34 @@ impl Session {
     async fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) => {
-                // The overlay promises that any other key dismisses it, so the key
-                // is caught here rather than interpreted. Presses only: the releases
-                // belonging to the chord that opened the overlay are still to come,
-                // and would otherwise close it before it could be read.
-                if self.show_help && key.kind == KeyEventKind::Press {
-                    self.dismiss_help();
+                // The menu holds the focus while it is up. Escape is what it says
+                // puts it away, and the only key that does; everything else is a
+                // local command or is swallowed. Presses only, or the release of the
+                // chord that opened it would close it before it could be read.
+                if self.show_menu {
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                        self.dismiss_menu();
+                        return Ok(());
+                    }
+                    // Local commands still work -- the menu is the list of them --
+                    // and a release still reaches the remote, because a key held from
+                    // before the menu opened is down over there until it does.
+                    let locks = self.input.lock_state(&key);
+                    match self.input.on_key_local(key) {
+                        KeyOutcome::Ignored => {}
+                        KeyOutcome::Keys(keys) => {
+                            if !self.view_only {
+                                self.sync_lock_keys(locks).await?;
+                                for key in keys {
+                                    self.send(X11Event::KeyEvent(key)).await?;
+                                }
+                            }
+                        }
+                        // Not `SendPrefix`: nothing typed at the menu belongs to the
+                        // remote, and the menu no longer offers it.
+                        KeyOutcome::Local(Command::SendPrefix) => {}
+                        KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
+                    }
                     return Ok(());
                 }
                 let locks = self.input.lock_state(&key);
@@ -767,6 +800,14 @@ impl Session {
                 let (tx, ty) = self.input.terminal_pixel(&mouse, &self.metrics);
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
+
+                // The menu takes the pointer while it is up. Nothing goes through to
+                // the remote: a click meant for a menu item must not also land on
+                // whatever is behind it.
+                if self.show_menu {
+                    self.on_menu_mouse(mouse).await?;
+                    return Ok(());
+                }
 
                 if !self.view_only {
                     let events = {
@@ -835,18 +876,8 @@ impl Session {
                 self.request_native_size(true).await?;
                 self.set_note("renegotiating the remote size".into());
             }
-            Command::CycleMode => {
-                let mode = self.mode.next();
-                self.mode = mode;
-                self.pan = (0, 0);
-                if mode == ScaleMode::Native {
-                    self.requested_size = None;
-                    self.request_native_size(true).await?;
-                } else {
-                    self.relayout();
-                }
-                self.set_note(format!("scaling: {}", describe(self.renderer.layout())));
-            }
+            Command::CycleMode => self.set_mode(self.mode.next()).await?,
+            Command::Mode(mode) => self.set_mode(mode).await?,
             Command::Pan(dx, dy) => {
                 let layout = *self.renderer.layout();
                 let (max_x, max_y) = layout.pan_limits();
@@ -879,27 +910,91 @@ impl Session {
                 );
             }
             Command::ToggleStats => self.show_stats = !self.show_stats,
-            Command::Help => {
-                if self.show_help {
-                    self.dismiss_help();
+            Command::Theme(theme) => {
+                self.theme = theme;
+                // The menu is redrawn in the new palette on the next tick; the cells it
+                // has already coloured are overwritten there rather than erased.
+                self.set_note(format!(
+                    "theme: {}",
+                    if theme == Theme::Dark {
+                        "dark"
+                    } else {
+                        "light"
+                    }
+                ));
+            }
+            Command::Menu => {
+                if self.show_menu {
+                    self.dismiss_menu();
                 } else {
-                    self.show_help = true;
+                    self.show_menu = true;
                 }
             }
         }
         Ok(())
     }
 
-    /// Hide the help overlay and arrange for the cells it used to be blanked.
+    /// Adopt a scaling mode, however it was asked for: the key cycles, the menu
+    /// names one outright.
+    async fn set_mode(&mut self, mode: ScaleMode) -> Result<()> {
+        self.mode = mode;
+        self.pan = (0, 0);
+        if mode == ScaleMode::Native {
+            self.requested_size = None;
+            self.request_native_size(true).await?;
+        } else {
+            self.relayout();
+        }
+        self.set_note(format!("scaling: {}", describe(self.renderer.layout())));
+        Ok(())
+    }
+
+    /// Point at the menu, and run whatever is clicked on.
+    ///
+    /// A click runs its command and leaves the menu up. Only the dismissal takes it
+    /// down -- the word in the title, the escape key, or the toggle at the top, which
+    /// are three ways of asking for the same thing. So panning twice is two clicks
+    /// rather than two trips through the menu, and picking a scaling mode shows the
+    /// brackets move to it.
+    ///
+    /// A click that lands on nothing does nothing, off the box included: the menu has
+    /// the focus, so there is nothing behind it to click on.
+    async fn on_menu_mouse(&mut self, ev: MouseEvent) -> Result<()> {
+        let (col, row) = self.input.terminal_cell(&ev, &self.metrics);
+        let hit = self.menu.hit(&self.metrics, col, row);
+        match ev.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => self.menu.set_hover(hit),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Hit::Item { command, .. } = hit {
+                    self.on_command(command).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// What the menu should mark as being in force.
+    fn menu_state(&self) -> menu::State {
+        menu::State {
+            mode: self.mode,
+            theme: self.theme,
+        }
+    }
+
+    /// Hide the menu and arrange for the cells it used to be blanked.
     ///
     /// Clearing the flag is not enough on its own, and neither is damaging the
-    /// image: the overlay is text, and tiles are placed below the text, so the box
+    /// image: the menu is text, and tiles are placed below the text, so the box
     /// outlives any repaint until the cells themselves are erased. The tiles are
     /// marked too, for a terminal that treats an erase as dropping the placements
     /// underneath it.
-    fn dismiss_help(&mut self) {
-        self.show_help = false;
-        self.clear_help = true;
+    fn dismiss_menu(&mut self) {
+        self.show_menu = false;
+        self.clear_menu = true;
+        // Or the row the pointer happened to be on would be lit the next time the
+        // menu opens, before the pointer has moved to say so.
+        self.menu.clear_hover();
         self.renderer.mark_all();
     }
 
@@ -1086,7 +1181,7 @@ impl Session {
 
     fn draw(&mut self) -> Result<()> {
         let has_work = self.renderer.has_work();
-        if !has_work && self.note.is_none() && !self.show_help && !self.clear_help {
+        if !has_work && self.note.is_none() && !self.show_menu && !self.clear_menu {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1100,17 +1195,17 @@ impl Session {
         }
         // Text first, then images, exactly as a relayout does it: erasing cells may
         // take the placements under them with it, so the tiles have to go out after.
-        if self.clear_help {
-            status::clear_help(&mut buf, &self.metrics, self.input.prefix());
-            self.clear_help = false;
+        if self.clear_menu {
+            self.menu.clear(&mut buf, &self.metrics);
+            self.clear_menu = false;
         }
         let stats = self.renderer.compose(&self.fb, &mut buf);
         if stats.tiles > 0 {
             self.last_stats = stats;
         }
         self.draw_status(&mut buf);
-        if self.show_help {
-            status::draw_help(&mut buf, &self.metrics, self.input.prefix());
+        if self.show_menu {
+            self.menu.draw(&mut buf, &self.metrics, self.menu_state());
         }
         if self.caps.sync_output {
             kitty::end_sync(&mut buf);
@@ -1132,53 +1227,74 @@ impl Session {
 
     fn draw_status(&mut self, buf: &mut Vec<u8>) {
         let layout = *self.renderer.layout();
-        let mut left = format!(
-            " {}  {}x{}",
-            if self.server_name.is_empty() {
-                "desktui"
-            } else {
-                self.server_name.as_str()
-            },
-            self.remote.0,
-            self.remote.1
-        );
+        // What this is connected to, which is the one thing on the left worth reading
+        // without looking for it.
+        let name = if self.server_name.is_empty() {
+            " desktui".to_string()
+        } else {
+            format!(" {}", self.server_name)
+        };
+
+        let mut rest = format!("  {}x{}", self.remote.0, self.remote.1);
         if !layout.is_pixel_exact() {
-            left.push_str(&format!(" -> {}x{}", layout.dst_w, layout.dst_h));
+            rest.push_str(&format!(" -> {}x{}", layout.dst_w, layout.dst_h));
         }
-        left.push_str(&format!("  {}", describe(&layout)));
+        rest.push_str(&format!("  {}", describe(&layout)));
         if self.view_only {
-            left.push_str("  view-only");
+            rest.push_str("  view-only");
         }
-        if self.input.is_armed() {
-            left.push_str("  PREFIX");
-        }
-        if let Some((note, at)) = &self.note {
+
+        // The note comes after the dot below, so it is built here rather than pushed.
+        let mut note = String::new();
+        if let Some((text, at)) = &self.note {
             if at.elapsed() < NOTE_LINGER {
-                left.push_str("  -- ");
-                left.push_str(note);
+                note = format!("  -- {text}");
             } else {
                 self.note = None;
             }
         }
 
-        let right = if self.show_stats {
-            format!(
-                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  Ctrl+{} ? ",
-                self.fps.fps(),
-                self.last_stats.tiles,
-                human_bytes(self.last_stats.bytes),
-                format_rtt(self.rtt),
-                self.dropped,
-                self.input.prefix().to_ascii_uppercase(),
+        // The one binding worth naming, because it opens the menu the rest of them are
+        // listed in. It keeps the ink when the statistics crowd the words out.
+        // Lower case, as the menu writes its shortcuts: the two should read alike.
+        let key = format!("ctrl+{} p", self.input.prefix());
+        let (figures, label) = if self.show_stats {
+            (
+                format!(
+                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  ",
+                    self.fps.fps(),
+                    self.last_stats.tiles,
+                    human_bytes(self.last_stats.bytes),
+                    format_rtt(self.rtt),
+                    self.dropped,
+                ),
+                " ".to_string(),
             )
         } else {
-            format!(
-                "{:>6}  Ctrl+{} ? for help ",
-                format_rtt(self.rtt),
-                self.input.prefix().to_ascii_uppercase()
+            (
+                format!("{:>6}  ", format_rtt(self.rtt)),
+                " commands ".into(),
             )
         };
-        status::draw(buf, &self.metrics, &left, &right);
+
+        // Lit while the prefix waits on its key. The dot is what catches the eye and
+        // the word is what it means: the next key is a command, not a keystroke. In the
+        // colour the menu picks things out with, so the light and the box it is about
+        // read as the same idea.
+        let ink = self.theme.palette();
+        let mut left = vec![ink.bright(&name), ink.text(&rest)];
+        if self.input.is_armed() {
+            left.push(ink.accent("  ● CMD"));
+        }
+        left.push(ink.text(&note));
+
+        status::draw(
+            buf,
+            &self.metrics,
+            ink,
+            left,
+            vec![ink.text(&figures), ink.bright(&key), ink.text(&label)],
+        );
     }
 
     fn relayout(&mut self) {

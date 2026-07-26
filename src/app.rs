@@ -18,7 +18,9 @@ use crate::term::caps::Caps;
 use crate::term::kitty;
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard};
+use crate::ui::menu::{self, Menu};
 use crate::ui::status;
+use crate::ui::theme::Theme;
 
 /// Rolling frame-rate estimate over a short window.
 pub struct FpsMeter {
@@ -88,8 +90,16 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     );
     let mut damage: Vec<Rect> = Vec::new();
     let mut fps = FpsMeter::new();
-    let mut show_help = false;
-    let mut clear_help = false;
+    // Listed, not clickable: none of the prefix commands mean anything to a loop
+    // with no server behind it, and nothing here can change what it shows either.
+    let menu = Menu::new(args.prefix_char());
+    let state = menu::State {
+        mode: args.scale,
+        theme: Theme::Dark,
+    };
+    let ink = state.theme.palette();
+    let mut show_menu = false;
+    let mut clear_menu = false;
     let mut last_stats = crate::render::FrameStats::default();
     let mut dropped: u64 = 0;
 
@@ -106,21 +116,26 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             }
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    let was_showing = show_help;
+                    let was_showing = show_menu;
                     match key.code {
+                        // Escape belongs to the menu while it is up, which is what the
+                        // menu's own title offers. Leaving it as the way out of the
+                        // pattern would have the box lie about what it does.
+                        KeyCode::Esc if show_menu => show_menu = false,
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Char('c')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             return Ok(());
                         }
-                        KeyCode::Char('h') | KeyCode::Char('?') => show_help = !show_help,
-                        _ => show_help = false,
+                        KeyCode::Char('h') | KeyCode::Char('?') => show_menu = !show_menu,
+                        // Nothing else dismisses it, here as in a session.
+                        _ => {}
                     }
-                    // The overlay leaves text and a backdrop image behind it, and
+                    // The menu leaves text and a backdrop image behind it, and
                     // neither is undone by drawing the pattern again.
-                    if was_showing && !show_help {
-                        clear_help = true;
+                    if was_showing && !show_menu {
+                        clear_menu = true;
                         renderer.mark_all();
                     }
                 }
@@ -184,7 +199,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         for r in &damage {
             renderer.mark(*r);
         }
-        if !renderer.has_work() && !show_help && !clear_help {
+        if !renderer.has_work() && !show_menu && !clear_menu {
             continue;
         }
 
@@ -192,9 +207,9 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         if caps.sync_output {
             kitty::begin_sync(&mut buf);
         }
-        if clear_help {
-            status::clear_help(&mut buf, &metrics, args.prefix_char());
-            clear_help = false;
+        if clear_menu {
+            menu.clear(&mut buf, &metrics);
+            clear_menu = false;
         }
         let stats = renderer.compose(&fb, &mut buf);
         if stats.tiles > 0 {
@@ -202,23 +217,30 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         }
 
         let layout = renderer.layout();
-        let left = format!(
-            " test-pattern  {}x{} {}  {} tiles",
+        // What is on screen, in the same place a session names its server.
+        let rest = format!(
+            "  {}x{} {}  {} tiles",
             layout.dst_w,
             layout.dst_h,
             describe(layout),
             renderer.tile_count(),
         );
-        let right = format!(
-            "{:>5.1} fps  {:>3} tiles/f  {:>6}/f  {} dropped  q quit  h help ",
+        let figures = format!(
+            "{:>5.1} fps  {:>3} tiles/f  {:>6}/f  {} dropped  q quit  ",
             fps.fps(),
             last_stats.tiles,
             human_bytes(last_stats.bytes),
             dropped,
         );
-        status::draw(&mut buf, &metrics, &left, &right);
-        if show_help {
-            status::draw_help(&mut buf, &metrics, args.prefix_char());
+        status::draw(
+            &mut buf,
+            &metrics,
+            ink,
+            vec![ink.bright(" test-pattern"), ink.text(&rest)],
+            vec![ink.text(&figures), ink.bright("h"), ink.text(" menu ")],
+        );
+        if show_menu {
+            menu.draw(&mut buf, &metrics, state);
         }
         if caps.sync_output {
             kitty::end_sync(&mut buf);

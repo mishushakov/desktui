@@ -117,6 +117,7 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 
 | `Ctrl+A` then | |
 |---|---|
+| `p` | the command menu |
 | `q` | quit |
 | `f` | full screen refresh |
 | `r` | renegotiate the remote size |
@@ -124,7 +125,6 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
 | `c` | toggle statistics (fps, tiles, bytes per frame, server RTT) |
-| `h` `?` | help |
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
 Clipboard works in both directions: paste into the terminal and it reaches the
@@ -148,7 +148,7 @@ re-sending an id replaces the image and its placement atomically, so partial upd
 need no delete traffic and never flicker. A one-pixel change costs about a kilobyte.
 
 Tiles are placed with `z=-1`, below text and above the cell background, so the
-status line and help overlay stay readable on top of the remote screen.
+status line and command menu stay readable on top of the remote screen.
 
 The mouse pointer is drawn here rather than by the server: asking for the `Cursor`
 pseudo-encoding gets the shape sent once and stops the server compositing it into the

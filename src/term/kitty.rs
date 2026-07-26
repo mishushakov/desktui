@@ -27,7 +27,7 @@
 //!   would answer every tile and we would have to drain those answers out of
 //!   the input stream.
 //! * `z=-1` puts the image below text but above the cell background, so the
-//!   status line and the help overlay stay legible on top of the remote screen.
+//!   status line and the command menu stay legible on top of the remote screen.
 //!   At the default `z=0` the image would cover them.
 //!
 //! Animation frames (`a=f`) are deliberately unused: they exist for
@@ -69,6 +69,10 @@ const PLACEMENT_ID: u32 = 1;
 /// can cover the remote screen. A cell background cannot, being painted below
 /// the image.
 pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x10000;
+
+/// Image id for the menu row under the pointer, one above the backdrop it is drawn
+/// on so it is composited over it rather than under.
+pub const MENU_HIGHLIGHT_IMAGE_ID: u32 = OVERLAY_IMAGE_ID + 1;
 
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,7 +4,7 @@
 //! answer for the keyboard protocol and owe a release for every press, some report
 //! nothing and have their releases synthesised. On top of that sit the things the
 //! client swallows rather than forwards -- the prefix chord, the key that dismisses the
-//! help overlay -- and the corrections it inserts, like a caps lock the server disagrees
+//! command menu -- and the corrections it inserts, like a caps lock the server disagrees
 //! with.
 
 mod common;
@@ -85,44 +85,33 @@ fn input_reaches_the_server_with_pixel_exact_coordinates() {
 }
 
 #[test]
-fn the_help_overlay_goes_away_on_the_next_key() {
-    // The bug this replaces: only the prefix command toggled the overlay, so the
-    // "any other key dismisses this" it advertises was untrue and the box stayed
-    // on screen for the rest of the session.
+fn the_command_menu_holds_the_focus_until_escape() {
+    // The menu has the focus while it is up: a key neither dismisses it nor reaches
+    // the remote, and escape -- which is what the title offers -- is the way out.
     let (server, mut term) = start(Resize::Accept, (1024, 768));
     assert_pixel_exact(&term, Duration::from_secs(10));
 
-    // Ctrl+A then ? raises it.
+    // Ctrl+A then p raises it.
     term.send(&[0x01]);
     std::thread::sleep(Duration::from_millis(50));
-    term.send(b"?");
+    term.send(b"p");
     assert!(
         term.wait_for(b"Renegotiate the remote size", Duration::from_secs(10)),
-        "the overlay never appeared"
+        "the menu never appeared"
     );
 
-    // While it is up it is redrawn every frame, so a tail of the output that no
-    // longer mentions it is the overlay being gone rather than merely not resent.
+    // An ordinary key changes nothing. It is redrawn every frame while it is up, so
+    // a tail that still mentions it is the box still being there.
     let mark = term.output().len();
     term.send(b"\x1b[120u");
     std::thread::sleep(Duration::from_millis(500));
-    let since = term.output()[mark..].to_vec();
     assert!(
-        !contains(&since, b"Renegotiate the remote size"),
-        "the overlay was still being drawn after a dismissing key"
+        contains(&term.output()[mark..], b"Renegotiate the remote size"),
+        "an ordinary key put the menu away"
     );
 
-    // Stopping the redraw is not the same as taking it off the screen. The glyphs
-    // outlive any repaint of the image below them, and the backdrop outranks every
-    // tile, so both have to be taken off explicitly -- and only the teardown deletes
-    // an image by id, which makes it the thing to look for.
-    assert!(
-        contains(&since, b"a=d,d=I,i="),
-        "the overlay was never cleared, so it is still on screen"
-    );
-
-    // The key that dismisses is swallowed rather than passed on: the overlay
-    // said it dismisses, not that it types.
+    // And it went nowhere else either: with the focus in the menu there is nothing
+    // behind it to type into.
     assert!(
         !server.requests().iter().any(|r| matches!(
             r,
@@ -131,7 +120,113 @@ fn the_help_overlay_goes_away_on_the_next_key() {
                 down: true
             }
         )),
-        "the dismissing key was forwarded to the server as well"
+        "a key typed at the menu was forwarded to the server"
+    );
+
+    // Escape is the way out. Stopping the redraw is not the same as taking it off the
+    // screen: the glyphs outlive any repaint of the image below them, and the backdrop
+    // outranks every tile, so both have to be taken off explicitly -- and only the
+    // teardown deletes an image by id, which makes it the thing to look for.
+    let mark = term.output().len();
+    term.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(500));
+    let since = term.output()[mark..].to_vec();
+    assert!(
+        !contains(&since, b"Renegotiate the remote size"),
+        "escape did not put the menu away"
+    );
+    assert!(
+        contains(&since, b"a=d,d=I,i="),
+        "the menu was never cleared, so it is still on screen"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn clicking_a_scaling_option_selects_that_one() {
+    // The menu is the only way to reach a scaling mode by name. The key cannot: one
+    // binding for four modes can only step to the next.
+    //
+    // The server refuses to resize, so the modes are told apart by what they do to a
+    // 1024x768 desktop in a 1600x833 area. Native falls back, integer scales by one
+    // and 1:1 is itself -- all three pixel-exact. Only fit resamples, so "scaled" is
+    // proof that the click landed on fit itself: one step on from the mode native fell
+    // back to would have been native again.
+    let (server, mut term) = start(Resize::Refuse, (1024, 768));
+    assert!(
+        term.wait_for(b"1:1", Duration::from_secs(10)),
+        "never fell back from native: {}",
+        tail(&term.output())
+    );
+
+    // Ctrl+A then p raises the menu.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"p");
+    assert!(
+        term.wait_for(b"Scaling", Duration::from_secs(10)),
+        "the menu never appeared: {}",
+        tail(&term.output())
+    );
+
+    // Where fit is. Twenty-three entries and their padding make a box 53 by 25,
+    // centred across 200 columns and the 49 rows above the status line, so its top
+    // left is cell 73,12. The scaling options are the sixteenth entry, three columns
+    // in past the padding, and fit is the second of them -- ten cells along, native
+    // taking eight and the gap two. Cell 89,28, which in 8x17 cells is pixel 716,484,
+    // and mouse reports are one-based.
+    //
+    // Checked rather than assumed, because a click aimed at a row that has moved
+    // would fail somewhere far less obvious than here.
+    let out = term.output();
+    let at = find(&out, b"\x1b[29;74H").unwrap_or_else(|| {
+        panic!(
+            "the menu does not reach cell 74,29 any more: {}",
+            tail(&out)
+        )
+    });
+    assert!(
+        contains(&out[at..(at + 160).min(out.len())], b"Native"),
+        "cell 74,29 is no longer the row of scaling options, so the click would miss"
+    );
+    let mark = out.len();
+    term.send(b"\x1b[<0;717;485M");
+    term.send(b"\x1b[<0;717;485m");
+
+    assert!(
+        term.wait_for(b"scaling: scaled", Duration::from_secs(10)),
+        "the click did not select fit: {}",
+        tail(&term.output())
+    );
+
+    // The menu stays up, and shows the choice it just made: the brackets mark the mode
+    // in force, so they move to fit. Only the dismissal takes the box down, which is
+    // what makes the row a control you can watch rather than one that ends the session
+    // with the menu.
+    std::thread::sleep(Duration::from_millis(500));
+    let since = term.output()[mark..].to_vec();
+    assert!(
+        contains(&since, b"Renegotiate the remote size"),
+        "the menu went away on a click that was not the dismissal"
+    );
+    assert!(
+        contains(&since, b"[Fit]"),
+        "the option in force is not the one that was clicked: {}",
+        tail(&since)
+    );
+
+    // And the click went to the menu alone. A button that reached the remote as well
+    // would have pressed whatever the box was covering.
+    assert!(
+        server
+            .wait_for(Duration::from_secs(1), |r| matches!(
+                r,
+                Request::Pointer { buttons: 1, .. }
+            ))
+            .is_none(),
+        "the click was forwarded to the server as well"
     );
 
     quit(&mut term);

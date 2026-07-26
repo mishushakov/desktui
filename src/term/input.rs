@@ -23,8 +23,10 @@ use crossterm::event::{
 
 use super::Metrics;
 use super::keysym::{bitmask, keysym};
+use crate::cli::ScaleMode;
 use crate::render::Layout;
 use crate::rfb::{ClientKeyEvent, ClientMouseEvent};
+use crate::ui::theme::Theme;
 
 /// Shortest gap between two motion reports, about 60 a second.
 ///
@@ -45,7 +47,7 @@ mod button {
     pub const WHEEL_RIGHT: u8 = 1 << 6;
 }
 
-/// A local command, reached through the prefix key.
+/// A local command, reached through the prefix key or by pointing at the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Quit,
@@ -53,10 +55,18 @@ pub enum Command {
     Renegotiate,
     /// Step to the next scaling mode.
     CycleMode,
+    /// Go straight to one scaling mode. No key reaches this: one binding cannot
+    /// name four modes, which is why the key cycles instead. A pointer can name
+    /// one, so the menu offers them as a row to choose from.
+    Mode(ScaleMode),
     Pan(i32, i32),
     ToggleViewOnly,
     ToggleStats,
-    Help,
+    /// Show the command menu, or put it away if it is already up.
+    Menu,
+    /// Wear a palette. No key reaches this either: it is a choice rather than a step,
+    /// so the menu offers the two side by side and a click names one.
+    Theme(Theme),
     /// The prefix was pressed twice: send it through to the server.
     SendPrefix,
 }
@@ -181,6 +191,25 @@ impl InputMapper {
         }
 
         self.translate(ev)
+    }
+
+    /// A key arriving while the menu has the focus.
+    ///
+    /// The prefix window still works, because the menu is the list of what it does,
+    /// but a keystroke meant for the remote is swallowed rather than sent -- which is
+    /// what having the focus means. It has to be swallowed *here* rather than by
+    /// dropping what comes back: a press is recorded as held the moment it is
+    /// translated, and throwing the event away after that would leave us believing
+    /// the server holds a key it was never sent, to be released later out of nowhere.
+    ///
+    /// Releases are let through for the mirror of that reason. A key pressed before
+    /// the menu opened is genuinely down on the remote, and its release is the only
+    /// thing that lets go of it.
+    pub fn on_key_local(&mut self, ev: KeyEvent) -> KeyOutcome {
+        if ev.kind != KeyEventKind::Release && !self.armed && !self.is_prefix(&ev) {
+            return KeyOutcome::Ignored;
+        }
+        self.on_key(ev)
     }
 
     /// Let go of a key the server was told is down, and say nothing otherwise.
@@ -310,6 +339,20 @@ impl InputMapper {
                 u32::from(ev.row) * metrics.cell_h + metrics.cell_h / 2,
             )
         }
+    }
+
+    /// The zero-based cell this event happened on.
+    ///
+    /// Through the pixel position rather than straight from the event, because with
+    /// mode 1016 in force the event carries pixels, and the chrome is addressed in
+    /// cells. The round trip is exact for a terminal without it: the middle of a
+    /// cell divides back to the cell it came from.
+    pub fn terminal_cell(&self, ev: &MouseEvent, metrics: &Metrics) -> (u16, u16) {
+        let (x, y) = self.terminal_pixel(ev, metrics);
+        (
+            (x / metrics.cell_w.max(1)).min(u32::from(u16::MAX)) as u16,
+            (y / metrics.cell_h.max(1)).min(u32::from(u16::MAX)) as u16,
+        )
     }
 
     /// Translate a mouse event, returning the pointer events to send.
@@ -458,7 +501,10 @@ fn command_for(code: KeyCode) -> Option<Command> {
         KeyCode::Char('m') => Command::CycleMode,
         KeyCode::Char('v') => Command::ToggleViewOnly,
         KeyCode::Char('c') => Command::ToggleStats,
-        KeyCode::Char('h') | KeyCode::Char('?') => Command::Help,
+        // Nothing else opens the menu, and the menu is where the rest of these are
+        // listed, so this is the one binding worth remembering -- which is why it is
+        // the one the status line names.
+        KeyCode::Char('p') => Command::Menu,
         KeyCode::Left => Command::Pan(-1, 0),
         KeyCode::Right => Command::Pan(1, 0),
         KeyCode::Up => Command::Pan(0, -1),
@@ -470,7 +516,6 @@ fn command_for(code: KeyCode) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ScaleMode;
     use crate::render::Layout;
 
     fn key(code: KeyCode, kind: KeyEventKind, mods: KeyModifiers) -> KeyEvent {
@@ -720,6 +765,68 @@ mod tests {
             command_for(KeyCode::Char('v')),
             Some(Command::ToggleViewOnly)
         );
+        assert_eq!(command_for(KeyCode::Char('c')), Some(Command::ToggleStats));
+        // The menu, and the only key that opens it.
+        assert_eq!(command_for(KeyCode::Char('p')), Some(Command::Menu));
+        assert!(
+            ('a'..='z')
+                .filter(|c| command_for(KeyCode::Char(*c)) == Some(Command::Menu))
+                .eq(['p']),
+            "more than one key opens the menu, or none does"
+        );
+        for gone in ['h', '?'] {
+            assert_eq!(command_for(KeyCode::Char(gone)), None, "{gone} still binds");
+        }
+    }
+
+    #[test]
+    fn the_menu_swallows_what_would_have_reached_the_remote() {
+        let mut input = InputMapper::new('a', true, true);
+        assert_eq!(
+            input.on_key_local(press(KeyCode::Char('x'))),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(
+            input.on_key_local(release(KeyCode::Char('x'))),
+            KeyOutcome::Ignored
+        );
+        // The point of swallowing it here rather than dropping what comes back: a
+        // translated press is recorded as held, and would be released later for a key
+        // the server was never told about.
+        assert!(
+            input.release_all().is_empty(),
+            "a swallowed press must not be remembered as held"
+        );
+    }
+
+    #[test]
+    fn the_menu_still_lets_go_of_a_key_held_before_it_opened() {
+        let mut input = InputMapper::new('a', true, true);
+        let KeyOutcome::Keys(_) = input.on_key(press(KeyCode::Char('x'))) else {
+            panic!("the press should have gone to the remote");
+        };
+        let KeyOutcome::Keys(events) = input.on_key_local(release(KeyCode::Char('x'))) else {
+            panic!("the release was swallowed, so the key stays down on the remote");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].down);
+        assert!(input.release_all().is_empty(), "and it is no longer held");
+    }
+
+    #[test]
+    fn the_prefix_window_works_while_the_menu_is_up() {
+        // The menu is the list of what the prefix does, so the keys it lists have to
+        // work while it is being read.
+        let mut input = InputMapper::new('a', true, true);
+        assert_eq!(
+            input.on_key_local(ctrl('a', KeyEventKind::Press)),
+            KeyOutcome::Ignored
+        );
+        assert!(input.is_armed());
+        assert_eq!(
+            input.on_key_local(press(KeyCode::Char('q'))),
+            KeyOutcome::Local(Command::Quit)
+        );
     }
 
     #[test]
@@ -775,6 +882,32 @@ mod tests {
             (events[0].position_x, events[0].position_y),
             (4 * 8 + 4, 5 * 17 + 8)
         );
+    }
+
+    #[test]
+    fn the_cell_under_the_pointer_is_found_either_way_round() {
+        // What the menu is hit-tested against. With mode 1016 the event carries
+        // pixels and has to be divided back down; without it the event is already
+        // cells, and going out to the middle of one and back has to land on the cell
+        // it started from.
+        let m = metrics();
+        let at = |column, row| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let pixels = InputMapper::new('a', true, true);
+        assert_eq!(pixels.terminal_cell(&at(0, 0), &m), (0, 0));
+        assert_eq!(
+            pixels.terminal_cell(&at(8 * 12 + 3, 17 * 7 + 9), &m),
+            (12, 7)
+        );
+
+        let cells = InputMapper::new('a', true, false);
+        for (col, row) in [(0, 0), (12, 7), (m.cols - 1, m.rows - 1)] {
+            assert_eq!(cells.terminal_cell(&at(col, row), &m), (col, row));
+        }
     }
 
     #[test]
