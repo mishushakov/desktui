@@ -151,17 +151,17 @@ impl Transfer {
             // not small. Measured on a full-screen 1600x832 update in 91 tiles
             // (`cargo test --release --test perf -- --ignored --nocapture`):
             //
-            //   pack BGRA->RGB into a buffer     1.0 ms/frame
-            //   direct: +zlib +base64           13.7 ms/frame   ->   73 fps ceiling
-            //   shm: object per tile             1.5 ms/frame   ->  654 fps ceiling
-            //   shm: per tile, packed in place   0.9 ms/frame   -> 1171 fps ceiling
+            //   pack BGRA->RGB into a buffer     1.1 ms/frame
+            //   direct: +zlib +base64           14.0 ms/frame   ->   71 fps ceiling
+            //   shm: object per tile             1.6 ms/frame   ->  633 fps ceiling
+            //   shm: per tile, packed in place   0.9 ms/frame   -> 1124 fps ceiling
             //
             // zlib is the whole story on the direct path. On the shared memory one it
             // is the pack: writing into the mapping rather than into a buffer for a
             // copy to follow is most of the difference between the last two rows. One
-            // object for the whole frame would be faster still -- five system calls
-            // rather than five a tile -- but Ghostty draws nothing for a placement
-            // carrying an `O=` offset; see RENDERING.md. The probe is what makes this
+            // object for the whole frame would be faster still -- 0.7 ms/frame, also
+            // measured -- but an object can be placed only once, because the terminal
+            // unlinks what it reads; see RENDERING.md. The probe is what makes this
             // safe to default to --
             // frames go out with responses suppressed, so a medium the terminal
             // cannot handle would fail invisibly, and silence about `t=s` sends us

@@ -340,9 +340,10 @@ fn pixels_travel_through_shared_memory_when_the_terminal_offers_it() {
     // An object per tile, each holding only that tile, and no `O=`/`S=` keys.
     //
     // The protocol has them, and one object per frame with an offset per tile would be
-    // five system calls a frame rather than five a tile -- but Ghostty draws nothing at
-    // all for a placement carrying them, and with `q=2` it does not say why. This asserts
-    // the shape that works, so the other one cannot come back without an answer.
+    // five system calls a frame rather than five a tile -- but the terminal unlinks an
+    // object once it has read it, so only the first tile placed out of one can find it.
+    // Ghostty and kitty both draw the frame's first tile and nothing else. This asserts
+    // the shape that works; RENDERING.md has the shape that would.
     let frame = frame_containing(&output, b"f=24,t=s,i=").expect("no frame carried a tile");
     let placements = shm_placements(frame);
     assert!(

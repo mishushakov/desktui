@@ -306,10 +306,10 @@ fn full_screen_compose_throughput() {
         total,
     );
 
-    // And the way it would be done if `O=` worked: one object for the frame, every tile
-    // packed into it at an offset of its own. Five system calls a frame rather than five a
-    // tile -- but Ghostty draws nothing for a placement carrying an offset, so this is a
-    // measurement of the road not taken. See RENDERING.md.
+    // One object for the frame, every tile packed into it at an offset of its own: five
+    // system calls a frame rather than five a tile. Not what the renderer does -- an object
+    // can only be read once, because the terminal unlinks it -- but the row is the floor a
+    // single transmission per frame would be working towards. See RENDERING.md.
     let frame_bytes: usize = tiles.iter().map(|&(_, _, w, h)| (w * h * 3) as usize).sum();
     let start = Instant::now();
     let mut total = 0;
@@ -324,8 +324,8 @@ fn full_screen_compose_throughput() {
     println!(
         "The pack row appends into a buffer, which is what the direct medium still does;\n\
          the rows below it pack into the mapping instead, so they come out under it.\n\
-         One object per frame is what `O=` would buy: see RENDERING.md for why it is not\n\
-         what the renderer does."
+         The last row is the syscall floor of one object per frame, which needs one\n\
+         transmission per frame to reach: see RENDERING.md."
     );
     println!("A partial update costs proportionally less. Server-side encoding, JPEG");
     println!("decode and the terminal's own work all come on top.");

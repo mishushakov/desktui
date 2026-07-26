@@ -207,10 +207,10 @@ Measured on a 1600x832 update in 91 tiles, single threaded
 
 | stage | per frame | ceiling |
 |---|---|---|
-| pack BGRA → RGB into a buffer | 1.0 ms | 988 fps |
-| `direct`: + zlib + base64 | 13.7 ms | **73 fps** |
-| `shm`: an object per tile, packed then copied | 1.5 ms | **654 fps** |
-| `shm`: an object per tile, packed in place | 0.9 ms | **1171 fps** |
+| pack BGRA → RGB into a buffer | 1.1 ms | 914 fps |
+| `direct`: + zlib + base64 | 14.0 ms | **71 fps** |
+| `shm`: an object per tile, packed then copied | 1.6 ms | **633 fps** |
+| `shm`: an object per tile, packed in place | 0.9 ms | **1124 fps** |
 
 zlib is the whole story on the direct path: compression and base64 cost twelve
 milliseconds that shared memory does not pay at all. On the shared memory path it is the
@@ -218,9 +218,10 @@ pack — writing straight into the mapping the terminal will read, rather than i
 for a copy to follow, which is why the last row comes in below the buffered pack above it.
 
 One object for the whole frame instead of one per tile would be faster still, five system
-calls rather than five per tile, and the protocol has the keys for it (`O=`/`S=`). Ghostty
-draws nothing for a placement carrying them, so that is not what this does —
-[`RENDERING.md`](RENDERING.md) has the details.
+calls rather than five per tile, and the protocol has the keys for it (`O=`/`S=`): 0.7 ms
+a frame, also measured. It cannot be reached a tile at a time, because a terminal unlinks
+a shared memory object once it has read it, so only the first tile placed out of one ever
+finds it — [`RENDERING.md`](RENDERING.md) has the finding and the shape that would work.
 
 So on a local terminal, full-screen motion is not CPU-bound on this side; over SSH, where
 shared memory cannot work, expect the compression ceiling. Server-side encoding and JPEG
