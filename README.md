@@ -40,7 +40,8 @@ collides with tmux.
 
 ## Installing
 
-Needs a Rust toolchain that speaks edition 2024 (1.85 or newer).
+Needs Rust 1.88 or newer. Edition 2024 alone would only ask for 1.85, but the
+terminal probe uses let-chains, which became stable in 1.88.
 
 ```
 cargo install desktui --locked

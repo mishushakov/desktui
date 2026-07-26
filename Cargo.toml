@@ -2,6 +2,10 @@
 name = "desktui"
 version = "0.1.0"
 edition = "2024"
+# Not the 1.85 that edition 2024 alone would need: the terminal probe uses
+# let-chains, stable since 1.88, and fast_image_resize asks for 1.87. Verified by
+# building on 1.87 (fails) and 1.88 (succeeds).
+rust-version = "1.88"
 license = "MIT"
 description = "A remote desktop client for your terminal"
 repository = "https://github.com/mishushakov/desktui"
