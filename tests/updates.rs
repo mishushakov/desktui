@@ -29,8 +29,8 @@ fn a_frame_is_never_composed_from_half_an_update() {
     //
     // The client's own deadline is put out of reach for the run: it may draw a seam rather
     // than let the screen stand still, and a machine loaded enough will cross any wall-clock
-    // deadline. With it out of the way every seam below is the client failing to wait, which
-    // is the claim. `a_stalled_update_is_drawn_rather_than_left_standing` is the other half.
+    // deadline. With it out of the way, every seam below is the client failing to wait, which
+    // is the claim. TESTING.md says why the deadline itself is not asserted from out here.
     let (_server, mut term) = start_with_env(
         Extensions {
             split_updates: true,
@@ -86,52 +86,6 @@ fn a_frame_is_never_composed_from_half_an_update() {
          to be over. The frames in question:\n{}",
         whole + half,
         torn.join("\n\n")
-    );
-
-    quit(&mut term);
-    term.wait(Duration::from_secs(10));
-}
-
-#[test]
-fn a_stalled_update_is_drawn_rather_than_left_standing() {
-    // The other side of the rule above. Waiting for an update to be whole cannot be
-    // unconditional: a server that takes half a second over one would freeze the screen for
-    // half a second, and a seam is the lesser evil. So the wait has a deadline, and past it
-    // the client draws what it holds.
-    //
-    // Set well under the stall here, where every other test puts it out of reach, so the
-    // deadline is certain to be crossed inside every stall rather than merely likely to be.
-    let (_server, mut term) = start_with_env(
-        Extensions {
-            split_updates: true,
-            ..Default::default()
-        },
-        (1024, 768),
-        &[],
-        &[("DESKTUI_MAX_PARTIAL_WAIT_MS", "20")],
-    );
-    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(10));
-    let settled = term.output().len();
-    std::thread::sleep(SPLIT_STALL * 10);
-
-    let first = tile_id(SPLIT_FIRST);
-    let second = [tile_id(SPLIT_SECOND), tile_id((SPLIT_SECOND.0, 320))];
-    let out = term.output();
-    let half = blocks(&out[settled..])
-        .into_iter()
-        .filter(|block| {
-            let drew_first = contains(block, transmit(first).as_bytes());
-            let drew_second = second
-                .iter()
-                .any(|id| contains(block, transmit(*id).as_bytes()));
-            drew_first != drew_second
-        })
-        .count();
-    assert!(
-        half > 0,
-        "no frame was drawn inside a stall, so the screen stood still for every one of \
-         them instead: {}",
-        tail(&out)
     );
 
     quit(&mut term);

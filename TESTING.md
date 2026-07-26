@@ -132,11 +132,10 @@ rather than let the screen stand still. No test can prove the right side of that
 outside: what reaches the terminal says which rectangles a frame carried, never how long the
 client had waited for them, and a machine loaded enough -- the whole suite in parallel,
 several servers and ptys at once -- crosses any wall-clock deadline eventually. So
-`DESKTUI_MAX_PARTIAL_WAIT_MS` sets it: `a_frame_is_never_composed_from_half_an_update` puts
-it a minute out of reach, so every seam is the client failing to wait, and
-`a_stalled_update_is_drawn_rather_than_left_standing` sets it far under the stall, so a
-screen that stood still is the client failing to give up. Each can fail for one reason. The
-env var is a test seam and says so where it is defined -- it is not a command-line option.
+`DESKTUI_MAX_PARTIAL_WAIT_MS` puts it a minute out of reach for
+`a_frame_is_never_composed_from_half_an_update`, and every seam that test sees is then the
+client failing to wait, with nothing about the machine's speed in it. The env var is a test
+seam and says so where it is defined -- it is not a command-line option.
 
 **And a claim about the steady state opens once the session has reached it.** Both of those
 count frames from the moment the bar reports the negotiated size, not from the first frame
@@ -167,6 +166,15 @@ saying why the session stopped.
 
 **`perf.rs`** is a measurement, not an assertion. A shared runner cannot make it
 honestly.
+
+**The deadline on waiting for a whole update is not asserted from outside**, though the
+waiting is. Setting it low and looking for the seam it permits was tried and does not work:
+a client drawing every 66ms while updates arrive every 110ms puts the first half of one
+update in the same frame as the second half of the last, so the frames a torn client
+produces read as whole ones and the test passes either way. It passed on macOS and failed on
+Linux for exactly that reason, which is a test measuring alignment rather than behaviour. The
+deadline is one comparison against one constant in `session.rs`; what needs proving from out
+here is that the client waits at all.
 
 **Fragmented delivery is not tested**, on purpose. noVNC feeds its decoders a byte at a
 time to break code that assumes a whole message arrived, because it hand-rolls a receive
