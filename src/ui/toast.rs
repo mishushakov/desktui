@@ -20,16 +20,14 @@
 //! underneath as it crosses a note it has already read. The session offers the pointer
 //! here before the menu, the popup being drawn over the menu -- see `session`.
 
-use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Widget};
 
-use super::paint::write_cells;
+use super::chrome::Chrome;
 use super::theme::{Palette, colour};
 // The button is the menu's, not one of the popup's own: the way to close a thing should
 // look the same wherever it is.
@@ -120,12 +118,6 @@ fn close_at(area: Rect) -> Rect {
 pub struct Toast {
     /// The message and when it went up.
     showing: Option<(String, Instant)>,
-    /// The cells the popup was last drawn on. Recorded rather than worked out again
-    /// when it comes off: the box is as wide as its message, and a message replaced or
-    /// a terminal resized in between would put it somewhere else.
-    drawn: Option<Rect>,
-    /// Cells a popup has left behind, which stay written until they are blanked.
-    stale: Option<Rect>,
     /// The pointer is on the button, which is drawn lit while it is.
     hover: bool,
 }
@@ -133,29 +125,40 @@ pub struct Toast {
 impl Toast {
     /// Put a note up, replacing whatever was there.
     ///
-    /// True when the popup that went has left cells behind, which is when the remote
-    /// screen under them has to be drawn back.
-    pub fn show(&mut self, text: String) -> bool {
-        // The outgoing box is not simply drawn over: a shorter message makes a
-        // narrower one, and the cells past it would keep the old backdrop.
-        let left_behind = self.take_down();
+    /// A shorter message makes a narrower box, and a replaced note may be somewhere else
+    /// entirely -- neither of which is this type's problem any more. It renders what it has
+    /// and the chrome's diff blanks whatever the last frame drew and this one does not.
+    pub fn show(&mut self, text: String) {
         self.showing = Some((text, Instant::now()));
-        left_behind
     }
 
-    /// Take a note that has run out off the screen. True on the frame it goes, with
-    /// the same meaning as [`Toast::show`]'s.
+    /// Take a note that has run out off the screen. True on the frame it goes, so the
+    /// caller knows a frame is owed.
     pub fn expire(&mut self) -> bool {
         match &self.showing {
-            Some((_, at)) if at.elapsed() >= LINGER => self.take_down(),
+            Some((_, at)) if at.elapsed() >= LINGER => {
+                self.take_down();
+                true
+            }
             _ => false,
         }
     }
 
-    /// Take a note off before its linger is up, the button having been clicked. True
-    /// with the same meaning as [`Toast::show`]'s.
+    /// Take a note off before its linger is up, the button having been clicked. True if
+    /// there was one.
     pub fn dismiss(&mut self) -> bool {
-        self.take_down()
+        let was_up = self.showing.is_some();
+        self.take_down();
+        was_up
+    }
+
+    /// Take the note off, and put the button out with it.
+    ///
+    /// The button matters: without this the next note arrives already lit, before the
+    /// pointer has moved to say it is on it.
+    fn take_down(&mut self) {
+        self.showing = None;
+        self.hover = false;
     }
 
     /// Is the pointer at zero-based cell `(col, row)` on the button?
@@ -185,52 +188,8 @@ impl Toast {
         Some(close_at(area(metrics, text)?))
     }
 
-    /// Is there a note up? A session with one has something to redraw even when no
-    /// frame has arrived.
-    pub fn is_live(&self) -> bool {
-        self.showing.is_some()
-    }
-
-    fn take_down(&mut self) -> bool {
-        self.showing = None;
-        // Or the next note would arrive with its button already lit, before the pointer
-        // has moved to say so.
-        self.hover = false;
-        match self.drawn.take() {
-            Some(area) => {
-                self.stale = Some(area);
-                true
-            }
-            // Never drawn -- a note replaced inside a single frame -- so there is
-            // nothing on the screen to take off.
-            None => false,
-        }
-    }
-
-    /// Blank the cells the last popup left, if any.
-    ///
-    /// Goes out before the frame's tiles, as the menu's erase does: a terminal may
-    /// treat clearing a cell as dropping the placement under it.
-    pub fn clear(&self, out: &mut Vec<u8>) {
-        let Some(area) = self.stale else {
-            return;
-        };
-        out.extend_from_slice(b"\x1b[0m");
-        for y in area.top()..area.bottom() {
-            let _ = write!(out, "\x1b[{};{}H", y + 1, area.x + 1);
-            out.extend(std::iter::repeat_n(b' ', usize::from(area.width)));
-        }
-        kitty::delete_image(out, kitty::TOAST_IMAGE_ID);
-    }
-
-    /// The frame carrying the erase reached the terminal, so the cells are clean.
-    /// A dropped frame leaves the record standing and the next one blanks them again.
-    pub fn commit(&mut self) {
-        self.stale = None;
-    }
-
     /// Draw the note, if there is one, over the top-right of the remote screen.
-    pub fn draw(&mut self, out: &mut Vec<u8>, metrics: &Metrics, ink: &Palette) {
+    pub fn render(&self, chrome: &mut Chrome, out: &mut Vec<u8>, metrics: &Metrics, ink: &Palette) {
         let Some((text, _)) = &self.showing else {
             return;
         };
@@ -250,12 +209,13 @@ impl Toast {
             usize::from(area.height),
             ink.paper,
         );
-        let mut buf = Buffer::empty(area);
+        chrome.keep(kitty::TOAST_IMAGE_ID);
+        let buf = chrome.buffer();
         let block = Block::new()
             .padding(Padding::symmetric(PAD_X, PAD_Y))
             .style(Style::new().bg(colour(ink.paper)).fg(colour(ink.ink)));
         let inner = block.inner(area);
-        block.render(area, &mut buf);
+        block.render(area, buf);
         // Given the room the button and the gap leave rather than the whole inside, so a
         // long message is clipped short of the button instead of up against it. One line
         // however long it is: a wrapped note is a box that changes height as it is read.
@@ -267,17 +227,13 @@ impl Toast {
             text.as_str(),
             Style::new().fg(colour(ink.ink)),
         ))
-        .render(said, &mut buf);
+        .render(said, buf);
         // The palette's own styling for the button, quiet or lit, which is the styling the
         // menu's title gives the same button: one definition, so pointing at either does
         // the same thing. Colour and nothing else, which is also the one kind of highlight
         // that needs no image of its own -- a background here would be painted under the
         // remote screen and never seen.
-        Line::from(Span::styled(CLOSE, ink.close_button(self.hover)))
-            .render(close_at(area), &mut buf);
-        write_cells(out, &buf);
-
-        self.drawn = Some(area);
+        Line::from(Span::styled(CLOSE, ink.close_button(self.hover))).render(close_at(area), buf);
     }
 
     /// Push the note back in time, so a test can reach its expiry without waiting out
@@ -330,12 +286,29 @@ mod tests {
         }
     }
 
-    /// A popup on screen, and the bytes that put it there.
-    fn shown(m: &Metrics, text: &str) -> (Toast, Vec<u8>) {
+    /// Render a popup the way a frame does -- into the chrome's plane -- and serialise what
+    /// came out, so the assertions below can go on reading escapes.
+    fn draw_toast(toast: &Toast, chrome: &mut Chrome, m: &Metrics, ink: &Palette) -> Vec<u8> {
+        chrome.begin(m);
+        let mut out = Vec::new();
+        toast.render(chrome, &mut out, m, ink);
+        chrome.flush(&mut out);
+        chrome.commit();
+        out
+    }
+
+    /// A popup on screen, the plane it is on, and the bytes that put it there.
+    fn shown_on(m: &Metrics, text: &str) -> (Toast, Chrome, Vec<u8>) {
         let mut toast = Toast::default();
         toast.show(text.to_string());
-        let mut out = Vec::new();
-        toast.draw(&mut out, m, ink());
+        let mut chrome = Chrome::new();
+        let out = draw_toast(&toast, &mut chrome, m, ink());
+        (toast, chrome, out)
+    }
+
+    /// The same, for the tests that never take it off again.
+    fn shown(m: &Metrics, text: &str) -> (Toast, Vec<u8>) {
+        let (toast, _, out) = shown_on(m, text);
         (toast, out)
     }
 
@@ -453,7 +426,12 @@ mod tests {
         let mut toast = Toast::default();
         toast.show("scaling: scaled".into());
         let mut out = Vec::new();
-        toast.draw(&mut out, &m, Theme::Light.palette());
+        out.extend(draw_toast(
+            &toast,
+            &mut Chrome::new(),
+            &m,
+            Theme::Light.palette(),
+        ));
         let text = String::from_utf8(out).unwrap();
         let light = Theme::Light.palette();
         assert!(text.contains(&bg(light.paper)) && text.contains(&fg(light.ink)));
@@ -545,7 +523,7 @@ mod tests {
 
         toast.set_hover(true);
         let mut out = Vec::new();
-        toast.draw(&mut out, &m, ink);
+        out.extend(draw_toast(&toast, &mut Chrome::new(), &m, ink));
         let lit = String::from_utf8(out).unwrap();
         assert!(
             inked(&lit, ink.accent).contains(CLOSE),
@@ -579,14 +557,12 @@ mod tests {
     #[test]
     fn the_button_takes_the_note_off_before_its_linger_is_up() {
         let m = metrics(80, 24);
-        let (mut toast, _) = shown(&m, "remote clipboard copied");
+        let (mut toast, mut chrome, _) = shown_on(&m, "remote clipboard copied");
         toast.set_hover(true);
-        assert!(toast.dismiss(), "the box was left standing");
-        assert!(!toast.is_live());
+        assert!(toast.dismiss(), "there was no box to take off");
 
-        let mut out = Vec::new();
-        toast.clear(&mut out);
-        let text = String::from_utf8(out).unwrap();
+        // Nothing asks for the cells back: the note is simply not in the next frame.
+        let text = String::from_utf8(draw_toast(&toast, &mut chrome, &m, ink())).unwrap();
         assert!(
             rows(text.as_bytes())
                 .iter()
@@ -598,7 +574,7 @@ mod tests {
         // The next note is not lit before the pointer has said so.
         toast.show("full refresh requested".into());
         let mut out = Vec::new();
-        toast.draw(&mut out, &m, ink());
+        out.extend(draw_toast(&toast, &mut Chrome::new(), &m, ink()));
         let text = String::from_utf8(out).unwrap();
         assert!(inked(&text, ink().muted).contains(CLOSE));
     }
@@ -617,20 +593,16 @@ mod tests {
     #[test]
     fn a_note_stays_for_its_linger_and_then_comes_off() {
         let m = metrics(80, 24);
-        let (mut toast, out) = shown(&m, "renegotiating the remote size");
+        let (mut toast, mut chrome, out) = shown_on(&m, "renegotiating the remote size");
         assert!(!out.is_empty());
         assert!(!toast.expire(), "took the note off before its time");
-        assert!(toast.is_live());
 
         toast.age(LINGER);
         assert!(toast.expire(), "the note outstayed its linger");
-        assert!(!toast.is_live());
 
         // Blanked cells and a dropped backdrop: the message is text, which no repaint
         // of the tiles under it would erase.
-        let mut out = Vec::new();
-        toast.clear(&mut out);
-        let text = String::from_utf8(out).unwrap();
+        let text = String::from_utf8(draw_toast(&toast, &mut chrome, &m, ink())).unwrap();
         assert_eq!(
             rows(text.as_bytes()).len(),
             3,
@@ -647,63 +619,62 @@ mod tests {
         );
         assert!(!text.contains("renegotiating"), "redrew what it took off");
 
-        // Nothing more to do once the frame carrying it has gone out.
-        toast.commit();
-        let mut out = Vec::new();
-        toast.clear(&mut out);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn a_dropped_frame_leaves_the_erase_to_the_next_one() {
-        let m = metrics(80, 24);
-        let (mut toast, _) = shown(&m, "renegotiating the remote size");
-        toast.age(LINGER);
-        toast.expire();
-
-        // Written but never submitted, so the cells are still on screen and the second
-        // frame has to carry the same erase.
-        let mut first = Vec::new();
-        toast.clear(&mut first);
-        let mut second = Vec::new();
-        toast.clear(&mut second);
-        assert!(!first.is_empty());
-        assert_eq!(first, second);
+        // And nothing more to say on the frame after that.
+        let again = draw_toast(&toast, &mut chrome, &m, ink());
+        assert!(again.is_empty(), "kept erasing what was already gone");
     }
 
     #[test]
     fn a_replaced_note_takes_the_wider_box_off_with_it() {
-        // A shorter message makes a narrower box, so the cells past it would keep the
-        // old backdrop unless they are blanked.
+        // A shorter message makes a narrower box, so the cells past it would keep the old
+        // backdrop unless they are blanked. Which nobody arranges: the wide box is in the
+        // last frame's plane and not in this one's.
         let m = metrics(80, 24);
-        let (mut toast, _) = shown(&m, "a good deal longer than the next one");
-        assert!(toast.show("brief".into()), "the old box was left standing");
+        let long = "a good deal longer than the next one";
+        let (mut toast, mut chrome, _) = shown_on(&m, long);
+        let wide = area(&m, long).expect("the first box did not fit");
 
-        let mut out = Vec::new();
-        toast.clear(&mut out);
-        let blanked = rows(&out);
-        assert_eq!(blanked.len(), 3);
-        let width = area(&m, "a good deal longer than the next one")
-            .expect("the first box did not fit")
-            .width;
+        toast.show("brief".into());
+        let text = String::from_utf8(draw_toast(&toast, &mut chrome, &m, ink())).unwrap();
+        let written = rows(text.as_bytes());
+        assert_eq!(written.len(), usize::from(wide.height));
         assert!(
-            blanked
-                .iter()
-                .all(|(.., text)| text.chars().count() == usize::from(width)),
-            "the erase has to cover the box that was drawn, not the one replacing it"
+            written.iter().all(|(_, col, _)| *col == wide.x + 1),
+            "the erase has to start where the wide box started, not where the narrow one \
+             does: {written:?}"
         );
+        // Only the cells the diff found different, so the far right -- blank in both boxes
+        // -- is left alone. What matters is that nothing of the old box is still readable.
+        let narrow = area(&m, "brief").expect("the second box did not fit");
+        let left_of_it = usize::from(narrow.x - wide.x);
+        assert!(
+            written
+                .iter()
+                .all(|(_, _, text)| text.chars().take(left_of_it).all(|c| c == ' ')),
+            "the part the new box does not cover has to be blank: {written:?}"
+        );
+        assert!(text.contains("brief"), "and the new note drawn: {text:?}");
     }
 
     #[test]
-    fn a_note_replaced_before_it_was_drawn_leaves_nothing_behind() {
-        let mut toast = Toast::default();
-        toast.show("never drawn".into());
+    fn a_note_stays_put_when_the_window_changes_width() {
+        // The box is anchored to the top right, so a window of another width puts it
+        // somewhere else -- and the note stays up across a resize. Nothing else would take
+        // the old one off: a relayout no longer erases the screen, and the box drawn where
+        // it now belongs does not reach where it was.
+        let wide = metrics(80, 24);
+        let (toast, mut chrome, _) = shown_on(&wide, "still up");
+        let was = area(&wide, "still up").expect("the box did not fit");
+
+        let narrow = metrics(60, 24);
+        let text = String::from_utf8(draw_toast(&toast, &mut chrome, &narrow, ink())).unwrap();
+        let now = area(&narrow, "still up").expect("the box did not fit");
+        assert_ne!(was.x, now.x, "the box was supposed to move");
+        let written = rows(text.as_bytes());
         assert!(
-            !toast.show("nor this".into()),
-            "nothing reached the screen, so nothing has to be taken off it"
+            written.iter().any(|(_, col, _)| *col == now.x + 1),
+            "drawn where it now belongs: {written:?}"
         );
-        let mut out = Vec::new();
-        toast.clear(&mut out);
-        assert!(out.is_empty());
+        assert!(text.contains("still up"), "and still says what it said");
     }
 }

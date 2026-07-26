@@ -30,6 +30,7 @@ use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
+use crate::ui::chrome::Chrome;
 use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
 use crate::ui::theme::Theme;
@@ -40,14 +41,44 @@ use crate::ui::toast::Toast;
 /// stop redrawing.
 const UPDATE_WATCHDOG: Duration = Duration::from_secs(1);
 
-/// Terminal resizes arrive in a stream while a window is dragged. Waiting this
-/// long after the last one keeps us from asking the server to resize dozens of
-/// times.
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Shortest gap between two resizes being acted on.
+///
+/// Terminal resizes arrive in a stream while a window is dragged, and each one adopted
+/// is a relayout and a request to the server. A rate limit rather than a quiet period:
+/// the first resize after a lull is acted on at once and the stream behind it is thinned
+/// to this, so a drag is answered as it happens instead of after it.
+///
+/// The same hundred milliseconds TigerVNC and noVNC settled on -- and TigerVNC
+/// deliberately moved *away* from a 500ms idle period, because waiting for a drag to
+/// finish makes maximising or going full screen feel like it did not take.
+const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Floor on the gap between two update requests, so a server that answers an
 /// incremental request instantly cannot spin us at full speed.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
+
+/// How long a frame will wait for the update it would be drawing to finish arriving,
+/// measured from the arrival of that update's first rectangle.
+///
+/// Past this it draws anyway. An update whose rectangles take longer than this to
+/// arrive cannot be drawn whole *and* often, and a screen that stands still is worse
+/// than one that shows a seam: the choice only comes up when the link or the server is
+/// already too slow to keep up.
+const MAX_PARTIAL_WAIT: Duration = Duration::from_millis(250);
+
+/// Overrides [`MAX_PARTIAL_WAIT`], in milliseconds. A seam for the tests, not an option:
+/// a test that means to prove a frame *waits* has to be able to take the deadline off the
+/// table, because nothing on the wire distinguishes a seam the client was entitled to draw
+/// from the bug of drawing one it was not -- and a shared machine under load will cross any
+/// wall-clock deadline eventually. Read once, at the start of a session.
+const PARTIAL_WAIT_ENV: &str = "DESKTUI_MAX_PARTIAL_WAIT_MS";
+
+fn max_partial_wait() -> Duration {
+    std::env::var(PARTIAL_WAIT_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(MAX_PARTIAL_WAIT, Duration::from_millis)
+}
 
 /// How often to measure the round trip, once frames stop being requested.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -137,7 +168,7 @@ pub async fn run<C: Connect>(
         };
 
         let mut session = Session::new(args, caps, backend).await?;
-        let result = session.run(args).await;
+        let result = session.run().await;
         // Let go of anything held on the remote before leaving, so a modifier does
         // not stay stuck in whatever had focus over there.
         session.release_input().await;
@@ -244,22 +275,53 @@ struct Session<B: Backend> {
     /// Which palette the chrome wears. Dark to start, the bar having been that colour
     /// before there was a choice.
     theme: Theme,
+    /// The cells the client owns, diffed frame to frame so taking chrome off the screen is
+    /// the same operation as putting it on.
+    chrome: Chrome,
     /// The command menu, and where the pointer is on it.
     menu: Menu,
     show_menu: bool,
-    /// The menu was dismissed and its cells still have to be blanked. Drawing
-    /// the image over them does not do it: the image sits below the text.
-    clear_menu: bool,
+    /// The wipe a relayout asks for, waiting for the frame that fills the screen
+    /// back in. Written on its own it is a blank screen that lasts until the next
+    /// frame composes, which is what a resize looked like; carried into that frame's
+    /// synchronised block, the old picture stands until the new one replaces it.
+    pending_cleanup: Vec<u8>,
     show_stats: bool,
     /// The notification popup in the top-right corner, and the note it is showing.
     toast: Toast,
 
     fps: FpsMeter,
+    /// How long a frame is allowed, from `--fps`. What the render tick is paced by, and
+    /// what says whether a frame is owed when an update finishes arriving.
+    frame_time: Duration,
+    /// Where the pointer is, in terminal pixels, so it can be put back after a resize.
+    pointer_px: Option<(u32, u32)>,
+    /// A rectangle of the update being received has been applied and the update is not
+    /// over. Drawing now would put half of one picture on the screen and half of
+    /// another -- which on a page being scrolled is half of it at each scroll position.
+    mid_update: bool,
+    /// How long that wait is allowed to last: [`MAX_PARTIAL_WAIT`], or whatever
+    /// [`PARTIAL_WAIT_ENV`] said when the session started.
+    max_partial_wait: Duration,
+    /// When the update being received started arriving, and how much of the picture it
+    /// has carried so far.
+    ///
+    /// The other end's half of the statistics. Everything else in the bar is this side --
+    /// our frame rate, our tiles, our bytes -- so a session that crawls because the
+    /// server is re-encoding a whole screen looks exactly like one that crawls because we
+    /// are. These say which: an update rate well under the frame rate is a server that
+    /// cannot keep up, whatever this end manages.
+    update_started: Option<Instant>,
+    update_pixels: u64,
+    /// Updates that carried picture, as a rate, and what the last one cost.
+    updates: FpsMeter,
+    delivery: Option<Duration>,
+    last_update_pixels: u64,
     last_stats: FrameStats,
     dropped: u64,
     pending_metrics: Option<Instant>,
-    /// When a resize was last acted on, so the first one after a quiet spell can be
-    /// acted on at once rather than waiting out the debounce.
+    /// When a resize was last acted on, which is what [`RESIZE_INTERVAL`] is measured
+    /// from: the first after a lull goes through at once, and a stream is thinned.
     metrics_applied_at: Option<Instant>,
     quit: bool,
 }
@@ -307,12 +369,22 @@ impl<B: Backend> Session<B> {
             no_clipboard: args.no_clipboard,
             clipboard_lossy: true,
             theme: Theme::Dark,
+            chrome: Chrome::new(),
             menu: Menu::new(args.prefix_char()),
             show_menu: false,
-            clear_menu: false,
+            pending_cleanup: Vec::new(),
             show_stats: false,
             toast: Toast::default(),
             fps: FpsMeter::new(),
+            frame_time: Duration::from_micros(1_000_000 / u64::from(args.fps)),
+            mid_update: false,
+            max_partial_wait: max_partial_wait(),
+            pointer_px: None,
+            update_started: None,
+            update_pixels: 0,
+            updates: FpsMeter::new(),
+            delivery: None,
+            last_update_pixels: 0,
             last_stats: FrameStats::default(),
             dropped: 0,
             pending_metrics: None,
@@ -321,9 +393,9 @@ impl<B: Backend> Session<B> {
         })
     }
 
-    async fn run(&mut self, args: &Args) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         let mut terminal = EventStream::new();
-        let mut ticker = interval(Duration::from_micros(1_000_000 / u64::from(args.fps)));
+        let mut ticker = interval(self.frame_time);
         // Falling behind should drop frames, not queue them up to be raced
         // through later.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -347,6 +419,26 @@ impl<B: Backend> Session<B> {
     }
 
     async fn on_update(&mut self, update: Update) -> Result<()> {
+        // Anything that changes the picture opens an update, and `FrameEnd` closes it. The
+        // rectangles between the two are one picture and belong on the screen together.
+        //
+        // An update of nothing but pseudo-rectangles -- a cursor shape, a layout, the lock
+        // keys -- is not a picture and does not open one, which is also what keeps it out
+        // of the delivery figures.
+        if matches!(
+            update,
+            Update::Bgra(..) | Update::Jpeg(..) | Update::Copy { .. }
+        ) {
+            self.mid_update = true;
+            self.update_started.get_or_insert_with(Instant::now);
+            self.update_pixels += match &update {
+                Update::Bgra(rect, _) | Update::Jpeg(rect, _) => {
+                    u64::from(rect.width) * u64::from(rect.height)
+                }
+                Update::Copy { dst, .. } => u64::from(dst.width) * u64::from(dst.height),
+                _ => 0,
+            };
+        }
         match update {
             Update::Bgra(rect, data) => {
                 if let Some(damage) = self.fb.apply_bgra(convert(rect), &data) {
@@ -397,6 +489,23 @@ impl<B: Backend> Session<B> {
                 // whole frame interval, which roughly halves the rate a moving
                 // picture can reach.
                 self.request_update().await?;
+
+                // And now the picture is whole, so draw it -- rather than leaving it to a
+                // tick, which would add latency for nothing. The render tick's job is to
+                // pace this, not to choose the moment: a frame is owed only if one has not
+                // gone out inside the last frame interval.
+                self.mid_update = false;
+                // What the other end just took to deliver one picture, before drawing it:
+                // the delivery is the server's, the frame that follows is ours, and telling
+                // them apart is the whole point of measuring here.
+                if let Some(at) = self.update_started.take() {
+                    self.delivery = Some(at.elapsed());
+                    self.last_update_pixels = std::mem::take(&mut self.update_pixels);
+                    self.updates.tick();
+                }
+                if self.fps.since_last() >= self.frame_time {
+                    self.draw()?;
+                }
             }
             Update::Clipboard(text) => {
                 if !self.no_clipboard {
@@ -699,6 +808,10 @@ impl<B: Backend> Session<B> {
                 // overlay, so it should keep up with the hand even while a frame is in
                 // flight.
                 let (tx, ty) = self.input.terminal_pixel(&mouse, &self.metrics);
+                // Kept in terminal pixels, not the destination pixels the renderer wants:
+                // a resize changes what a destination pixel means, and the pointer has to
+                // be re-derived from where it actually is rather than left where it was.
+                self.pointer_px = Some((tx, ty));
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
 
@@ -721,9 +834,7 @@ impl<B: Backend> Session<B> {
                     tracing::debug!("click at cell {col},{row}; the cross wants {target:?}");
                 }
                 if on_close && pressed {
-                    if self.toast.dismiss() {
-                        self.renderer.mark_all();
-                    }
+                    self.toast.dismiss();
                     return Ok(());
                 }
 
@@ -900,34 +1011,31 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Hide the menu and arrange for the cells it used to be blanked.
+    /// Hide the menu.
     ///
-    /// Clearing the flag is not enough on its own, and neither is damaging the
-    /// image: the menu is text, and tiles are placed below the text, so the box
-    /// outlives any repaint until the cells themselves are erased. The tiles are
-    /// marked too, for a terminal that treats an erase as dropping the placements
-    /// underneath it.
+    /// Nothing else to do: a menu absent from the next frame's plane is a menu whose cells
+    /// the diff blanks and whose images the chrome drops, and the cells it gives up come
+    /// back as damage so the picture under them is drawn again.
     fn dismiss_menu(&mut self) {
         self.show_menu = false;
-        self.clear_menu = true;
         // Or the row the pointer happened to be on would be lit the next time the
         // menu opens, before the pointer has moved to say so.
         self.menu.clear_hover();
-        self.renderer.mark_all();
     }
 
     async fn on_tick(&mut self) -> Result<()> {
-        // A resize has settled: adopt the new geometry, and ask the server to
-        // match it if it is willing to.
-        // Leading edge, then trailing: the first resize after a quiet spell is acted on
-        // at once, and only a continuing stream of them is held back. Waiting out the
-        // debounce for a single resize makes the window feel like it did not take, which
-        // is the whole reason the delay was noticeable.
-        let quiet_before = self
+        // A resize is waiting: adopt the new geometry, and ask the server to match it if
+        // it is willing to.
+        //
+        // Rate limited, not deferred. The first resize after a lull goes through at once
+        // and a continuing stream is thinned to one every `RESIZE_INTERVAL`, so a drag is
+        // answered while it happens. The second arm is the tail of a stream that stopped
+        // before the interval was up, which nothing else would come back for.
+        let due = self
             .metrics_applied_at
-            .is_none_or(|last| last.elapsed() >= RESIZE_DEBOUNCE);
+            .is_none_or(|last| last.elapsed() >= RESIZE_INTERVAL);
         if let Some(at) = self.pending_metrics
-            && (quiet_before || at.elapsed() >= RESIZE_DEBOUNCE)
+            && (due || at.elapsed() >= RESIZE_INTERVAL)
         {
             self.pending_metrics = None;
             self.metrics_applied_at = Some(Instant::now());
@@ -973,6 +1081,22 @@ impl<B: Backend> Session<B> {
             self.send(Input::Refresh { incremental: true }).await?;
         }
 
+        // A frame drawn in the middle of an update is half of one picture and half of
+        // another. The rectangles still arriving are the rest of this one, and the end of
+        // it draws -- so there is nothing to do here but wait, up to the point where
+        // waiting is worse than the seam.
+        //
+        // Measured from when this update started arriving, not from the last frame: the
+        // budget is for *this update's* rectangles to turn up in, and time spent idle
+        // before it began is not the server being slow with it. Timing it from the last
+        // frame charged the update for the gap ahead of it, so a machine that had been
+        // busy elsewhere drew the seam on an update that arrived perfectly promptly.
+        let waited = self
+            .update_started
+            .map_or(Duration::ZERO, |at| at.elapsed());
+        if self.mid_update && waited < self.max_partial_wait {
+            return Ok(());
+        }
         self.draw()
     }
 
@@ -1064,13 +1188,10 @@ impl<B: Backend> Session<B> {
     }
 
     fn draw(&mut self) -> Result<()> {
-        // A note that has run out has to come off the screen, and the screen it was
-        // over has to be drawn back: work of its own, whether or not a frame arrived.
-        if self.toast.expire() {
-            self.renderer.mark_all();
-        }
-        let has_work = self.renderer.has_work();
-        if !has_work && !self.toast.is_live() && !self.show_menu && !self.clear_menu {
+        // A note that has run out has to come off the screen: work of its own, whether or
+        // not a frame arrived.
+        let expired = self.toast.expire();
+        if !self.renderer.has_work() && !expired && self.pending_cleanup.is_empty() {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1082,25 +1203,41 @@ impl<B: Backend> Session<B> {
         if self.caps.sync_output {
             kitty::begin_sync(&mut buf);
         }
-        // Text first, then images, exactly as a relayout does it: erasing cells may
-        // take the placements under them with it, so the tiles have to go out after.
-        if self.clear_menu {
-            self.menu.clear(&mut buf, &self.metrics);
-            self.clear_menu = false;
+        // A relayout's wipe, if one is owed: erase and delete inside the same
+        // synchronised block that puts the screen back, so the terminal only ever shows
+        // one of the two layouts and never the gap between them.
+        let cleanup = std::mem::take(&mut self.pending_cleanup);
+        buf.extend_from_slice(&cleanup);
+
+        // The chrome, all of it, before the tiles. Its own cells are diffed against what
+        // is on screen, so a menu that closed or a bar whose row moved is blanked by being
+        // absent rather than by anyone remembering to erase it -- and the cells it gives up
+        // come back as damage, which is what the tiles under them need. Before the tiles
+        // because a terminal may treat clearing a cell as dropping the placement under it;
+        // the text still lands above them, z-index deciding that rather than write order.
+        let resized = self.chrome.begin(&self.metrics);
+        if resized {
+            // The geometry changed, so what is on screen is a guess and the guess has been
+            // wrong: erase the text and say all of it again. Inside the frame that redraws,
+            // so nothing is ever seen blank -- which is the whole difference between this
+            // and the wipe that used to go out on its own.
+            buf.extend_from_slice(b"\x1b[2J");
         }
-        self.toast.clear(&mut buf);
+        self.render_chrome(&mut buf);
+        for cells in self.chrome.flush(&mut buf) {
+            self.renderer
+                .mark_cells(cells.x, cells.y, cells.width, cells.height);
+        }
+        if resized {
+            // And put the picture back on its cells, in case the erase took the placements
+            // with it. Pixels, not placements, are what a resize is expensive in.
+            self.renderer.replace_all(&mut buf);
+        }
+
         let stats = self.renderer.compose(&self.fb, &mut buf);
         if stats.tiles > 0 {
             self.last_stats = stats;
         }
-        self.draw_status(&mut buf);
-        if self.show_menu {
-            self.menu.draw(&mut buf, &self.metrics, self.menu_state());
-        }
-        // Last of the chrome, so a note that arrives with the menu open lands on top
-        // of it rather than under it.
-        self.toast
-            .draw(&mut buf, &self.metrics, self.theme.palette());
         if self.caps.sync_output {
             kitty::end_sync(&mut buf);
         }
@@ -1108,19 +1245,40 @@ impl<B: Backend> Session<B> {
         match self.writer.submit(buf) {
             Ok(()) => {
                 self.renderer.commit();
-                self.toast.commit();
+                self.chrome.commit();
                 self.fps.tick();
             }
             Err(Busy::Full(buf)) => {
                 self.dropped += 1;
                 self.writer.recycle(buf);
+                // The wipe went out with the frame or not at all: dropping it here would
+                // leave the old layout's chrome and tiles on screen for good, since the
+                // damage that would have painted over them was never composed.
+                if !cleanup.is_empty() {
+                    self.pending_cleanup = cleanup;
+                }
             }
             Err(Busy::Closed) => anyhow::bail!("the terminal stopped accepting output"),
         }
         Ok(())
     }
 
-    fn draw_status(&mut self, buf: &mut Vec<u8>) {
+    /// Render every piece of chrome into the plane, and place the images they sit on.
+    ///
+    /// In the order they stack: the bar, then the menu over the picture, then a note over
+    /// the menu -- a note that arrives while the menu is open belongs on top of it.
+    fn render_chrome(&mut self, out: &mut Vec<u8>) {
+        self.render_status();
+        if self.show_menu {
+            let state = self.menu_state();
+            self.menu
+                .render(&mut self.chrome, out, &self.metrics, state);
+        }
+        self.toast
+            .render(&mut self.chrome, out, &self.metrics, self.theme.palette());
+    }
+
+    fn render_status(&mut self) {
         let layout = *self.renderer.layout();
         // What this is connected to, which is the one thing on the left worth reading
         // without looking for it.
@@ -1144,12 +1302,18 @@ impl<B: Backend> Session<B> {
         // Lower case, as the menu writes its shortcuts: the two should read alike.
         let key = format!("ctrl+{} p", self.input.prefix());
         let (figures, label) = if self.show_stats {
+            // Ours, then theirs. An update rate far below the frame rate is a server that
+            // cannot keep up, and no amount of work on this side will move it.
             (
                 format!(
-                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  ",
+                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>5.1} up/s  {:>6} /up  \
+                     {:>5.2} MP  {:>6} rtt  {} dropped  ",
                     self.fps.fps(),
                     self.last_stats.tiles,
                     human_bytes(self.last_stats.bytes),
+                    self.updates.fps(),
+                    format_rtt(self.delivery),
+                    self.last_update_pixels as f64 / 1e6,
                     format_rtt(self.rtt),
                     self.dropped,
                 ),
@@ -1172,8 +1336,8 @@ impl<B: Backend> Session<B> {
             left.push(ink.accent("  ● CMD"));
         }
 
-        status::draw(
-            buf,
+        status::render(
+            self.chrome.buffer(),
             &self.metrics,
             ink,
             left,
@@ -1190,9 +1354,17 @@ impl<B: Backend> Session<B> {
             self.pan,
         );
         let cleanup = self.renderer.relayout(layout);
-        if !cleanup.is_empty() {
-            let _ = self.writer.submit_blocking(cleanup);
+        // The pointer is placed against the terminal's grid, which has just changed under
+        // it. Its screen position has not, so put it back where it actually is.
+        if let Some((tx, ty)) = self.pointer_px {
+            let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
+            self.renderer.move_cursor(at);
         }
+        // Held for the next frame rather than written now, and appended: a relayout
+        // names the tiles it has dropped, and a second one before that frame goes out
+        // names different ones. Each lowers what the renderer believes is placed, so no
+        // id is named twice.
+        self.pending_cleanup.extend_from_slice(&cleanup);
     }
 
     async fn send(&self, input: Input) -> Result<()> {
@@ -1252,9 +1424,7 @@ impl<B: Backend> Session<B> {
         // A note landing on top of one already up takes the old box off the screen with
         // it, and the remote screen under the cells it no longer covers has to come
         // back -- the same repair the menu asks for when it is dismissed.
-        if self.toast.show(note) {
-            self.renderer.mark_all();
-        }
+        self.toast.show(note);
     }
 }
 

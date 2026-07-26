@@ -49,8 +49,11 @@ const CHUNK: usize = 4096;
 /// screen content, and we are spending that CPU every frame.
 const ZLIB_LEVEL: Compression = Compression::new(1);
 
-/// First image id we use. Tiles take `IMAGE_ID_BASE + index`, well away from
-/// the low ids other programs tend to pick.
+/// First image id we use, well away from the low ids other programs tend to pick.
+///
+/// A tile takes `IMAGE_ID_BASE` plus an offset for where it sits in the grid, which
+/// `render::TileGrid` works out. Its stride is what the distance to
+/// [`OVERLAY_IMAGE_ID`] has to clear.
 pub const IMAGE_ID_BASE: u32 = 0x7600;
 
 /// Placement id carried by every image we place.
@@ -63,12 +66,14 @@ const PLACEMENT_ID: u32 = 1;
 
 /// Image id for an overlay's backdrop, above every id a tile can take.
 ///
-/// Tiles are around 128px square, so even a 4K terminal uses a few hundred of
-/// them and could never reach this. The distance is the point: at equal
-/// z-index the higher id is composited on top, which is the only way an overlay
-/// can cover the remote screen. A cell background cannot, being painted below
-/// the image.
-pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x10000;
+/// The distance is the point: at equal z-index the higher id is composited on
+/// top, which is the only way an overlay can cover the remote screen. A cell
+/// background cannot, being painted below the image.
+///
+/// A tile is addressed by its place in the grid rather than by a running count, so
+/// what has to be cleared is the whole coordinate space and not the number of tiles
+/// on screen -- `render::TILE_ID_STRIDE` squared, which this is comfortably past.
+pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x40000;
 
 /// Image id for the menu row under the pointer, one above the backdrop it is drawn
 /// on so it is composited over it rather than under.
@@ -77,6 +82,13 @@ pub const MENU_HIGHLIGHT_IMAGE_ID: u32 = OVERLAY_IMAGE_ID + 1;
 /// Image id for the notification popup's backdrop, above both of the menu's: a note
 /// that arrives while the menu is open belongs on top of it, not under it.
 pub const TOAST_IMAGE_ID: u32 = MENU_HIGHLIGHT_IMAGE_ID + 1;
+
+/// Image id for the mouse pointer, above everything.
+///
+/// It is what you are aiming with, so nothing should be able to cover it -- including the
+/// menu, whose items are clicked with it. Blended into the tiles, as it used to be, it
+/// went under the menu's backdrop and could not be seen while the menu was open.
+pub const CURSOR_IMAGE_ID: u32 = TOAST_IMAGE_ID + 1;
 
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +189,12 @@ impl KittyEncoder {
     /// The payload is the object's name rather than the data, which is the whole
     /// point: nothing is base64-encoded but a short string. The `m` key is
     /// meaningless for a local medium, so there is never more than one command.
+    ///
+    /// The object holds exactly this tile and nothing else, so there are no `O=`/`S=`
+    /// keys. The protocol has them, and one object per frame with an offset per tile
+    /// would be five system calls a frame rather than five a tile -- but Ghostty draws
+    /// nothing for a placement carrying them, and with `q=2` it does not say why. Until
+    /// that is understood, a frame is an object per tile.
     pub fn place_shm(&mut self, out: &mut Vec<u8>, at: Placement, name: &str) {
         let Placement { id, col, row, w, h } = at;
         if w == 0 || h == 0 {
@@ -193,16 +211,6 @@ impl KittyEncoder {
         out.extend_from_slice(self.b64.as_bytes());
         out.extend_from_slice(b"\x1b\\");
     }
-
-    /// Delete every image and free the data behind it.
-    ///
-    /// Used when the layout changes: every tile is about to be retransmitted, so
-    /// the old ones are only in the way. The teardown sequence in `term::mod` spells
-    /// the same command out by hand, because it has to work from a panic handler
-    /// where there is no encoder to call.
-    pub fn delete_all(out: &mut Vec<u8>) {
-        out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\");
-    }
 }
 
 /// Let go of an image's current placement, keeping the image data.
@@ -218,6 +226,101 @@ impl KittyEncoder {
 /// `a=T` that follows is about to replace it anyway.
 fn release_placement(out: &mut Vec<u8>, id: u32) {
     let _ = write!(out, "\x1b_Ga=d,d=i,i={id},p={PLACEMENT_ID},q=2\x1b\\");
+}
+
+/// Where a placement sits: the cell, and how far into it.
+///
+/// `X`/`Y` are pixel offsets *within* the first cell and must be smaller than one, which is
+/// what lets the pointer sit between cells instead of snapping to a corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct At {
+    pub col: u16,
+    pub row: u16,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// Transmit `rgba` and place it, keeping its alpha.
+///
+/// `f=32` rather than the tiles' `f=24`, because this is for the pointer, whose shape is a
+/// mask: the alpha decides what of the picture underneath shows through. Overlapping
+/// placements blend, and at equal `z` the higher id is on top, which is why the pointer's
+/// id is the highest of ours.
+///
+/// Not compressed. A pointer is a few kilobytes and is sent once per shape, where zlib
+/// costs a pass over it every time.
+pub fn place_rgba(out: &mut Vec<u8>, id: u32, at: At, w: u32, h: u32, rgba: &[u8]) {
+    debug_assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+    if w == 0 || h == 0 || rgba.is_empty() {
+        return;
+    }
+    let mut b64 = String::new();
+    BASE64.encode_string(rgba, &mut b64);
+
+    release_placement(out, id);
+    let _ = write!(out, "\x1b[{};{}H", at.row as u32 + 1, at.col as u32 + 1);
+
+    let bytes = b64.as_bytes();
+    let mut chunks = bytes.chunks(CHUNK);
+    let first = chunks.next().unwrap_or(b"");
+    let mut remaining = bytes.len().saturating_sub(first.len());
+
+    let _ = write!(
+        out,
+        "\x1b_Ga=T,q=2,C=1,z=-1,f=32,i={id},p={PLACEMENT_ID},s={w},v={h},X={},Y={}",
+        at.x, at.y
+    );
+    if remaining > 0 {
+        out.extend_from_slice(b",m=1");
+    }
+    out.push(b';');
+    out.extend_from_slice(first);
+    out.extend_from_slice(b"\x1b\\");
+    for chunk in chunks {
+        remaining -= chunk.len();
+        let more = if remaining > 0 { 1 } else { 0 };
+        let _ = write!(out, "\x1b_Gm={more},q=2;");
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+}
+
+/// Move an image the terminal already holds, sub-cell offsets and all.
+pub fn place_existing_at(out: &mut Vec<u8>, id: u32, at: At) {
+    release_placement(out, id);
+    let _ = write!(out, "\x1b[{};{}H", at.row as u32 + 1, at.col as u32 + 1);
+    let _ = write!(
+        out,
+        "\x1b_Ga=p,q=2,C=1,z=-1,i={id},p={PLACEMENT_ID},X={},Y={}\x1b\\",
+        at.x, at.y
+    );
+}
+
+/// Take an image off the screen, keeping its data for the next time it is placed.
+///
+/// For the pointer leaving the window: the shape has not changed, so re-sending it when it
+/// comes back would be a transmission where a placement will do.
+pub fn hide_image(out: &mut Vec<u8>, id: u32) {
+    release_placement(out, id);
+}
+
+/// Put an image the terminal already holds on different cells, without sending a pixel.
+///
+/// A layout can move the picture without changing it: centring an image in a window of
+/// another width shifts every tile by a cell and leaves every pixel where it was. `a=p`
+/// is the protocol's word for that -- display image `i` at the cursor, no payload -- and
+/// the docs name replacing a placement as the way to "resize or move placements around
+/// the screen without flicker".
+///
+/// No dimensions: the image has its own, from the transmission that created it, and the
+/// natural size is the size it was drawn at before.
+///
+/// The release beforehand is the discipline every placement here follows, for the reason
+/// [`release_placement`] gives.
+pub fn place_existing(out: &mut Vec<u8>, id: u32, col: u16, row: u16) {
+    release_placement(out, id);
+    let _ = write!(out, "\x1b[{};{}H", row as u32 + 1, col as u32 + 1);
+    let _ = write!(out, "\x1b_Ga=p,q=2,C=1,z=-1,i={id},p={PLACEMENT_ID}\x1b\\");
 }
 
 /// Fill a block of cells with one colour, as an image at the tiles' own z-index.

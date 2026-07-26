@@ -11,9 +11,136 @@ mod common;
 
 use std::time::Duration;
 
-use common::server::{EXTENDED_CLIPBOARD_ENCODING, Extensions, FakeServer, Request, Resize};
+use common::server::{
+    EXTENDED_CLIPBOARD_ENCODING, Extensions, FakeServer, Request, Resize, SPLIT_FIRST,
+    SPLIT_SECOND, SPLIT_STALL,
+};
 use common::session::*;
 use common::*;
+
+#[test]
+fn a_frame_is_never_composed_from_half_an_update() {
+    // The rectangles of one update are one picture, and they arrive one at a time. A
+    // client that draws whatever it holds when its own clock strikes puts the first
+    // rectangle on screen without the second -- and on a scrolling page, where the whole
+    // screen is one update, that is half of it at the new scroll position and half at the
+    // old. Which is what it looks like: blocks all over the screen, misplaced, until the
+    // scrolling stops and one whole update lands.
+    //
+    // The client's own deadline is put out of reach for the run: it may draw a seam rather
+    // than let the screen stand still, and a machine loaded enough will cross any wall-clock
+    // deadline. With it out of the way, every seam below is the client failing to wait, which
+    // is the claim. TESTING.md says why the deadline itself is not asserted from out here.
+    let (_server, mut term) = start_with_env(
+        Extensions {
+            split_updates: true,
+            ..Default::default()
+        },
+        (1024, 768),
+        &[],
+        &[("DESKTUI_MAX_PARTIAL_WAIT_MS", "60000")],
+    );
+    // From the settled session on, not from the first frame. Until the server has granted
+    // the size and the client has adopted it, the picture on screen is *meant* to be in
+    // pieces: a relayout re-sends what moved, and a frame carrying one tile of the old
+    // letterboxed layout is that, not a torn update. Measuring through the negotiation read
+    // one of those as a tear about one run in ten.
+    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(10));
+    let settled = term.output().len();
+    // A good many stalls' worth, so every tick that wanted to draw inside one has had its
+    // chance. The pacing is off the end of each update, so these run back to back.
+    std::thread::sleep(SPLIT_STALL * 10);
+
+    // 1:1 over a desktop resized to the terminal, so a remote pixel is a terminal pixel
+    // and the tiles are 128x136 of them: the first rectangle is tile 0,0 and the second
+    // spans tiles 2,1 and 2,2.
+    let first = tile_id(SPLIT_FIRST);
+    let second = [tile_id(SPLIT_SECOND), tile_id((SPLIT_SECOND.0, 320))];
+    let out = term.output();
+    let (mut whole, mut half) = (0, 0);
+    let mut torn = Vec::new();
+    for block in blocks(&out[settled..]) {
+        let drew_first = contains(block, transmit(first).as_bytes());
+        let drew_second = second
+            .iter()
+            .any(|id| contains(block, transmit(*id).as_bytes()));
+        match (drew_first, drew_second) {
+            (true, true) => whole += 1,
+            (true, false) | (false, true) => {
+                half += 1;
+                torn.push(show(&block[..block.len().min(400)]));
+            }
+            (false, false) => {}
+        }
+    }
+    assert!(
+        whole > 0,
+        "no frame ever carried an update whole: {}",
+        tail(&out)
+    );
+    assert_eq!(
+        half,
+        0,
+        "{half} frames carried one half of an update without the other, out of \
+         {} that carried any of it. A frame has to wait for the update it is drawing \
+         to be over. The frames in question:\n{}",
+        whole + half,
+        torn.join("\n\n")
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+/// The first image id that is not a tile's. Above it are the overlay backdrops and the
+/// pointer, which are transmitted like tiles and are not tiles.
+const OVERLAY_ID: u32 = 0x7600 + 0x40000;
+
+/// Every image id transmitted in `out`, tiles and overlays alike.
+fn transmitted_ids(out: &[u8]) -> Vec<u32> {
+    let mut found = Vec::new();
+    for at in offsets(out, b"\x1b_Ga=T") {
+        let rest = &out[at..];
+        let Some(key) = find(rest, b"i=") else {
+            continue;
+        };
+        let digits: Vec<u8> = rest[key + 2..]
+            .iter()
+            .copied()
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        if let Ok(id) = String::from_utf8_lossy(&digits).parse() {
+            found.push(id);
+        }
+    }
+    found
+}
+
+/// The image id of the tile covering a pixel, for the 1:1 layout the session harness
+/// negotiates: 8x17 cells make tiles of 128x136, numbered by where they sit.
+fn tile_id((x, y): (u16, u16)) -> u32 {
+    const BASE: u32 = 0x7600;
+    const STRIDE: u32 = 512;
+    BASE + u32::from(y / 136) * STRIDE + u32::from(x / 128)
+}
+
+/// The transmit command for an image id, which is what says a tile reached the screen --
+/// as opposed to the delete that precedes it, which names the same id.
+fn transmit(id: u32) -> String {
+    format!("i={id},p=1,s=")
+}
+
+/// Everything between a begin-sync marker and its end, which is one frame.
+fn blocks(out: &[u8]) -> Vec<&[u8]> {
+    let mut found = Vec::new();
+    for open in offsets(out, BEGIN_SYNC) {
+        let from = open + BEGIN_SYNC.len();
+        if let Some(len) = find(&out[from..], END_SYNC) {
+            found.push(&out[from..from + len]);
+        }
+    }
+    found
+}
 
 #[test]
 fn keeps_at_most_one_update_request_in_flight() {
@@ -109,6 +236,156 @@ fn requests_the_encodings_it_can_actually_decode() {
         }
         other => panic!("unexpected request {other:?}"),
     }
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn the_statistics_say_what_the_other_end_is_doing() {
+    // Everything else in the bar is this side. A session that crawls because the server is
+    // re-encoding a whole screen looks exactly like one that crawls because we are, and
+    // that question has cost a working day before now.
+    //
+    // The split-update server delivers one picture per stall, so its rate is known ahead
+    // of time: a shade under five a second, where the client is free to draw sixty.
+    let (_server, mut term) = start_with(
+        Extensions {
+            split_updates: true,
+            ..Default::default()
+        },
+        (1024, 768),
+        &[],
+    );
+    assert_drew(&term, Duration::from_secs(10));
+
+    // Ctrl+A then c turns the figures on.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"c");
+    assert!(
+        wait_for_text(&term, "up/s", Duration::from_secs(10)),
+        "the bar never reported an update rate: {}",
+        Screen::of(&term.output()).row(49)
+    );
+    // Long enough for the rolling window to hold several stalls.
+    std::thread::sleep(SPLIT_STALL * 6);
+
+    let bar = Screen::of(&term.output()).row(49);
+    let (rate, delivery) = delivery_figures(&bar).expect("no delivery figures in the bar");
+    // One update per stall, near enough: worked out from the stall rather than written
+    // down, so the figure follows the constant instead of being pinned to one value of it.
+    // Wide, because what the server adds around a stall is the machine's business and the
+    // claim is only that the bar reports the order of magnitude it is seeing.
+    let expected = 1000.0 / SPLIT_STALL.as_millis() as f64;
+    assert!(
+        (expected * 0.4..expected * 1.6).contains(&rate),
+        "expected about {expected:.0} updates a second from a {SPLIT_STALL:?} stall, bar \
+         said {rate}: {bar:?}"
+    );
+    // Measured from the first rectangle *arriving*, where the server's stall starts before
+    // it writes one, so this reads a few milliseconds under the stall rather than over it.
+    assert!(
+        delivery + 20 >= SPLIT_STALL.as_millis() as u32,
+        "an update split across a {SPLIT_STALL:?} stall cannot have been delivered in \
+         {delivery}ms: {bar:?}"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+/// The update rate and per-update delivery time, read off the bar.
+///
+/// From the screen rather than the stream: every figure in the bar changes every frame, so
+/// what reaches the terminal is the digits that differ and a cursor move between them.
+fn delivery_figures(bar: &str) -> Option<(f64, u32)> {
+    // "  4.9 up/s   215ms /up"
+    let at = bar.find("up/s")?;
+    let rate: f64 = bar[..at]
+        .rsplit(' ')
+        .find(|s| !s.is_empty())?
+        .parse()
+        .ok()?;
+    let after = &bar[at + "up/s".len()..];
+    let ms: u32 = after
+        .split("ms")
+        .next()?
+        .trim()
+        .rsplit(' ')
+        .find(|s| !s.is_empty())?
+        .parse()
+        .ok()?;
+    Some((rate, ms))
+}
+
+#[test]
+fn no_push_never_offers_the_extension_and_keeps_asking() {
+    // Pushed frames are cheaper by a round trip and unbounded: the server decides how
+    // hard both ends work, and every update has to be decoded whether or not there is
+    // time to draw it. `--no-push` puts the pace back here.
+    //
+    // Declined by never offering it. A server announces the extension by answering
+    // `SetEncodings`, and only a client that asked may enable it, so leaving the encoding
+    // out is what stops the whole arrangement rather than turning it down afterwards.
+    let ext = Extensions {
+        continuous_updates: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit", "--no-push"]);
+
+    let request = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetEncodings(_))
+        })
+        .expect("no encodings were negotiated");
+    match request {
+        Request::SetEncodings(encodings) => {
+            assert!(
+                !encodings.contains(&-313),
+                "ContinuousUpdates must not be offered: {encodings:?}"
+            );
+            assert!(
+                encodings.contains(&-312),
+                "Fence is a separate extension and the latency probe needs it: \
+                 {encodings:?}"
+            );
+        }
+        other => panic!("unexpected request {other:?}"),
+    }
+
+    // So it is never turned on, and the frames stay something this end asks for. The
+    // watchdog is what keeps asking here, the fake server having nothing to answer an
+    // incremental request with, so give it longer than its second.
+    assert_drew(&term, Duration::from_secs(10));
+    let before = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::FramebufferUpdate { .. }))
+        .count();
+    std::thread::sleep(Duration::from_secs(2));
+    let asked = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::FramebufferUpdate { .. }))
+        .count();
+    assert!(
+        asked > before,
+        "stopped asking for frames without anything pushing them"
+    );
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::EnableContinuousUpdates { .. })),
+        "asked the server to push frames anyway: {:?}",
+        server.requests()
+    );
+    assert!(
+        !contains(&term.output(), b"pushing frames"),
+        "said the remote was pushing frames: {}",
+        tail(&term.output())
+    );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
@@ -354,19 +631,52 @@ fn the_cursor_shape_is_requested_and_drawn_locally() {
         other => panic!("unexpected {other:?}"),
     }
 
-    // Moving the pointer has to produce frames without the server sending anything:
-    // the overlay is drawn on this side. How long that takes is the machine's business;
-    // that it happens at all is the client's.
-    let before = tiles_drawn(&term);
+    // Moving the pointer has to reach the screen without the server sending anything: the
+    // overlay is drawn on this side. And it has to cost a placement rather than a tile --
+    // the pointer is an image of its own now, where it used to be blended into every tile
+    // it touched, so a frame while the mouse moves retransmitted two to four of them.
+    // Wait for the screen to stop changing first. The note the client puts up at startup
+    // marks everything when it goes, and a redraw arriving mid-measurement would be read as
+    // the pointer having cost tiles.
+    let mut quiet = 0;
+    let mut last = tiles_drawn(&term);
+    for _ in 0..80 {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = tiles_drawn(&term);
+        quiet = if now == last { quiet + 1 } else { 0 };
+        if quiet >= 3 {
+            break;
+        }
+        last = now;
+    }
+
+    let bytes_before = term.output().len();
     for x in (200..500).step_by(30) {
         term.send(format!("\x1b[<35;{x};200M").as_bytes());
         std::thread::sleep(Duration::from_millis(30));
     }
-    assert_kept_drawing(
-        &term,
-        before,
-        "moving the pointer, so the cursor is not being composited locally",
-        Duration::from_secs(10),
+    std::thread::sleep(Duration::from_millis(400));
+
+    let out = term.output();
+    let since = &out[bytes_before.min(out.len())..];
+    assert!(
+        contains(since, b"f=32,i="),
+        "the pointer should be an RGBA image of its own: {}",
+        show(since)
+    );
+    assert!(
+        contains(since, b"a=p,q=2"),
+        "and moving it should be a placement: {}",
+        show(since)
+    );
+    let tiles: Vec<u32> = transmitted_ids(since)
+        .into_iter()
+        .filter(|id| *id < OVERLAY_ID)
+        .collect();
+    assert!(
+        tiles.is_empty(),
+        "moving the pointer retransmitted {} tiles: {tiles:?}",
+        tiles.len()
     );
 
     quit(&mut term);

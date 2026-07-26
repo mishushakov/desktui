@@ -34,6 +34,13 @@ pub struct Options {
     pub local_cursor: bool,
     /// Offer to exchange clipboards at all.
     pub clipboard: bool,
+    /// Let the server push frames instead of answering one request at a time.
+    ///
+    /// Cheaper by a round trip per frame, and unbounded: a server pushing as fast as it
+    /// can encode decides how hard both ends work, and every update has to be decoded
+    /// whether or not there is time to draw it. Turning it off puts the pace back in the
+    /// client's hands, at a round trip per frame.
+    pub push: bool,
 }
 
 /// An RFB server, and what it takes to connect to it.
@@ -105,7 +112,17 @@ impl Vnc {
             .add_encoding(VncEncoding::LastRectPseudo)
             // Ask the server to push frames rather than answer a request each time, which
             // saves a round trip per frame; Fence is what makes that safe to negotiate.
-            .add_encoding(VncEncoding::ContinuousUpdatesPseudo)
+            //
+            // Not advertised with --no-push. A server announces the extension by answering
+            // `SetEncodings`, and only a client that asked for it may enable it -- so
+            // leaving it out here is what makes the whole arrangement never happen, rather
+            // than being offered and declined later. Fence stays either way: it is a
+            // separate extension, and the latency probe is built on it.
+            .add_encodings(if self.opts.push {
+                &[VncEncoding::ContinuousUpdatesPseudo][..]
+            } else {
+                &[]
+            })
             .add_encoding(VncEncoding::FencePseudo)
             // And to tell us its lock-key state, so a caps lock that disagrees with the
             // local keyboard can be corrected instead of shouting.
@@ -162,6 +179,10 @@ struct State {
     /// change its mind, so this has to be said again after one -- the difference
     /// between a desktop that grows and one that grows a black band down two sides.
     pushing_for: Option<(u16, u16)>,
+    /// Whether the server is allowed to push at all. False under `--no-push`, where the
+    /// extension is never offered -- and a server that announces it regardless is not
+    /// taken up on it, since the point is the pace and not the negotiation.
+    push_wanted: bool,
     /// The framebuffer size, tracked so a resize can re-arm the above.
     ///
     /// A second copy of what the engine already knows, because deciding to re-arm
@@ -195,6 +216,7 @@ impl VncBackend {
             state: Mutex::new(State {
                 size,
                 clipboard_wanted: opts.clipboard,
+                push_wanted: opts.push,
                 ..State::default()
             }),
         }
@@ -300,6 +322,13 @@ impl State {
             VncEvent::EndOfContinuousUpdates => {
                 // The first one of these is the server saying the extension exists.
                 // Any later one means it stopped, and asking again is how it restarts.
+                //
+                // Ignored outright under `--no-push`, including a server that announces
+                // the extension without being asked: what that flag buys is the pace, and
+                // taking this up would hand it back.
+                if !self.push_wanted {
+                    return None;
+                }
                 self.pushing_for = None;
                 self.enable_pushing();
                 Some(Update::Pushing(true))
@@ -478,8 +507,13 @@ mod tests {
 
     /// Every test here drives the state machine, which is the whole of the
     /// translation and needs no socket behind it.
+    /// A backend's state as a session without `--no-push` has it: willing to be pushed to,
+    /// which is the default and what all but one of these tests are about.
     fn state() -> State {
-        State::default()
+        State {
+            push_wanted: true,
+            ..State::default()
+        }
     }
 
     fn request(flags: u32, payload: &[u8]) -> VncEvent {
@@ -587,7 +621,7 @@ mod tests {
         // black screen. The size comes from ServerInit instead.
         let mut state = State {
             size: (1024, 768),
-            ..State::default()
+            ..state()
         };
         state.translate(VncEvent::EndOfContinuousUpdates);
         match state.outbox.pop_front().unwrap() {
@@ -596,6 +630,27 @@ mod tests {
             }
             other => panic!("expected an enable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_push_ignores_a_server_that_announces_the_extension_anyway() {
+        // The flag is about the pace, not the negotiation: a server that sends
+        // `EndOfContinuousUpdates` without being asked -- and the encoding is never
+        // offered under it -- must not end up pushing regardless.
+        let mut state = State {
+            size: (800, 600),
+            push_wanted: false,
+            ..state()
+        };
+        assert!(
+            state.translate(VncEvent::EndOfContinuousUpdates).is_none(),
+            "told the session frames were being pushed"
+        );
+        assert!(
+            state.outbox.is_empty(),
+            "asked the server to push anyway: {:?}",
+            state.outbox
+        );
     }
 
     #[test]

@@ -85,6 +85,7 @@ fn run(args: &Args) -> Result<()> {
             compression: args.compression,
             local_cursor: !args.view_only,
             clipboard: !args.no_clipboard,
+            push: !args.no_push,
         },
     );
     runtime.block_on(session::run(args, &caps, &guard, &mut vnc))

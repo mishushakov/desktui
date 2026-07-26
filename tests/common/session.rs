@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use super::server::{Extensions, FakeServer, Request, Resize};
-use super::{FakeTerm, GHOSTTY_REPLIES, contains, count, tail};
+use super::{FakeTerm, GHOSTTY_REPLIES, Screen, contains, count, tail};
 
 /// A 200x50 terminal of 8x17 cells: 1600x850 pixels, of which 49 rows are usable.
 ///
@@ -29,11 +29,13 @@ pub const EXPECTED_SIZE: &str = "1600x832";
 /// The escape that carries one tile to the terminal. Counting these counts drawing.
 pub const DREW: &[u8] = b"\x1b_Ga=T";
 
-/// The image ids the client's overlays take: `kitty::IMAGE_ID_BASE + 0x10000` for the
+/// The image ids the client's overlays take: `kitty::IMAGE_ID_BASE + 0x40000` for the
 /// menu's backdrop, and one each above it for the bar under the pointer and the
 /// notification popup. Worked out here the way the client works them out, because a
-/// test reads the numbers off the wire rather than the constants behind them.
-pub const MENU_ID: u32 = 0x7600 + 0x10000;
+/// test reads the numbers off the wire rather than the constants behind them -- which
+/// means this has to move when the client's base does, as it did when tiles started
+/// taking ids by position and needed the room below the overlays.
+pub const MENU_ID: u32 = 0x7600 + 0x40000;
 pub const MENU_HIGHLIGHT_ID: u32 = MENU_ID + 1;
 pub const TOAST_ID: u32 = MENU_HIGHLIGHT_ID + 1;
 
@@ -65,11 +67,30 @@ pub fn start(resize: Resize, remote: (u16, u16)) -> (FakeServer, FakeTerm) {
 
 /// The same, with extensions enabled on the server and extra arguments to the client.
 pub fn start_with(ext: Extensions, remote: (u16, u16), extra: &[&str]) -> (FakeServer, FakeTerm) {
+    start_with_env(ext, remote, extra, &[])
+}
+
+/// As [`start_with`], with environment for the client.
+///
+/// `DESKTUI_MAX_PARTIAL_WAIT_MS` is the one worth knowing about: it is how long a frame
+/// will wait for the update it would be drawing to finish arriving before drawing the seam
+/// instead, which is a deadline no test can prove the right side of. A machine loaded
+/// enough -- the whole suite in parallel, several servers and ptys at once -- crosses any
+/// wall-clock deadline eventually, and what reaches the terminal says which rectangles a
+/// frame carried, never how long the client had waited for them. So a test about the
+/// *waiting* puts the deadline out of reach, and one about the deadline sets it low on
+/// purpose.
+pub fn start_with_env(
+    ext: Extensions,
+    remote: (u16, u16),
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (FakeServer, FakeTerm) {
     let server = FakeServer::start_with(remote.0, remote.1, Resize::Accept, ext);
     let addr = server.addr.to_string();
     let mut args = vec![addr.as_str(), "--fps", "15"];
     args.extend_from_slice(extra);
-    let mut term = FakeTerm::spawn(COLS, ROWS, PIXELS.0, PIXELS.1, &args);
+    let mut term = FakeTerm::spawn_with_env(COLS, ROWS, PIXELS.0, PIXELS.1, &args, env);
     term.answer_probe(GHOSTTY_REPLIES);
     (server, term)
 }
@@ -125,22 +146,39 @@ pub fn paste(
 // suite flaky.
 
 /// The status line reports `size` as the desktop it is showing.
+///
+/// Read off the screen rather than the stream. The chrome is diffed frame to frame, so a
+/// size that replaces another reaches the terminal as the digits that differ and a cursor
+/// move -- "1600x832" over "1024x768" shares its fifth character, and the phrase is nowhere
+/// in the bytes even though it is on screen.
 #[track_caller]
 pub fn assert_reports_size(term: &FakeTerm, size: &str, timeout: Duration) {
     assert!(
-        term.wait_for(size.as_bytes(), timeout),
+        wait_for_text(term, size, timeout),
         "the status line never reported {size}: {}",
-        tail(&term.output())
+        Screen::of(&term.output()).row(49)
     );
+}
+
+/// Wait for `text` to be on screen, wherever it is.
+pub fn wait_for_text(term: &FakeTerm, text: &str, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if Screen::of(&term.output()).contains(text) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Screen::of(&term.output()).contains(text)
 }
 
 /// Every remote pixel lands on exactly one terminal pixel.
 #[track_caller]
 pub fn assert_pixel_exact(term: &FakeTerm, timeout: Duration) {
     assert!(
-        term.wait_for(b"native 1:1", timeout),
+        wait_for_text(term, "native 1:1", timeout),
         "the mapping never became pixel-exact: {}",
-        tail(&term.output())
+        Screen::of(&term.output()).row(49)
     );
 }
 

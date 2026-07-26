@@ -111,19 +111,19 @@ fn the_command_menu_holds_the_focus_until_escape() {
         "the menu never appeared"
     );
 
-    // An ordinary key changes nothing. The box is redrawn every frame while it is up, so
-    // a later frame that still holds it is the box still being there.
+    // An ordinary key changes nothing, so the box is neither taken down nor said again:
+    // the chrome is diffed, and a menu that has not changed is not written. So what settles
+    // it is that frames kept coming and none of them took the box down.
     //
     // The wait is not a deadline for an answer -- there is no answer to wait for -- but
-    // long enough for a wrong one to have gone out in, after which what the client is
-    // drawing *now* is what settles it.
+    // long enough for a wrong one to have gone out in.
+    let mark = term.output().len();
     term.send(b"\x1b[120u");
     std::thread::sleep(Duration::from_millis(500));
-    let since = term
-        .drawn_after(term.output().len(), 2, Duration::from_secs(10))
+    term.drawn_after(term.output().len(), 2, Duration::from_secs(10))
         .expect("the client stopped drawing with the menu up");
     assert!(
-        contains(&since, b"Renegotiate the remote size"),
+        !contains(&term.output()[mark..], &deleted(MENU_ID)),
         "an ordinary key put the menu away"
     );
 
@@ -217,13 +217,19 @@ fn clicking_a_scaling_option_selects_that_one() {
         contains(&out[at..(at + 160).min(out.len())], b"Native"),
         "cell 74,29 is no longer the row of scaling options, so the click would miss"
     );
-    let mark = out.len();
     term.send(b"\x1b[<0;717;485M");
     term.send(b"\x1b[<0;717;485m");
 
-    let selected = term
-        .wait_for_after(mark, b"scaling: scaled", Duration::from_secs(10))
-        .unwrap_or_else(|| panic!("the click did not select fit: {}", tail(&term.output())));
+    // Read the screen rather than the stream: the chrome is diffed, so a note replacing
+    // another reaches the terminal as the cells that differ and a cursor move, and the
+    // phrase is nowhere in the bytes even though it is on screen.
+    assert!(
+        wait_for_text(&term, "scaling: scaled", Duration::from_secs(10)),
+        "the click did not select fit: {}",
+        Screen::of(&term.output()).row(1)
+    );
+    // Where the stream had got to with the choice made, for the next claim to watch from.
+    let selected = term.output().len();
 
     // The menu stays up, and shows the choice it just made: the brackets mark the mode
     // in force, so they move to fit. Only the dismissal takes the box down, which is
@@ -236,13 +242,16 @@ fn clicking_a_scaling_option_selects_that_one() {
         .drawn_after(selected, 2, Duration::from_secs(10))
         .expect("the client stopped drawing after the click");
     assert!(
-        contains(&since, b"Renegotiate the remote size"),
+        !contains(&since, &deleted(MENU_ID)),
         "the menu went away on a click that was not the dismissal"
     );
+    // The brackets are read off the screen for the same reason the note above them is: they
+    // moved when the click landed, and a window that starts after that is a window they have
+    // already gone out in.
     assert!(
-        contains(&since, b"[Fit]"),
+        wait_for_text(&term, "[Fit]", Duration::from_secs(10)),
         "the option in force is not the one that was clicked: {}",
-        tail(&since)
+        tail(&term.output())
     );
 
     // And the click went to the menu alone. A button that reached the remote as well
@@ -395,7 +404,7 @@ fn the_close_button_answers_while_the_menu_is_up() {
     );
     // And the menu is still up: the cross closes the note, not the box behind it.
     assert!(
-        contains(&since, b"Renegotiate the remote size"),
+        !contains(&since, &deleted(MENU_ID)),
         "closing the notification put the menu away too: {}",
         tail(&since)
     );

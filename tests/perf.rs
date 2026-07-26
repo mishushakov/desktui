@@ -108,6 +108,113 @@ fn publish_shm(data: &[u8], counter: u64) -> usize {
     data.len()
 }
 
+/// Pack a tile straight into a slice, as `Framebuffer::pack_rgb_into` does.
+fn pack_tile_into(frame: &[u8], tile: (u32, u32, u32, u32), out: &mut [u8]) {
+    let (tx, ty, tw, th) = tile;
+    let stride = (tw * 3) as usize;
+    for (row, line) in out.chunks_exact_mut(stride).enumerate().take(th as usize) {
+        let start = (((ty + row as u32) * WIDTH + tx) * 4) as usize;
+        let end = start + (tw * 4) as usize;
+        for (px, rgb) in frame[start..end]
+            .chunks_exact(4)
+            .zip(line.chunks_exact_mut(3))
+        {
+            rgb.copy_from_slice(&[px[2], px[1], px[0]]);
+        }
+    }
+}
+
+/// An object per tile, packed straight into the mapping. What the renderer does: the
+/// per-tile system calls of `publish_shm` without the copy that followed its pack.
+fn publish_shm_in_place(
+    frame: &[u8],
+    tile: (u32, u32, u32, u32),
+    counter: u64,
+    len: usize,
+) -> usize {
+    let name = format!("/vtperfp{counter:x}");
+    let cname = CString::new(name).unwrap();
+    // SAFETY: a valid NUL-terminated name; O_EXCL so a collision is reported.
+    let fd = unsafe {
+        libc::shm_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600 as libc::c_uint,
+        )
+    };
+    assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
+    // SAFETY: sizing and mapping an object we just created and own; the slice is of the
+    // length we mapped.
+    unsafe {
+        assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED);
+        pack_tile_into(
+            frame,
+            tile,
+            std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len),
+        );
+        libc::munmap(ptr, len);
+        libc::close(fd);
+        libc::shm_unlink(cname.as_ptr());
+    }
+    len
+}
+
+/// One object for a whole frame's tiles, packed straight into the mapping: the whole
+/// per-*frame* cost of the `t=s` medium, against `publish_shm`'s per-tile one.
+fn publish_shm_frame(
+    frame: &[u8],
+    tiles: &[(u32, u32, u32, u32)],
+    counter: u64,
+    len: usize,
+) -> usize {
+    let name = format!("/vtperff{counter:x}");
+    let cname = CString::new(name).unwrap();
+    // SAFETY: a valid NUL-terminated name; O_EXCL so a collision is reported.
+    let fd = unsafe {
+        libc::shm_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600 as libc::c_uint,
+        )
+    };
+    assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
+    // SAFETY: sizing and mapping an object we just created and own; the slice is of the
+    // length we mapped and is written a disjoint tile at a time.
+    unsafe {
+        assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let map = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len);
+        let mut at = 0;
+        for &tile in tiles {
+            let bytes = (tile.2 * tile.3 * 3) as usize;
+            pack_tile_into(frame, tile, &mut map[at..at + bytes]);
+            at += bytes;
+        }
+        libc::munmap(ptr, len);
+        libc::close(fd);
+        // The terminal would do this; here nobody is reading, so we clean up.
+        libc::shm_unlink(cname.as_ptr());
+    }
+    len
+}
+
 fn report(label: &str, elapsed: std::time::Duration, rounds: u32, bytes: usize) {
     let ms = (elapsed / rounds).as_secs_f64() * 1000.0;
     println!(
@@ -167,7 +274,8 @@ fn full_screen_compose_throughput() {
     }
     report("direct: +zlib +base64", start.elapsed(), ROUNDS, total);
 
-    // The shared memory medium: a real object per tile, syscalls included.
+    // The shared memory medium, the way it used to be done: an object per tile, packed
+    // into a buffer and copied in. Kept for the comparison below.
     let start = Instant::now();
     let mut total = 0;
     let mut counter = 0u64;
@@ -178,10 +286,47 @@ fn full_screen_compose_throughput() {
             total += publish_shm(&scratch, counter);
         }
     }
-    report("shm: +object per tile", start.elapsed(), ROUNDS, total);
+    report("shm: object per tile", start.elapsed(), ROUNDS, total);
+
+    // The way it is done: still an object per tile, but packed into the mapping rather
+    // than into a buffer for a copy to follow.
+    let start = Instant::now();
+    let mut total = 0;
+    for frame in &frames {
+        for &tile in &tiles {
+            counter += 1;
+            let bytes = (tile.2 * tile.3 * 3) as usize;
+            total += publish_shm_in_place(frame, tile, counter, bytes);
+        }
+    }
+    report(
+        "shm: per tile, packed in place",
+        start.elapsed(),
+        ROUNDS,
+        total,
+    );
+
+    // And the way it would be done if `O=` worked: one object for the frame, every tile
+    // packed into it at an offset of its own. Five system calls a frame rather than five a
+    // tile -- but Ghostty draws nothing for a placement carrying an offset, so this is a
+    // measurement of the road not taken. See RENDERING.md.
+    let frame_bytes: usize = tiles.iter().map(|&(_, _, w, h)| (w * h * 3) as usize).sum();
+    let start = Instant::now();
+    let mut total = 0;
+    for frame in &frames {
+        counter += 1;
+        total += publish_shm_frame(frame, &tiles, counter, frame_bytes);
+    }
+    report("shm: one object per frame", start.elapsed(), ROUNDS, total);
 
     println!();
     println!("Ceilings are this stage alone, single threaded, with every tile dirty.");
+    println!(
+        "The pack row appends into a buffer, which is what the direct medium still does;\n\
+         the rows below it pack into the mapping instead, so they come out under it.\n\
+         One object per frame is what `O=` would buy: see RENDERING.md for why it is not\n\
+         what the renderer does."
+    );
     println!("A partial update costs proportionally less. Server-side encoding, JPEG");
     println!("decode and the terminal's own work all come on top.");
     println!();

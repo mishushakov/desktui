@@ -403,6 +403,132 @@ pub fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+/// Every offset at which `needle` appears.
+pub fn offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = find(&haystack[from..], needle) {
+        found.push(from + at);
+        from += at + 1;
+    }
+    found
+}
+
+/// Erasing the whole screen, which a layout change is never allowed to need.
+pub const ERASE_SCREEN: &[u8] = b"\x1b[2J";
+/// The two narrower ways of taking something off the screen: a row of text, and one
+/// image and the data behind it.
+pub const ERASE_ROW: &[u8] = b"\x1b[2K";
+pub const DELETE_IMAGE: &[u8] = b"a=d,d=I";
+/// Synchronised output. Everything a layout change takes off the screen has to be
+/// inside a block that puts the new one there.
+pub const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
+pub const END_SYNC: &[u8] = b"\x1b[?2026l";
+
+/// The synchronised block holding the first occurrence of `needle`, which is one frame.
+///
+/// What a frame contains is often the claim -- that an erase and the tiles that undo it
+/// travel together, that every tile of one frame came out of one shared memory object --
+/// and a claim about a frame has to be measured inside its own markers.
+pub fn frame_containing<'a>(out: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    let at = find(out, needle)?;
+    let open = offsets(out, BEGIN_SYNC).into_iter().rfind(|o| *o < at)?;
+    let from = open + BEGIN_SYNC.len();
+    let len = find(&out[from..], END_SYNC)?;
+    Some(&out[from..from + len])
+}
+
+/// A layout change since `before` never left the screen blank.
+///
+/// Text and placements alike stay on the cells they were written to when the grid
+/// changes shape, so a relayout has to take the stale ones off. It used to do that by
+/// erasing the whole screen and deleting every image -- and to write that on its own,
+/// ahead of the frame that fills the screen back in, so the terminal was blank until the
+/// next one composed. Twice or three times over, a resize settling through several paths.
+///
+/// Two claims, then. The screen is never erased wholesale: a relayout names the rows and
+/// the images it is actually taking, and everything else is replaced where it stands. And
+/// what it does take, it takes inside the synchronised block that redraws -- so the
+/// terminal shows one layout or the other and never neither.
+///
+/// `before` has to be an offset past the setup sequence, whose own erase is the alternate
+/// screen being entered and has nothing to redraw yet.
+///
+/// Both loops make this claim -- the session and the test pattern -- so it is written
+/// once here rather than twice.
+#[track_caller]
+pub fn assert_a_relayout_never_blanks_the_screen(term: &FakeTerm, before: usize) {
+    // A frame is written in one go, but a snapshot can still catch one mid-write, so
+    // wait for a block carrying tiles to be there in full.
+    let mut out = term.output();
+    for _ in 0..500 {
+        let whole = {
+            let seen = &out[before..];
+            find(seen, session::DREW).is_some_and(|drew| find(&seen[drew..], END_SYNC).is_some())
+        };
+        if whole {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        out = term.output();
+    }
+
+    let seen = &out[before..];
+    assert!(
+        contains(seen, session::DREW),
+        "the new layout was never drawn: {}",
+        show(seen)
+    );
+    let opens = offsets(seen, BEGIN_SYNC);
+    let closes = offsets(seen, END_SYNC);
+
+    // A resize does erase the screen -- what a terminal leaves on the alternate screen after
+    // the window changed shape is not something we can claim to know -- so the property is
+    // not that it never happens but that it is never *seen*: the block that erases has to be
+    // the block that puts the picture back. Erases before the first block are the setup
+    // entering the alternate screen, with nothing drawn yet to lose.
+    for at in offsets(seen, ERASE_SCREEN) {
+        let Some(open) = opens.iter().copied().rfind(|o| *o < at) else {
+            continue;
+        };
+        // `None < Some(_)`, so an open marker before it with no close since means the erase
+        // is inside that block rather than after it ended.
+        let since = closes.iter().copied().rfind(|c| *c < at);
+        assert!(
+            since < Some(open),
+            "the screen was erased at {at} outside a synchronised block \
+             (last open {open}, last close {since:?}): {}",
+            show(seen)
+        );
+        let close = closes
+            .iter()
+            .copied()
+            .find(|c| *c > at)
+            .unwrap_or(seen.len());
+        assert!(
+            contains(&seen[open..close], session::DREW),
+            "the screen was erased at {at} in a block that drew nothing back: {}",
+            show(&seen[open..close])
+        );
+    }
+
+    for taken in [ERASE_ROW, DELETE_IMAGE] {
+        for at in offsets(seen, taken) {
+            let open = opens.iter().copied().rfind(|o| *o < at);
+            let close = closes.iter().copied().rfind(|c| *c < at);
+            // `None < Some(_)`, so something with an open marker before it and no close
+            // since is inside the block.
+            assert!(
+                open.is_some() && close < open,
+                "{} at {at} is not inside a synchronised block \
+                 (last open {open:?}, last close {close:?}): {}",
+                show(taken),
+                show(seen)
+            );
+        }
+    }
+}
+
 /// The readable part of the output, for assertion messages: escape-heavy tails are
 /// unreadable, and the status line is what actually says what happened.
 ///
@@ -434,4 +560,111 @@ pub fn show(buf: &[u8]) -> String {
         }
     }
     s
+}
+
+/// The cells a stream of escapes would leave on screen.
+///
+/// The chrome is diffed frame to frame, so a message that replaces another is written only
+/// where the two differ: "scaling: scaled" over "scaling: scaled up" reaches the terminal as
+/// a few cells and a cursor move, and searching the stream for the whole phrase finds
+/// nothing. What is on screen is the claim worth making, so this reconstructs it.
+///
+/// Only what the chrome uses: absolute cursor positioning, printable text, and erase-to-end
+/// of line. Everything else -- graphics commands, SGR, mode changes -- is skipped, which is
+/// exactly right: none of it puts a glyph in a cell.
+pub struct Screen {
+    rows: Vec<Vec<char>>,
+}
+
+impl Screen {
+    /// Replay `out` onto a grid large enough for any terminal a test opens, so a resize
+    /// mid-stream does not need to be tracked to read what is on screen.
+    pub fn of(out: &[u8]) -> Self {
+        Self::replay(out, 512, 256)
+    }
+
+    /// Replay `out` and return what it left on a `cols` by `rows` screen.
+    pub fn replay(out: &[u8], cols: usize, rows: usize) -> Self {
+        let mut screen = Self {
+            rows: vec![vec![' '; cols]; rows],
+        };
+        let (mut row, mut col) = (0usize, 0usize);
+        let text = String::from_utf8_lossy(out).into_owned();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                if c.is_control() {
+                    continue;
+                }
+                if let Some(line) = screen.rows.get_mut(row)
+                    && let Some(cell) = line.get_mut(col)
+                {
+                    *cell = c;
+                }
+                col += 1;
+                continue;
+            }
+            // An escape: collect it, then act on the ones that move or blank cells.
+            let Some(kind) = chars.next() else { break };
+            if kind == '_' || kind == 'P' || kind == ']' {
+                // A device-control or graphics string, terminated by ST.
+                let mut last = '\0';
+                for c in chars.by_ref() {
+                    if last == '\x1b' && c == '\\' {
+                        break;
+                    }
+                    last = c;
+                }
+                continue;
+            }
+            if kind != '[' {
+                continue;
+            }
+            let mut params = String::new();
+            let mut final_byte = '\0';
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    final_byte = c;
+                    break;
+                }
+                params.push(c);
+            }
+            let numbers: Vec<usize> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
+            match final_byte {
+                'H' => {
+                    row = numbers.first().copied().unwrap_or(1).saturating_sub(1);
+                    col = numbers.get(1).copied().unwrap_or(1).saturating_sub(1);
+                }
+                'K' => {
+                    // 2 blanks the whole line, 0 or absent from the cursor on.
+                    let from = if numbers.first() == Some(&2) { 0 } else { col };
+                    if let Some(line) = screen.rows.get_mut(row) {
+                        for cell in &mut line[from.min(cols)..] {
+                            *cell = ' ';
+                        }
+                    }
+                }
+                'J' => {
+                    for line in &mut screen.rows {
+                        line.fill(' ');
+                    }
+                }
+                _ => {}
+            }
+        }
+        screen
+    }
+
+    /// One row, trailing blanks trimmed.
+    pub fn row(&self, row: usize) -> String {
+        self.rows
+            .get(row)
+            .map(|line| line.iter().collect::<String>().trim_end().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Is `text` on any row?
+    pub fn contains(&self, text: &str) -> bool {
+        (0..self.rows.len()).any(|row| self.row(row).contains(text))
+    }
 }

@@ -18,6 +18,7 @@ use crate::term::caps::Caps;
 use crate::term::kitty;
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard};
+use crate::ui::chrome::Chrome;
 use crate::ui::menu::{self, Menu};
 use crate::ui::status;
 use crate::ui::theme::Theme;
@@ -99,7 +100,13 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     };
     let ink = state.theme.palette();
     let mut show_menu = false;
-    let mut clear_menu = false;
+    let mut menu_shown = false;
+    let mut chrome = Chrome::new();
+    // The wipe a relayout asks for, waiting for the frame that fills the screen back
+    // in. Written on its own it is a blank screen that lasts until the next frame
+    // composes; carried into that frame's synchronised block, the old picture stands
+    // until the new one replaces it.
+    let mut pending_cleanup: Vec<u8> = Vec::new();
     let mut last_stats = crate::render::FrameStats::default();
     let mut dropped: u64 = 0;
 
@@ -116,7 +123,6 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             }
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    let was_showing = show_menu;
                     match key.code {
                         // Escape belongs to the menu while it is up, which is what the
                         // menu's own title offers. Leaving it as the way out of the
@@ -131,12 +137,6 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                         KeyCode::Char('h') | KeyCode::Char('?') => show_menu = !show_menu,
                         // Nothing else dismisses it, here as in a session.
                         _ => {}
-                    }
-                    // The menu leaves text and a backdrop image behind it, and
-                    // neither is undone by drawing the pattern again.
-                    if was_showing && !show_menu {
-                        clear_menu = true;
-                        renderer.mark_all();
                     }
                 }
                 Event::Mouse(m) => {
@@ -174,11 +174,13 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     pattern.resize(area_w, area_h);
                     fb.resize(area_w, area_h);
                     pattern.paint_all(&mut fb);
+
                     let layout = Layout::compute(&metrics, args.scale, area_w, area_h, (0, 0));
                     let cleanup = renderer.relayout(layout);
-                    if !cleanup.is_empty() {
-                        let _ = writer.submit_blocking(cleanup);
-                    }
+                    // Held for the next frame rather than written now, and appended: a
+                    // relayout names the tiles it has dropped, and a second one before
+                    // that frame goes out names different ones.
+                    pending_cleanup.extend_from_slice(&cleanup);
                 }
                 _ => {}
             }
@@ -199,7 +201,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         for r in &damage {
             renderer.mark(*r);
         }
-        if !renderer.has_work() && !show_menu && !clear_menu {
+        if !renderer.has_work() && pending_cleanup.is_empty() && !show_menu && !menu_shown {
             continue;
         }
 
@@ -207,22 +209,23 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         if caps.sync_output {
             kitty::begin_sync(&mut buf);
         }
-        if clear_menu {
-            menu.clear(&mut buf, &metrics);
-            clear_menu = false;
-        }
-        let stats = renderer.compose(&fb, &mut buf);
-        if stats.tiles > 0 {
-            last_stats = stats;
-        }
+        // A relayout's wipe, if one is owed: erase and delete inside the same
+        // synchronised block that puts the screen back, so the terminal only ever shows
+        // one of the two layouts and never the gap between them.
+        let cleanup = std::mem::take(&mut pending_cleanup);
+        buf.extend_from_slice(&cleanup);
 
-        let layout = renderer.layout();
-        // What is on screen, in the same place a session names its server.
+        // The chrome, diffed against what is on screen, before the tiles: see `session`.
+        let resized = chrome.begin(&metrics);
+        if resized {
+            buf.extend_from_slice(b"\x1b[2J");
+        }
+        let layout = *renderer.layout();
         let rest = format!(
             "  {}x{} {}  {} tiles",
             layout.dst_w,
             layout.dst_h,
-            describe(layout),
+            describe(&layout),
             renderer.tile_count(),
         );
         let figures = format!(
@@ -232,16 +235,29 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             human_bytes(last_stats.bytes),
             dropped,
         );
-        status::draw(
-            &mut buf,
+        status::render(
+            chrome.buffer(),
             &metrics,
             ink,
             vec![ink.bright(" test-pattern"), ink.text(&rest)],
             vec![ink.text(&figures), ink.bright("h"), ink.text(" menu ")],
         );
         if show_menu {
-            menu.draw(&mut buf, &metrics, state);
+            menu.render(&mut chrome, &mut buf, &metrics, state);
         }
+        menu_shown = show_menu;
+        for cells in chrome.flush(&mut buf) {
+            renderer.mark_cells(cells.x, cells.y, cells.width, cells.height);
+        }
+        if resized {
+            renderer.replace_all(&mut buf);
+        }
+
+        let stats = renderer.compose(&fb, &mut buf);
+        if stats.tiles > 0 {
+            last_stats = stats;
+        }
+
         if caps.sync_output {
             kitty::end_sync(&mut buf);
         }
@@ -249,12 +265,19 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         match writer.submit(buf) {
             Ok(()) => {
                 renderer.commit();
+                chrome.commit();
                 fps.tick();
             }
             // Terminal is still busy: keep the damage and try again next tick.
             Err(Busy::Full(buf)) => {
                 dropped += 1;
                 writer.recycle(buf);
+                // The wipe went out with the frame or not at all: dropping it here would
+                // leave the old layout's status line and tiles on screen for good, since
+                // the damage that would have painted over them was never composed.
+                if !cleanup.is_empty() {
+                    pending_cleanup = cleanup;
+                }
             }
             Err(Busy::Closed) => break,
         }

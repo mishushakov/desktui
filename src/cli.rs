@@ -56,6 +56,16 @@ pub struct Args {
     #[arg(long)]
     pub no_clipboard: bool,
 
+    /// Ask for each frame instead of letting the server push them.
+    ///
+    /// Pushed frames save a round trip each, and cost the pace: a server pushing as
+    /// fast as it can encode decides how hard both ends work, and every update has to
+    /// be decoded whether or not there is time to draw it. On a busy screen -- a page
+    /// being scrolled -- that can saturate the server, this end, or both. Asking for
+    /// one frame at a time gives the pace back, at a round trip per frame.
+    #[arg(long)]
+    pub no_push: bool,
+
     /// Local command prefix key, as a single character interpreted as Ctrl+<char>.
     #[arg(long, default_value = "a", value_name = "CHAR")]
     pub prefix: char,
@@ -141,12 +151,18 @@ impl Transfer {
             // not small. Measured on a full-screen 1600x832 update in 91 tiles
             // (`cargo test --release --test perf -- --ignored --nocapture`):
             //
-            //   pack BGRA->RGB            1.4 ms/frame
-            //   direct: +zlib +base64    21.0 ms/frame   ->  48 fps ceiling
-            //   shm: +object per tile     2.1 ms/frame   -> 466 fps ceiling
+            //   pack BGRA->RGB into a buffer     1.0 ms/frame
+            //   direct: +zlib +base64           13.7 ms/frame   ->   73 fps ceiling
+            //   shm: object per tile             1.5 ms/frame   ->  654 fps ceiling
+            //   shm: per tile, packed in place   0.9 ms/frame   -> 1171 fps ceiling
             //
-            // The six syscalls per tile cost 0.7ms across all 91 of them; zlib
-            // costs twenty. The probe is what makes this safe to default to --
+            // zlib is the whole story on the direct path. On the shared memory one it
+            // is the pack: writing into the mapping rather than into a buffer for a
+            // copy to follow is most of the difference between the last two rows. One
+            // object for the whole frame would be faster still -- five system calls
+            // rather than five a tile -- but Ghostty draws nothing for a placement
+            // carrying an `O=` offset; see RENDERING.md. The probe is what makes this
+            // safe to default to --
             // frames go out with responses suppressed, so a medium the terminal
             // cannot handle would fail invisibly, and silence about `t=s` sends us
             // down the path that always works.

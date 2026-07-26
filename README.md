@@ -35,7 +35,10 @@ stops input reaching the remote and leaves the pointer for the server to draw.
 
 **Tuned for the link you are on.** `--quality` and `--compression` trade sharpness and
 server CPU against bandwidth, and `--fps` caps the frame rate. The defaults are
-lossless at 60 fps; turn quality down only when the link cannot afford it.
+lossless at 60 fps; turn quality down only when the link cannot afford it — a screen
+that changes wholesale, like a page being scrolled, is where lossless gets expensive,
+and it is the server paying. `--no-push` goes further and takes the pace back from the
+server; see below.
 
 **Your keys reach the remote, not the terminal.** Everything is passed through,
 including `Ctrl+C`. Local commands live behind `Ctrl+A`, which `--prefix` moves when it
@@ -107,7 +110,7 @@ Also used when the terminal offers it:
 | Mouse mode 1016 (SGR-pixel) | pointer position in pixels | pointer snaps to cell centres |
 | Mode 2026 (synchronised output) | a frame commits without tearing | multi-tile frames may tear |
 | Kitty keyboard protocol | real key releases, bare modifier keys | a release is synthesised after each press |
-| `t=s` shared memory | frames skip base64 and zlib: ~10x the throughput on a full-screen update, and the default when offered | base64 + zlib, capped near 48 fps for full-screen motion |
+| `t=s` shared memory | frames skip base64 and zlib, and pixels are packed straight into the object the terminal reads: ~15x the throughput on a full-screen update, and the default when offered | base64 + zlib, capped near 70 fps for full-screen motion |
 
 Run `--print-caps` to see what your terminal answered. It reports the pixel geometry
 from both `TIOCGWINSZ` and `CSI 14 t`, and warns when they disagree — that
@@ -127,7 +130,7 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | `m` | cycle the scaling mode: native / fit / integer / 1:1 |
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
-| `c` | toggle statistics (fps, tiles, bytes per frame, server RTT) |
+| `c` | toggle statistics: ours (fps, tiles, bytes per frame) and the server's (updates per second, delivery time, megapixels per update), plus RTT and dropped frames |
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
 Clipboard works in both directions: paste into the terminal and it reaches the
@@ -153,15 +156,39 @@ cells, each with its own image id. Only tiles that changed are retransmitted, an
 re-sending an id replaces the image and its placement atomically, so partial updates
 need no delete traffic and never flicker. A one-pixel change costs about a kilobyte.
 
+What "changed" means is asked of each tile rather than tracked centrally: a tile holds a
+key -- where its pixels come from, at what scale, through which filter, from which
+generation of the framebuffer -- and sending is what happens when the key it holds is not
+the key it wants. One comparison covers damage, resizing, panning, a change of scale mode
+and a change of font size, with no case for each. An id names *where a tile sits*, so a
+window that grew by two cells keeps every tile whose pixels are unchanged and a view that
+merely re-centred is moved rather than re-sent: one placement per tile, about forty bytes,
+no pixels at all.
+
+A frame is one write, wrapped in synchronised output, so the terminal shows the frame before
+it or the frame after it and never a screen mid-change. Everything a relayout has to take
+off the screen travels inside the frame that puts the new one up, which is what makes
+resizing smooth rather than a flicker: dragging a window edge never shows a blank. A resize
+does erase the screen's text -- what a terminal leaves on the alternate screen after the
+window changes shape is not something a client can assume -- and it is the same frame that
+says all of it again.
+
+A frame also waits for the update it would be drawing to be whole. The rectangles of one
+framebuffer update are one picture, and half of them on screen is half a scroll position;
+the wait is capped at 250ms per update, because a screen that stands still is worse than one
+with a seam.
+
 Tiles are placed with `z=-1`, below text and above the cell background, so the
 status line and command menu stay readable on top of the remote screen.
 
 The mouse pointer is drawn here rather than by the server: asking for the `Cursor`
 pseudo-encoding gets the shape sent once and stops the server compositing it into the
 framebuffer, so the pointer keeps up with your hand instead of lagging it by a round
-trip. It is blended into each tile as that tile is packed, which leaves the server's
-picture untouched — nothing to save and restore, and a pointer that moves twice between
-frames costs nothing extra. A view-only session does not ask, because there is no local
+trip. It is an image of its own with an id above every tile's, placed with sub-cell offsets and
+moved with a placement rather than a transmission — so moving the mouse costs about forty
+bytes, where blending it into each tile it touched used to retransmit two to four of them
+per frame. Being above every tile also means it stays visible over the command menu, which
+is what you click its items with. A view-only session does not ask, because there is no local
 pointer worth drawing and the server's own is the only way to see where the real one is.
 
 Update requests are paced against the end of each framebuffer update, so there is
@@ -179,14 +206,25 @@ Measured on a 1600x832 update in 91 tiles, single threaded
 
 | stage | per frame | ceiling |
 |---|---|---|
-| pack BGRA → RGB (every path pays this) | 1.4 ms | 700 fps |
-| `direct`: + zlib + base64 | 21.0 ms | **48 fps** |
-| `shm`: + one object per tile | 2.1 ms | **466 fps** |
+| pack BGRA → RGB into a buffer | 1.0 ms | 988 fps |
+| `direct`: + zlib + base64 | 13.7 ms | **73 fps** |
+| `shm`: an object per tile, packed then copied | 1.5 ms | **654 fps** |
+| `shm`: an object per tile, packed in place | 0.9 ms | **1171 fps** |
 
-zlib is the whole story: the 546 syscalls behind 91 shared memory objects cost 0.7 ms
-between them, and compression costs twenty. So on a local terminal, full-screen
-motion is not CPU-bound; over SSH, where shared memory cannot work, expect the
-compression ceiling. Server-side encoding and JPEG decode come on top of both.
+zlib is the whole story on the direct path: compression and base64 cost twelve
+milliseconds that shared memory does not pay at all. On the shared memory path it is the
+pack — writing straight into the mapping the terminal will read, rather than into a buffer
+for a copy to follow, which is why the last row comes in below the buffered pack above it.
+
+One object for the whole frame instead of one per tile would be faster still, five system
+calls rather than five per tile, and the protocol has the keys for it (`O=`/`S=`). Ghostty
+draws nothing for a placement carrying them, so that is not what this does —
+[`RENDERING.md`](RENDERING.md) has the details.
+
+So on a local terminal, full-screen motion is not CPU-bound on this side; over SSH, where
+shared memory cannot work, expect the compression ceiling. Server-side encoding and JPEG
+decode come on top of both, and on a busy screen the server is usually the one that runs
+out first — see `--quality`.
 
 What would help beyond this is the **continuous updates** extension, where the server
 pushes frames instead of answering a request each time. That saves one network round
@@ -204,6 +242,13 @@ answering `SetEncodings` with `EndOfContinuousUpdates`; from then on no requests
 at all, and a fence is echoed back with the request bit cleared and any flag we do not
 implement stripped. TigerVNC negotiates this, so `make test-live` covers it against a
 real server rather than only a cooperative fake.
+
+What it costs is the pace. A server pushing as fast as it can encode decides how hard
+both ends work, and every update has to be decoded to keep the stream in sync whether or
+not there is time to draw it — so `--fps` bounds the drawing and not the work. On a busy
+screen that can saturate the server, this end, or both. `--no-push` never offers the
+encoding, and ignores the announcement from a server that sends it unbidden: frames go
+back to one request at a time, a round trip each.
 
 **Lock-key state** (`QEMULedEvent`, -261). A remote caps lock that disagrees with the
 local keyboard turns every keystroke into the wrong case, and nothing in the keystroke
@@ -231,7 +276,9 @@ make perf           # time the compose pipeline
 
 The protocol layer is vendored rather than a dependency — [`src/rfb/README.md`](src/rfb/README.md)
 says why, and what was fixed on the way in. [`TESTING.md`](TESTING.md) describes the test
-suites and which of them needs what.
+suites and which of them needs what. [`RENDERING.md`](RENDERING.md) is the render
+pipeline: what the graphics protocol dictates, how a resize is made cheap, and which parts
+of that design are built.
 
 The live suite needs the container:
 

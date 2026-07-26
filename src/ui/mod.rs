@@ -9,6 +9,7 @@
 //! Text is legible over the image because placements use `z=-1`, which puts them
 //! below text and above the cell background.
 
+pub mod chrome;
 pub mod menu;
 mod paint;
 pub mod status;
