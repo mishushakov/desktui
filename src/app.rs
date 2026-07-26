@@ -211,21 +211,31 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         }
 
         let layout = renderer.layout();
-        let left = format!(
-            " test-pattern  {}x{} {}  {} tiles",
+        // What is on screen, in the same place a session names its server.
+        let rest = format!(
+            "  {}x{} {}  {} tiles",
             layout.dst_w,
             layout.dst_h,
             describe(layout),
             renderer.tile_count(),
         );
-        let right = format!(
-            "{:>5.1} fps  {:>3} tiles/f  {:>6}/f  {} dropped  q quit  h menu ",
+        let figures = format!(
+            "{:>5.1} fps  {:>3} tiles/f  {:>6}/f  {} dropped  q quit  ",
             fps.fps(),
             last_stats.tiles,
             human_bytes(last_stats.bytes),
             dropped,
         );
-        status::draw(&mut buf, &metrics, &left, &right);
+        status::draw(
+            &mut buf,
+            &metrics,
+            vec![status::bright(" test-pattern"), status::text(&rest)],
+            vec![
+                status::text(&figures),
+                status::bright("h"),
+                status::text(" menu "),
+            ],
+        );
         if show_menu {
             menu.draw(&mut buf, &metrics, args.scale);
         }

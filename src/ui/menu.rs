@@ -19,6 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Widget};
 
+use super::ACCENT;
 use super::paint::write_cells;
 use crate::cli::ScaleMode;
 use crate::term::input::Command;
@@ -47,9 +48,8 @@ const HOVER: Color = Color::Rgb(0xed, 0xe9, 0xfe);
 const HOVER_RGB: (u8, u8, u8) = (0xed, 0xe9, 0xfe);
 
 /// Inks. The background is set once by the block and left alone, so these only
-/// ever change the glyph colour.
+/// ever change the glyph colour. `ACCENT` is shared with the status bar.
 const INK: Color = Color::Rgb(0x11, 0x11, 0x11);
-const ACCENT: Color = Color::Rgb(0x7c, 0x3a, 0xed);
 const MUTED: Color = Color::Rgb(0x88, 0x88, 0x88);
 
 /// Breathing room inside the box, in cells. There is no border to hold the text

@@ -1201,51 +1201,76 @@ impl Session {
 
     fn draw_status(&mut self, buf: &mut Vec<u8>) {
         let layout = *self.renderer.layout();
-        let mut left = format!(
-            " {}  {}x{}",
-            if self.server_name.is_empty() {
-                "desktui"
-            } else {
-                self.server_name.as_str()
-            },
-            self.remote.0,
-            self.remote.1
-        );
+        // What this is connected to, which is the one thing on the left worth reading
+        // without looking for it.
+        let name = if self.server_name.is_empty() {
+            " desktui".to_string()
+        } else {
+            format!(" {}", self.server_name)
+        };
+
+        let mut rest = format!("  {}x{}", self.remote.0, self.remote.1);
         if !layout.is_pixel_exact() {
-            left.push_str(&format!(" -> {}x{}", layout.dst_w, layout.dst_h));
+            rest.push_str(&format!(" -> {}x{}", layout.dst_w, layout.dst_h));
         }
-        left.push_str(&format!("  {}", describe(&layout)));
+        rest.push_str(&format!("  {}", describe(&layout)));
         if self.view_only {
-            left.push_str("  view-only");
+            rest.push_str("  view-only");
         }
-        if self.input.is_armed() {
-            left.push_str("  PREFIX");
-        }
-        if let Some((note, at)) = &self.note {
+
+        // The note comes after the dot below, so it is built here rather than pushed.
+        let mut note = String::new();
+        if let Some((text, at)) = &self.note {
             if at.elapsed() < NOTE_LINGER {
-                left.push_str("  -- ");
-                left.push_str(note);
+                note = format!("  -- {text}");
             } else {
                 self.note = None;
             }
         }
 
-        // The one binding worth naming, because it opens the menu the rest of them
-        // are listed in. Shortened when the statistics are up and the room is gone.
-        let prefix = self.input.prefix().to_ascii_uppercase();
-        let right = if self.show_stats {
-            format!(
-                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  Ctrl+{prefix} p ",
-                self.fps.fps(),
-                self.last_stats.tiles,
-                human_bytes(self.last_stats.bytes),
-                format_rtt(self.rtt),
-                self.dropped,
+        // The one binding worth naming, because it opens the menu the rest of them are
+        // listed in. It keeps the ink when the statistics crowd the words out.
+        // Lower case, as the menu writes its shortcuts: the two should read alike.
+        let key = format!("ctrl+{} p", self.input.prefix());
+        let (figures, label) = if self.show_stats {
+            (
+                format!(
+                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  ",
+                    self.fps.fps(),
+                    self.last_stats.tiles,
+                    human_bytes(self.last_stats.bytes),
+                    format_rtt(self.rtt),
+                    self.dropped,
+                ),
+                " ".to_string(),
             )
         } else {
-            format!("{:>6}  Ctrl+{prefix} p for cmd ", format_rtt(self.rtt))
+            (
+                format!("{:>6}  ", format_rtt(self.rtt)),
+                " commands ".into(),
+            )
         };
-        status::draw(buf, &self.metrics, &left, &right);
+
+        // Lit while the prefix waits on its key. The dot is what catches the eye and
+        // the word is what it means: the next key is a command, not a keystroke. In the
+        // colour the menu picks things out with, so the light and the box it is about
+        // read as the same idea.
+        let mut left = vec![status::bright(&name), status::text(&rest)];
+        if self.input.is_armed() {
+            left.push(status::accent("  ● CMD"));
+        }
+        left.push(status::text(&note));
+
+        status::draw(
+            buf,
+            &self.metrics,
+            left,
+            vec![
+                status::text(&figures),
+                status::bright(&key),
+                status::text(&label),
+            ],
+        );
     }
 
     fn relayout(&mut self) {
