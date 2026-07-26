@@ -3,9 +3,20 @@
 //! We only need a narrow slice of the protocol, but that slice has to be exactly
 //! right:
 //!
-//! * `a=T` transmits and places in one command. Re-transmitting an id deletes
-//!   the previous image *and* its placements, so a stable id per tile gives
-//!   flicker-free partial updates without any explicit delete traffic.
+//! * `a=T` transmits and places in one command, and `p=` pins the placement it
+//!   makes. Both halves matter. A terminal keys a placement by image id *and*
+//!   placement id, and a command that omits `p=` asks for a brand new placement
+//!   rather than a replacement -- so a stable image id alone is not enough to
+//!   replace anything. Every tile of every frame would add a placement that
+//!   nothing ever removes.
+//! * `a=d,d=i` drops the previous placement just before the new one is made. The
+//!   spec says re-transmitting an image id deletes its placements for us, and
+//!   this code used to rely on that, but Ghostty's `addPlacement` overwrites the
+//!   map entry without releasing the pin the old placement held in the screen.
+//!   With `p=` alone the placement count stays flat and the pins still pile up,
+//!   which is a leak in the terminal that only an explicit delete collects. The
+//!   `d` is lower case so the image data survives to be overwritten by the `a=T`
+//!   that follows.
 //! * `f=24` sends packed RGB. That is 25% less data through zlib than RGBA, and
 //!   the alpha channel would be constant anyway.
 //! * `o=z` compresses the payload. Screen content is highly compressible, and
@@ -42,6 +53,14 @@ const ZLIB_LEVEL: Compression = Compression::new(1);
 /// the low ids other programs tend to pick.
 pub const IMAGE_ID_BASE: u32 = 0x7600;
 
+/// Placement id carried by every image we place.
+///
+/// One constant covers every tile: a placement is keyed by the pair, and each
+/// tile already owns an image id, so nothing collides. Any non-zero value would
+/// do -- zero is the one that must be avoided, being the protocol's way of
+/// asking for an additional placement instead of a replacement.
+const PLACEMENT_ID: u32 = 1;
+
 /// Image id for an overlay's backdrop, above every id a tile can take.
 ///
 /// Tiles are around 128px square, so even a 4K terminal uses a few hundred of
@@ -54,7 +73,8 @@ pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x10000;
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
-    /// Image id. Re-using one replaces the image and its placements atomically.
+    /// Image id. Re-using one replaces the image data; the placement on top of it
+    /// is replaced by the fixed `p=` every command carries.
     pub id: u32,
     /// Zero-based cell the top-left corner lands on.
     pub col: u16,
@@ -111,6 +131,8 @@ impl KittyEncoder {
         b64.clear();
         BASE64.encode_string(data, b64);
 
+        release_placement(out, id);
+
         // Place at the cursor, so put the cursor where the tile goes. CUP is
         // one-based.
         let _ = write!(out, "\x1b[{};{}H", row as u32 + 1, col as u32 + 1);
@@ -121,7 +143,7 @@ impl KittyEncoder {
         let mut remaining = bytes.len().saturating_sub(first.len());
 
         out.extend_from_slice(b"\x1b_Ga=T,q=2,C=1,z=-1,f=24,i=");
-        let _ = write!(out, "{id},s={w},v={h}");
+        let _ = write!(out, "{id},p={PLACEMENT_ID},s={w},v={h}");
         if *compress {
             out.extend_from_slice(b",o=z");
         }
@@ -152,10 +174,14 @@ impl KittyEncoder {
         if w == 0 || h == 0 {
             return;
         }
+        release_placement(out, id);
         let _ = write!(out, "\x1b[{};{}H", row as u32 + 1, col as u32 + 1);
         self.b64.clear();
         BASE64.encode_string(name.as_bytes(), &mut self.b64);
-        let _ = write!(out, "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},s={w},v={h};");
+        let _ = write!(
+            out,
+            "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},p={PLACEMENT_ID},s={w},v={h};"
+        );
         out.extend_from_slice(self.b64.as_bytes());
         out.extend_from_slice(b"\x1b\\");
     }
@@ -169,6 +195,21 @@ impl KittyEncoder {
     pub fn delete_all(out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\");
     }
+}
+
+/// Let go of an image's current placement, keeping the image data.
+///
+/// Emitted immediately before every placement, which is not the tidiness it looks
+/// like. Replacing a placement is meant to release whatever the old one held, and
+/// Ghostty does not: the entry in its placement map is overwritten in place while
+/// the tracked pin the old placement had taken in the screen is left behind. At a
+/// placement per tile per frame those pins are thousands a second, so the delete
+/// is what keeps a long session from slowing to a crawl.
+///
+/// `d=i` rather than `d=I`: the upper case form frees the image data too, and the
+/// `a=T` that follows is about to replace it anyway.
+fn release_placement(out: &mut Vec<u8>, id: u32) {
+    let _ = write!(out, "\x1b_Ga=d,d=i,i={id},p={PLACEMENT_ID},q=2\x1b\\");
 }
 
 /// Fill a block of cells with one colour, as an image at the tiles' own z-index.
@@ -198,10 +239,13 @@ pub fn place_solid(
     let mut b64 = String::new();
     BASE64.encode_string(&pixels, &mut b64);
 
+    // The overlay is redrawn every frame it is up, so it accumulates placements
+    // exactly as a tile would without this.
+    release_placement(out, id);
     let _ = write!(out, "\x1b[{row};{col}H");
     let _ = write!(
         out,
-        "\x1b_Ga=T,q=2,C=1,z=-1,f=24,i={id},s=2,v=2,c={cols},r={rows};"
+        "\x1b_Ga=T,q=2,C=1,z=-1,f=24,i={id},p={PLACEMENT_ID},s=2,v=2,c={cols},r={rows};"
     );
     out.extend_from_slice(b64.as_bytes());
     out.extend_from_slice(b"\x1b\\");
@@ -234,6 +278,10 @@ mod tests {
 
     /// Pull the payloads out of a stream of graphics commands, returning the
     /// first command's keys alongside the concatenated base64.
+    ///
+    /// Commands carrying no payload are skipped, so the count is the number of
+    /// transmissions and the placement-releasing deletes that precede each one do
+    /// not show up as chunks.
     fn split(out: &[u8]) -> (String, String, usize) {
         let text = String::from_utf8(out.to_vec()).unwrap();
         let mut keys = String::new();
@@ -242,7 +290,9 @@ mod tests {
         for cmd in text.split("\x1b_G").skip(1) {
             let cmd = cmd.strip_suffix("\x1b\\").unwrap_or(cmd);
             let cmd = cmd.split("\x1b\\").next().unwrap();
-            let (k, p) = cmd.split_once(';').unwrap();
+            let Some((k, p)) = cmd.split_once(';') else {
+                continue;
+            };
             if count == 0 {
                 keys = k.to_string();
             }
@@ -250,6 +300,18 @@ mod tests {
             count += 1;
         }
         (keys, payload, count)
+    }
+
+    /// The graphics commands in a stream, as their key strings.
+    fn commands(out: &[u8]) -> Vec<String> {
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        text.split("\x1b_G")
+            .skip(1)
+            .map(|cmd| {
+                let cmd = cmd.split("\x1b\\").next().unwrap();
+                cmd.split(';').next().unwrap().to_string()
+            })
+            .collect()
     }
 
     #[test]
@@ -280,11 +342,71 @@ mod tests {
         let mut enc = KittyEncoder::new(false);
         let mut out = Vec::new();
         enc.place_rgb(&mut out, place(IMAGE_ID_BASE, 7, 3, 1, 1), &[1, 2, 3]);
+        let text = String::from_utf8(out).unwrap();
+        // Immediately before the transmission, wherever the release ahead of it
+        // ends: a placement lands wherever the cursor happens to be.
         assert!(
-            out.starts_with(b"\x1b[4;8H"),
-            "{:?}",
-            String::from_utf8_lossy(&out)
+            text.contains("\x1b[4;8H\x1b_Ga=T"),
+            "{}",
+            text.escape_debug()
         );
+    }
+
+    /// The leak this guards against: a placement command with no `p=` asks the
+    /// terminal for an *additional* placement rather than a replacement, so every
+    /// tile of every frame left one behind. Ghostty rebuilds its whole placement
+    /// list each frame, so a session's cost grew with its age until it crawled.
+    #[test]
+    fn every_placement_pins_its_placement_id() {
+        let mut enc = KittyEncoder::new(true);
+        let mut out = Vec::new();
+        enc.place_rgb(&mut out, place(IMAGE_ID_BASE, 0, 0, 2, 2), &[7; 2 * 2 * 3]);
+        enc.place_shm(&mut out, place(IMAGE_ID_BASE + 1, 0, 0, 2, 2), "/vt1-2");
+        place_solid(&mut out, OVERLAY_IMAGE_ID, 1, 1, 4, 2, (0, 0, 0));
+
+        let transmits: Vec<_> = commands(&out)
+            .into_iter()
+            .filter(|keys| keys.contains("a=T"))
+            .collect();
+        assert_eq!(transmits.len(), 3, "{transmits:?}");
+        for keys in transmits {
+            assert!(
+                keys.contains(&format!("p={PLACEMENT_ID}")),
+                "a placement without p= accumulates in the terminal: {keys}"
+            );
+        }
+    }
+
+    /// And the other half of it: replacing a placement is supposed to release what
+    /// the old one held, but Ghostty keeps the pin, so the release has to be asked
+    /// for. Lower-case `d` leaves the image data for the transmission to replace.
+    #[test]
+    fn each_placement_releases_the_one_it_replaces() {
+        let mut enc = KittyEncoder::new(false);
+        for (label, out) in [
+            ("rgb", {
+                let mut out = Vec::new();
+                enc.place_rgb(&mut out, place(IMAGE_ID_BASE + 5, 0, 0, 2, 2), &[0; 12]);
+                out
+            }),
+            ("shm", {
+                let mut out = Vec::new();
+                enc.place_shm(&mut out, place(IMAGE_ID_BASE + 5, 0, 0, 2, 2), "/vt1-2");
+                out
+            }),
+        ] {
+            let cmds = commands(&out);
+            let release = format!("a=d,d=i,i={},p={PLACEMENT_ID},q=2", IMAGE_ID_BASE + 5);
+            assert_eq!(
+                cmds.first().map(String::as_str),
+                Some(release.as_str()),
+                "{label}: {cmds:?}"
+            );
+            assert!(
+                cmds[1].contains("a=T"),
+                "{label}: the release must sit directly ahead of the placement: {cmds:?}"
+            );
+        }
     }
 
     #[test]
@@ -308,11 +430,13 @@ mod tests {
         assert_eq!(BASE64.decode(payload).unwrap(), rgb);
 
         // Only the last chunk says m=0, and continuation chunks carry nothing
-        // but m and q.
+        // but m and q. The release and the first chunk come ahead of them.
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("m=0").count(), 1);
-        for cmd in text.split("\x1b_G").skip(2) {
-            let keys = cmd.split(';').next().unwrap();
+        let continuations = commands(text.as_bytes());
+        let continuations = &continuations[2..];
+        assert_eq!(continuations.len(), 3);
+        for keys in continuations {
             assert!(
                 keys == "m=1,q=2" || keys == "m=0,q=2",
                 "continuation keys must be m and q only, got {keys}"
