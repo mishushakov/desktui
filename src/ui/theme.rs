@@ -1,9 +1,9 @@
 //! The two palettes the chrome can wear.
 //!
-//! One palette covers both pieces, because they are one piece of chrome as far as
-//! the eye is concerned: the bar names what you are connected to and the menu lists
-//! what you can do about it, and a light box over a dark bar would read as two
-//! programs.
+//! One palette covers every piece, because they are one piece of chrome as far as
+//! the eye is concerned: the bar names what you are connected to, the menu lists what
+//! you can do about it and the popup says what came of it, and a light box over a dark
+//! bar would read as two programs.
 //!
 //! Every colour is kept as bytes rather than as a `ratatui::Color`. The menu needs
 //! both forms -- its backdrop and its highlight are images, because a cell colour
@@ -39,8 +39,9 @@ impl Theme {
 
 /// Everything either piece of chrome is allowed to paint with.
 pub struct Palette {
-    /// The menu's background, and the ink on it: labels, then the shortcuts beside
-    /// them, which are quieter because you read them second.
+    /// The surface the menu and the notification popup are drawn on, and the ink on
+    /// it: labels, then the shortcuts beside them, which are quieter because you read
+    /// them second.
     pub paper: Rgb,
     pub ink: Rgb,
     pub muted: Rgb,
@@ -72,6 +73,25 @@ impl Palette {
     /// prefix waits for the key that follows it.
     pub fn accent<'a>(&self, text: &'a str) -> Span<'a> {
         Span::styled(text, Style::new().fg(colour(self.accent)))
+    }
+
+    /// The button that closes a piece of chrome, quiet or under the pointer.
+    ///
+    /// The menu's title carries one and so does the notification popup, and the pointer
+    /// has to do the same thing to both -- so the styling is defined once here rather
+    /// than at each of them, where two copies would drift into two conventions for one
+    /// control.
+    ///
+    /// It lifts by colour alone: grey to the accent, with no ground behind it and nothing
+    /// drawn under it. Three cells of bracketed mark changing colour is a plain enough
+    /// answer to being pointed at, and a bar and a rule on top of that are two more marks
+    /// saying the same thing. The menu makes an exception of this row for the same reason
+    /// (see `menu::Menu::hover_bar`).
+    pub fn close_button(&self, hovered: bool) -> Style {
+        match hovered {
+            true => Style::new().fg(colour(self.accent)),
+            false => Style::new().fg(colour(self.muted)),
+        }
     }
 }
 
@@ -135,6 +155,28 @@ mod tests {
                 p.paper, p.bar,
                 "{theme:?}: the menu is not the bar's colour"
             );
+        }
+    }
+
+    #[test]
+    fn a_close_button_lights_by_colour_and_nothing_else() {
+        // The menu's title and the popup both carry one, and one definition serves both,
+        // so this is the whole of what either of them does to it: grey to the accent, with
+        // no ground behind it and no rule under it.
+        for theme in [Theme::Dark, Theme::Light] {
+            let p = theme.palette();
+            let quiet = p.close_button(false);
+            assert_eq!(quiet.fg, Some(colour(p.muted)), "{theme:?}");
+
+            let lit = p.close_button(true);
+            assert_eq!(lit.fg, Some(colour(p.accent)), "{theme:?}");
+            for state in [quiet, lit] {
+                assert_eq!(state.bg, None, "{theme:?}: the button has no ground");
+                assert!(
+                    state.add_modifier.is_empty(),
+                    "{theme:?}: the colour is the whole of it"
+                );
+            }
         }
     }
 

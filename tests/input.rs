@@ -87,7 +87,8 @@ fn input_reaches_the_server_with_pixel_exact_coordinates() {
 #[test]
 fn the_command_menu_holds_the_focus_until_escape() {
     // The menu has the focus while it is up: a key neither dismisses it nor reaches
-    // the remote, and escape -- which is what the title offers -- is the way out.
+    // the remote, and escape is the way out -- as is the [x] on the title, and the
+    // toggle at the top of the box.
     let (server, mut term) = start(Resize::Accept, (1024, 768));
     assert_pixel_exact(&term, Duration::from_secs(10));
 
@@ -227,6 +228,131 @@ fn clicking_a_scaling_option_selects_that_one() {
             ))
             .is_none(),
         "the click was forwarded to the server as well"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn clicking_the_close_button_puts_the_notification_away() {
+    // The popup's `[x]` is the one target outside the menu. A click on it has to take
+    // the box off the screen before its linger is up -- and take it off properly, the
+    // message being text that no repaint of the tiles under it would erase.
+    let (server, mut term) = start(Resize::Accept, (1024, 768));
+    assert_drew(&term, Duration::from_secs(10));
+
+    // Ctrl+A then f asks for a full refresh, which is the shortest way to a note.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"f");
+    assert!(
+        term.wait_for(b"full refresh requested", Duration::from_secs(10)),
+        "the notification never appeared: {}",
+        tail(&term.output())
+    );
+
+    // Where the button is. The message is 22 columns and the box adds eight -- three of
+    // gap, one for the `x`, two of padding either side -- so it is 30 wide, held two
+    // columns off the right of 200 and one row down. That puts the `x` at cell 195,2,
+    // which in 8x17 cells is pixel 1560,34; mouse reports are one-based.
+    //
+    // Checked rather than assumed, because a click aimed at a box that has moved would
+    // fail somewhere far less obvious than here.
+    let out = term.output();
+    let at = find(&out, b"\x1b[3;169H").unwrap_or_else(|| {
+        panic!(
+            "the notification does not start at cell 169,3 any more: {}",
+            tail(&out)
+        )
+    });
+    assert!(
+        contains(
+            &out[at..(at + 120).min(out.len())],
+            b"full refresh requested"
+        ),
+        "cell 169,3 is no longer the message's row, so the click would miss"
+    );
+
+    let mark = out.len();
+    term.send(b"\x1b[<0;1561;35M");
+    term.send(b"\x1b[<0;1561;35m");
+    std::thread::sleep(Duration::from_millis(600));
+
+    let since = term.output()[mark..].to_vec();
+    assert!(
+        contains(&since, b"a=d,d=I,i="),
+        "the popup's backdrop was never deleted, so the box is still there: {}",
+        tail(&since)
+    );
+    assert!(
+        !contains(&since, b"full refresh requested"),
+        "the message is still being redrawn: {}",
+        tail(&since)
+    );
+
+    // And the click went to the popup alone: a press that reached the remote as well
+    // would have landed on whatever the box was covering.
+    assert!(
+        server
+            .wait_for(Duration::from_secs(1), |r| matches!(
+                r,
+                Request::Pointer { buttons: 1, .. }
+            ))
+            .is_none(),
+        "the click was forwarded to the server as well"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn the_close_button_answers_while_the_menu_is_up() {
+    // Which is most of the time a note is on screen: half the commands that raise one
+    // are reached through the menu, and a click on a menu item leaves the box up. The
+    // popup is drawn over the menu, so it has to be clickable over it too -- otherwise
+    // the menu, which takes the whole pointer while it is up, eats the click.
+    let (_server, mut term) = start(Resize::Accept, (1024, 768));
+    assert_drew(&term, Duration::from_secs(10));
+
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"p");
+    assert!(
+        term.wait_for(b"Renegotiate the remote size", Duration::from_secs(10)),
+        "the menu never appeared: {}",
+        tail(&term.output())
+    );
+
+    // A local command still works with the menu up, and this one puts a note on screen.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"f");
+    assert!(
+        term.wait_for(b"full refresh requested", Duration::from_secs(10)),
+        "the notification never appeared: {}",
+        tail(&term.output())
+    );
+
+    // The button, as in `clicking_the_close_button_puts_the_notification_away`: cell
+    // 195,2 of an 8x17 grid, and mouse reports are one-based.
+    let mark = term.output().len();
+    term.send(b"\x1b[<0;1561;35M");
+    term.send(b"\x1b[<0;1561;35m");
+    std::thread::sleep(Duration::from_millis(600));
+
+    let since = term.output()[mark..].to_vec();
+    assert!(
+        !contains(&since, b"full refresh requested"),
+        "the menu swallowed the click on the popup drawn over it: {}",
+        tail(&since)
+    );
+    // And the menu is still up: the cross closes the note, not the box behind it.
+    assert!(
+        contains(&since, b"Renegotiate the remote size"),
+        "closing the notification put the menu away too: {}",
+        tail(&since)
     );
 
     quit(&mut term);

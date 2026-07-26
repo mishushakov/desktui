@@ -88,7 +88,7 @@ desktop is reflowed to fit and no resampling happens at all. Resize the terminal
 window and the remote desktop follows.
 
 When a server will not do that — `x11vnc` usually refuses, and some are not built
-for it — the status line says why and falls back to scaling or a 1:1 view you can
+for it — a notification says why and falls back to scaling or a 1:1 view you can
 pan.
 
 ## Requirements
@@ -239,7 +239,7 @@ make desktop-stop
 TigerVNC on purpose: `-AcceptSetDesktopSize` defaults to on, so the negotiation is
 genuinely exercised rather than quietly falling back. Point the client at an `x11vnc`
 instance instead to exercise the other path — it usually answers "administratively
-prohibited", which is what the status line has to explain.
+prohibited", which is what the notification has to explain.
 
 The container publishes to `127.0.0.1` and nothing else, because VNC's password auth
 is DES with an eight-character key and the session that follows is in the clear.
