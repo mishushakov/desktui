@@ -242,7 +242,9 @@ make perf           # time the compose pipeline
 
 The protocol layer is vendored rather than a dependency — [`src/rfb/README.md`](src/rfb/README.md)
 says why, and what was fixed on the way in. [`TESTING.md`](TESTING.md) describes the test
-suites and which of them needs what.
+suites and which of them needs what. [`RENDERING.md`](RENDERING.md) is the render
+pipeline: what the graphics protocol dictates, how a resize is made cheap, and which parts
+of that design are built.
 
 The live suite needs the container:
 
