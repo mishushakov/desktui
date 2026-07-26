@@ -1,4 +1,5 @@
-use crate::rfb::{PixelFormat, Rect, VncError, VncEvent};
+use crate::remote::Rect;
+use crate::rfb::{PixelFormat, VncError, VncEvent};
 use std::future::Future;
 use std::io::Read;
 use tokio::io::{AsyncRead, AsyncReadExt};

@@ -55,7 +55,8 @@ pub(super) fn palette_entry(
 /// that the pixels are right, and is `#[ignore]`d besides.
 #[cfg(test)]
 pub(super) mod testing {
-    use crate::rfb::{PixelFormat, Rect, VncError, VncEvent};
+    use crate::remote::Rect;
+    use crate::rfb::{PixelFormat, VncError, VncEvent};
     use std::cell::RefCell;
     use std::future::{Ready, ready};
 

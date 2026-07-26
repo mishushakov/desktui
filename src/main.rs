@@ -1,8 +1,9 @@
-//! desktui: a VNC client that draws the remote desktop with the Kitty graphics
-//! protocol, one remote pixel per terminal pixel.
+//! desktui: a remote desktop client that draws with the Kitty graphics protocol,
+//! one remote pixel per terminal pixel.
 
 mod app;
 mod cli;
+mod remote;
 mod render;
 mod rfb;
 mod session;
@@ -76,7 +77,17 @@ fn run(args: &Args) -> Result<()> {
         .enable_all()
         .build()
         .context("failed to start the async runtime")?;
-    runtime.block_on(session::run(args, &caps, &guard, &addr, password))
+    let mut vnc = remote::vnc::Vnc::new(
+        addr,
+        password,
+        remote::vnc::Options {
+            quality: args.quality,
+            compression: args.compression,
+            local_cursor: !args.view_only,
+            clipboard: !args.no_clipboard,
+        },
+    );
+    runtime.block_on(session::run(args, &caps, &guard, &mut vnc))
 }
 
 /// A password from the arguments or the environment, if either has one.

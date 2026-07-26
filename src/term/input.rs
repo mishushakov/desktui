@@ -1,8 +1,8 @@
-//! Terminal input to RFB input.
+//! Terminal input to remote input.
 //!
 //! Two things make this more than a lookup table.
 //!
-//! **Releases.** RFB wants a down and an up for every key. The Kitty keyboard
+//! **Releases.** The remote wants a down and an up for every key. The Kitty keyboard
 //! protocol provides both; a terminal without it reports only presses, so the
 //! release has to be synthesised straight after. Which of the two we are dealing
 //! with is settled by the capability probe rather than guessed at from traffic.
@@ -24,8 +24,8 @@ use crossterm::event::{
 use super::Metrics;
 use super::keysym::{bitmask, keysym};
 use crate::cli::ScaleMode;
+use crate::remote::{Key, Pointer};
 use crate::render::Layout;
-use crate::rfb::{ClientKeyEvent, ClientMouseEvent};
 use crate::ui::theme::Theme;
 
 /// Shortest gap between two motion reports, about 60 a second.
@@ -36,7 +36,8 @@ use crate::ui::theme::Theme;
 /// lost -- only intermediate positions the remote would not have noticed.
 const MOTION_INTERVAL: Duration = Duration::from_millis(17);
 
-/// VNC pointer button bits, from RFC 6143 section 7.5.5.
+/// Pointer button bits, from RFC 6143 section 7.5.5, which is how they cross the
+/// seam in [`Pointer`].
 mod button {
     pub const LEFT: u8 = 1 << 0;
     pub const MIDDLE: u8 = 1 << 1;
@@ -88,7 +89,7 @@ pub enum KeyOutcome {
     /// Nothing to do: swallowed, or unmapped.
     Ignored,
     /// Send these to the server, in order.
-    Keys(Vec<ClientKeyEvent>),
+    Keys(Vec<Key>),
     /// Handle this locally.
     Local(Command),
 }
@@ -227,7 +228,7 @@ impl InputMapper {
     }
 
     /// Send the prefix chord through to the server, as if it had not been caught.
-    pub fn literal_prefix(&mut self) -> Vec<ClientKeyEvent> {
+    pub fn literal_prefix(&mut self) -> Vec<Key> {
         let mut out = Vec::new();
         let ctrl = bitmask::CONTROL;
         let key = super::keysym::keysym_for_char(self.prefix);
@@ -269,7 +270,7 @@ impl InputMapper {
     }
 
     /// Bring the remote's modifier state in line with the reported bitmask.
-    fn sync_modifiers(&mut self, out: &mut Vec<ClientKeyEvent>, want: KeyModifiers) {
+    fn sync_modifiers(&mut self, out: &mut Vec<Key>, want: KeyModifiers) {
         for (flag, sym) in [
             (KeyModifiers::SHIFT, bitmask::SHIFT),
             (KeyModifiers::CONTROL, bitmask::CONTROL),
@@ -290,19 +291,19 @@ impl InputMapper {
         }
     }
 
-    fn press(&mut self, out: &mut Vec<ClientKeyEvent>, sym: u32) {
+    fn press(&mut self, out: &mut Vec<Key>, sym: u32) {
         self.held.insert(sym);
-        out.push(ClientKeyEvent {
-            keycode: sym,
+        out.push(Key {
+            keysym: sym,
             down: true,
         });
     }
 
     /// Release a key, but only if we told the server it was down.
-    fn release(&mut self, out: &mut Vec<ClientKeyEvent>, sym: u32) {
+    fn release(&mut self, out: &mut Vec<Key>, sym: u32) {
         if self.held.remove(&sym) {
-            out.push(ClientKeyEvent {
-                keycode: sym,
+            out.push(Key {
+                keysym: sym,
                 down: false,
             });
         }
@@ -310,17 +311,17 @@ impl InputMapper {
 
     /// Release everything still held. Called when leaving, losing focus, or
     /// reconnecting: a modifier left down on the remote outlives us.
-    pub fn release_all(&mut self) -> Vec<ClientKeyEvent> {
+    pub fn release_all(&mut self) -> Vec<Key> {
         let mut out: Vec<_> = self
             .held
             .drain()
-            .map(|sym| ClientKeyEvent {
-                keycode: sym,
+            .map(|sym| Key {
+                keysym: sym,
                 down: false,
             })
             .collect();
         // Deterministic order makes the traffic reproducible in tests and logs.
-        out.sort_by_key(|e| e.keycode);
+        out.sort_by_key(|e| e.keysym);
         self.synthesised = KeyModifiers::NONE;
         out
     }
@@ -359,12 +360,7 @@ impl InputMapper {
     ///
     /// Returns nothing when the pointer is outside the drawn image, so a click on
     /// the letterbox is not reported as a click on the nearest edge.
-    pub fn on_mouse(
-        &mut self,
-        ev: MouseEvent,
-        layout: &Layout,
-        metrics: &Metrics,
-    ) -> Vec<ClientMouseEvent> {
+    pub fn on_mouse(&mut self, ev: MouseEvent, layout: &Layout, metrics: &Metrics) -> Vec<Pointer> {
         let (tx, ty) = self.terminal_pixel(&ev, metrics);
         let Some((x, y)) = layout.terminal_px_to_src(tx, ty) else {
             return Vec::new();
@@ -410,14 +406,14 @@ impl InputMapper {
                     _ => button::WHEEL_RIGHT,
                 };
                 self.last_position = Some((x, y));
-                out.push(ClientMouseEvent {
-                    position_x: x,
-                    position_y: y,
+                out.push(Pointer {
+                    x,
+                    y,
                     buttons: self.buttons | bit,
                 });
-                out.push(ClientMouseEvent {
-                    position_x: x,
-                    position_y: y,
+                out.push(Pointer {
+                    x,
+                    y,
                     buttons: self.buttons,
                 });
                 return out;
@@ -425,9 +421,9 @@ impl InputMapper {
         }
 
         self.last_position = Some((x, y));
-        out.push(ClientMouseEvent {
-            position_x: x,
-            position_y: y,
+        out.push(Pointer {
+            x,
+            y,
             buttons: self.buttons,
         });
         out
@@ -437,7 +433,7 @@ impl InputMapper {
     ///
     /// Called from the render tick, so a pointer that stops moving still ends up
     /// where the user left it.
-    pub fn flush_motion(&mut self) -> Option<ClientMouseEvent> {
+    pub fn flush_motion(&mut self) -> Option<Pointer> {
         let (x, y) = self.pending_motion?;
         if let Some(last) = self.last_motion
             && last.elapsed() < MOTION_INTERVAL
@@ -447,40 +443,36 @@ impl InputMapper {
         self.pending_motion = None;
         self.last_motion = Some(Instant::now());
         self.last_position = Some((x, y));
-        Some(ClientMouseEvent {
-            position_x: x,
-            position_y: y,
+        Some(Pointer {
+            x,
+            y,
             buttons: self.buttons,
         })
     }
 
     /// Emit a held-back position immediately, before an event that must not be
     /// reordered behind it.
-    fn flush_pending(&mut self, out: &mut Vec<ClientMouseEvent>) {
+    fn flush_pending(&mut self, out: &mut Vec<Pointer>) {
         if let Some((x, y)) = self.pending_motion.take() {
             self.last_motion = Some(Instant::now());
             self.last_position = Some((x, y));
-            out.push(ClientMouseEvent {
-                position_x: x,
-                position_y: y,
+            out.push(Pointer {
+                x,
+                y,
                 buttons: self.buttons,
             });
         }
     }
 
     /// Let go of every pointer button, for the same reason as `release_all`.
-    pub fn release_buttons(&mut self) -> Option<ClientMouseEvent> {
+    pub fn release_buttons(&mut self) -> Option<Pointer> {
         if self.buttons == 0 {
             return None;
         }
         self.buttons = 0;
         self.pending_motion = None;
         let (x, y) = self.last_position.unwrap_or((0, 0));
-        Some(ClientMouseEvent {
-            position_x: x,
-            position_y: y,
-            buttons: 0,
-        })
+        Some(Pointer { x, y, buttons: 0 })
     }
 }
 
@@ -561,15 +553,15 @@ mod tests {
         let mut input = InputMapper::new('a', true, true);
         assert_eq!(
             input.on_key(press(KeyCode::Char('x'))),
-            KeyOutcome::Keys(vec![ClientKeyEvent {
-                keycode: 0x78,
+            KeyOutcome::Keys(vec![Key {
+                keysym: 0x78,
                 down: true
             }])
         );
         assert_eq!(
             input.on_key(release(KeyCode::Char('x'))),
-            KeyOutcome::Keys(vec![ClientKeyEvent {
-                keycode: 0x78,
+            KeyOutcome::Keys(vec![Key {
+                keysym: 0x78,
                 down: false
             }])
         );
@@ -584,7 +576,7 @@ mod tests {
         assert_eq!(events.len(), 2, "{events:?}");
         assert!(events[0].down);
         assert!(!events[1].down);
-        assert_eq!(events[0].keycode, events[1].keycode);
+        assert_eq!(events[0].keysym, events[1].keysym);
     }
 
     #[test]
@@ -600,12 +592,12 @@ mod tests {
         // Shift down, c down, c up. Shift stays down until it is reported gone.
         assert_eq!(
             events[0],
-            ClientKeyEvent {
-                keycode: bitmask::SHIFT,
+            Key {
+                keysym: bitmask::SHIFT,
                 down: true
             }
         );
-        assert_eq!(events[1].keycode, 0x63);
+        assert_eq!(events[1].keysym, 0x63);
         assert!(!events[2].down);
 
         // Now without shift: it has to be released.
@@ -614,8 +606,8 @@ mod tests {
         };
         assert_eq!(
             events[0],
-            ClientKeyEvent {
-                keycode: bitmask::SHIFT,
+            Key {
+                keysym: bitmask::SHIFT,
                 down: false
             }
         );
@@ -635,8 +627,8 @@ mod tests {
         };
         assert_eq!(
             events,
-            vec![ClientKeyEvent {
-                keycode: 0xffe3,
+            vec![Key {
+                keysym: 0xffe3,
                 down: true
             }]
         );
@@ -650,8 +642,8 @@ mod tests {
         };
         assert_eq!(
             events,
-            vec![ClientKeyEvent {
-                keycode: 0x63,
+            vec![Key {
+                keysym: 0x63,
                 down: true
             }],
             "the modifier must not be pressed a second time"
@@ -714,8 +706,8 @@ mod tests {
         );
         assert_eq!(
             input.on_key(key(ctrl_l, KeyEventKind::Release, KeyModifiers::NONE)),
-            KeyOutcome::Keys(vec![ClientKeyEvent {
-                keycode: 0xffe3,
+            KeyOutcome::Keys(vec![Key {
+                keysym: 0xffe3,
                 down: false
             }])
         );
@@ -735,12 +727,12 @@ mod tests {
         assert_eq!(events.len(), 4);
         assert_eq!(
             events[0],
-            ClientKeyEvent {
-                keycode: bitmask::CONTROL,
+            Key {
+                keysym: bitmask::CONTROL,
                 down: true
             }
         );
-        assert_eq!(events[1].keycode, 0x61);
+        assert_eq!(events[1].keysym, 0x61);
         assert!(!events[3].down);
         // And nothing is left held afterwards.
         assert!(input.release_all().is_empty());
@@ -842,7 +834,7 @@ mod tests {
         let released = input.release_all();
         assert_eq!(released.len(), 3);
         assert!(released.iter().all(|e| !e.down));
-        assert_eq!(released.last().unwrap().keycode, 0xffe3);
+        assert_eq!(released.last().unwrap().keysym, 0xffe3);
         assert!(input.release_all().is_empty(), "and only once");
     }
 
@@ -861,7 +853,7 @@ mod tests {
             &metrics(),
         );
         assert_eq!(events.len(), 1);
-        assert_eq!((events[0].position_x, events[0].position_y), (37, 91));
+        assert_eq!((events[0].x, events[0].y), (37, 91));
     }
 
     #[test]
@@ -878,10 +870,7 @@ mod tests {
             &layout,
             &metrics(),
         );
-        assert_eq!(
-            (events[0].position_x, events[0].position_y),
-            (4 * 8 + 4, 5 * 17 + 8)
-        );
+        assert_eq!((events[0].x, events[0].y), (4 * 8 + 4, 5 * 17 + 8));
     }
 
     #[test]
@@ -1012,7 +1001,7 @@ mod tests {
         assert!(input.flush_motion().is_none());
         std::thread::sleep(MOTION_INTERVAL + Duration::from_millis(2));
         let flushed = input.flush_motion().expect("the last position must arrive");
-        assert_eq!((flushed.position_x, flushed.position_y), (12, 10));
+        assert_eq!((flushed.x, flushed.y), (12, 10));
         assert!(input.flush_motion().is_none(), "and only once");
     }
 
@@ -1043,11 +1032,8 @@ mod tests {
             2,
             "the held position, then the click: {events:?}"
         );
-        assert_eq!((events[0].position_x, events[0].buttons), (44, 0));
-        assert_eq!(
-            (events[1].position_x, events[1].buttons),
-            (44, button::LEFT)
-        );
+        assert_eq!((events[0].x, events[0].buttons), (44, 0));
+        assert_eq!((events[1].x, events[1].buttons), (44, button::LEFT));
     }
 
     #[test]

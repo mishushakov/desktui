@@ -1,5 +1,6 @@
 use super::clipboard;
-use crate::rfb::{MAX_CUT_TEXT, MAX_PAYLOAD, PixelFormat, Rect, ScreenInfo, VncError};
+use crate::remote::{Rect, ScreenInfo};
+use crate::rfb::{MAX_CUT_TEXT, MAX_PAYLOAD, PixelFormat, VncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug)]
