@@ -120,7 +120,7 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | `q` | quit |
 | `f` | full screen refresh |
 | `r` | renegotiate the remote size |
-| `n` `s` `i` `1` | native / fit / integer / 1:1 mapping |
+| `m` | cycle the scaling mode: native / fit / integer / 1:1 |
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
 | `c` | toggle statistics (fps, tiles, bytes per frame, server RTT) |

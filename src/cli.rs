@@ -98,6 +98,18 @@ pub enum ScaleMode {
     OneToOne,
 }
 
+impl ScaleMode {
+    /// The next scaling mode in the cycle, in declaration order and wrapping round.
+    pub fn next(self) -> Self {
+        match self {
+            ScaleMode::Native => ScaleMode::Fit,
+            ScaleMode::Fit => ScaleMode::Integer,
+            ScaleMode::Integer => ScaleMode::OneToOne,
+            ScaleMode::OneToOne => ScaleMode::Native,
+        }
+    }
+}
+
 impl Transfer {
     /// Pick a concrete medium.
     ///
@@ -245,7 +257,7 @@ fn parse_server(spec: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_server;
+    use super::{ScaleMode, parse_server};
 
     #[test]
     fn bare_host_defaults_to_5900() {
@@ -283,5 +295,25 @@ mod tests {
         assert!(parse_server(":1").is_err());
         assert!(parse_server("desk:abc").is_err());
         assert!(parse_server("[::1").is_err());
+    }
+
+    #[test]
+    fn the_scale_modes_cycle_and_come_back_round() {
+        let mut mode = ScaleMode::Native;
+        let mut seen = vec![mode];
+        for _ in 0..3 {
+            mode = mode.next();
+            seen.push(mode);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ScaleMode::Native,
+                ScaleMode::Fit,
+                ScaleMode::Integer,
+                ScaleMode::OneToOne,
+            ]
+        );
+        assert_eq!(mode.next(), ScaleMode::Native);
     }
 }
