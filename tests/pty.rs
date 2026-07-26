@@ -7,8 +7,39 @@
 mod common;
 
 use common::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The object name and byte offset of every shared-memory placement in a frame.
+///
+/// Parsed rather than pattern-matched: the keys of one command say which object the tile
+/// comes out of and where in it, and those two together are the claim worth testing.
+fn shm_placements(frame: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut found = Vec::new();
+    for at in offsets(frame, b"t=s,") {
+        let rest = &frame[at..];
+        let Some(payload) = find(rest, b";") else {
+            continue;
+        };
+        let name = rest[payload + 1..]
+            .iter()
+            .copied()
+            .take_while(|b| *b != 0x1b)
+            .collect();
+        let start = find(&rest[..payload], b",O=")
+            .map(|key| {
+                rest[key + 3..payload]
+                    .iter()
+                    .copied()
+                    .take_while(u8::is_ascii_digit)
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.push((name, start));
+    }
+    found
+}
 
 #[test]
 fn probes_before_touching_the_screen() {
@@ -304,6 +335,33 @@ fn pixels_travel_through_shared_memory_when_the_terminal_offers_it() {
         !contains(&output, b"o=z"),
         "shared memory needs no compression: {}",
         show(&output)
+    );
+
+    // One object per frame, not per tile: every tile of a frame is placed out of the same
+    // object at an offset of its own, which is what keeps a full-screen frame to five
+    // system calls instead of five per tile.
+    let frame = frame_containing(&output, b"f=24,t=s,i=").expect("no frame carried a tile");
+    let placements = shm_placements(frame);
+    assert!(
+        placements.len() > 1,
+        "expected a frame of several tiles to measure: {}",
+        show(frame)
+    );
+    let names: HashSet<&[u8]> = placements.iter().map(|(name, _)| name.as_slice()).collect();
+    assert_eq!(
+        names.len(),
+        1,
+        "expected {} tiles to share one object, saw {} names: {}",
+        placements.len(),
+        names.len(),
+        show(frame)
+    );
+    let starts: HashSet<&[u8]> = placements.iter().map(|(_, at)| at.as_slice()).collect();
+    assert_eq!(
+        starts.len(),
+        placements.len(),
+        "every tile needs its own offset into the object: {}",
+        show(frame)
     );
 
     term.send(b"q");

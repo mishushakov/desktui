@@ -208,12 +208,12 @@ Built:
 - moves as `a=p` for a picture that only shifted (`src/term/kitty.rs`)
 - damage published at the update boundary (`src/session.rs`)
 - resize rate limit, leading edge (`src/session.rs`)
+- one shared memory object per frame, `O=`/`S=` offsets, packed straight into the mapping
+  (`src/term/shm.rs`, `src/render/framebuffer.rs`) -- 1.5 ms/frame to 0.7 on a full-screen
+  update, measured by `make perf`
 
 Not built, in the order worth doing:
 
-- **one shared memory object per frame**, with `O=` offsets, packing straight into the
-  mapping. Today it is one object per tile and two passes over every pixel
-  (`src/term/shm.rs`, `src/render/mod.rs`).
 - **the plane as described**: `Content` keys instead of `dirty: Vec<bool>`, `placed` as a
   rectangle, and `Layout::maps_alike`.
 - **resample only the dirty region** in scaled modes.

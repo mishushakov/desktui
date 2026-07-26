@@ -151,12 +151,16 @@ impl Transfer {
             // not small. Measured on a full-screen 1600x832 update in 91 tiles
             // (`cargo test --release --test perf -- --ignored --nocapture`):
             //
-            //   pack BGRA->RGB            1.4 ms/frame
-            //   direct: +zlib +base64    21.0 ms/frame   ->  48 fps ceiling
-            //   shm: +object per tile     2.1 ms/frame   -> 466 fps ceiling
+            //   pack BGRA->RGB into a buffer   1.1 ms/frame
+            //   direct: +zlib +base64         13.7 ms/frame   ->   73 fps ceiling
+            //   shm: object per tile           1.5 ms/frame   ->  670 fps ceiling
+            //   shm: one object per frame      0.7 ms/frame   -> 1479 fps ceiling
             //
-            // The six syscalls per tile cost 0.7ms across all 91 of them; zlib
-            // costs twenty. The probe is what makes this safe to default to --
+            // zlib is the whole story on the direct path. On the shared memory one
+            // the syscalls were: an object per tile is five of them per tile, where
+            // one object for the frame is five in total, and packing into the
+            // mapping rather than into a buffer saves the copy that followed. The
+            // probe is what makes this safe to default to --
             // frames go out with responses suppressed, so a medium the terminal
             // cannot handle would fail invisibly, and silence about `t=s` sends us
             // down the path that always works.

@@ -203,7 +203,7 @@ fn moving_the_picture_costs_placements_and_not_pixels() {
     // whatever the compose has to say, so a move with nothing to send is a frame with no
     // transmission in it at all.
     let out = term.output();
-    let moved = before_at(&out, b"a=p,").expect("no frame carried the move");
+    let moved = frame_containing(&out, b"a=p,").expect("no frame carried the move");
     assert!(
         !contains(moved, DREW),
         "moving the picture sent pixels too: {}",
@@ -242,15 +242,6 @@ fn settle(term: &FakeTerm) {
         }
         last = now;
     }
-}
-
-/// The synchronised block containing the first occurrence of `needle`, which is one frame.
-fn before_at<'a>(out: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
-    let at = find(out, needle)?;
-    let open = offsets(out, BEGIN_SYNC).into_iter().rfind(|o| *o < at)?;
-    let from = open + BEGIN_SYNC.len();
-    let len = find(&out[from..], END_SYNC)?;
-    Some(&out[from..from + len])
 }
 
 #[test]

@@ -110,7 +110,7 @@ Also used when the terminal offers it:
 | Mouse mode 1016 (SGR-pixel) | pointer position in pixels | pointer snaps to cell centres |
 | Mode 2026 (synchronised output) | a frame commits without tearing | multi-tile frames may tear |
 | Kitty keyboard protocol | real key releases, bare modifier keys | a release is synthesised after each press |
-| `t=s` shared memory | frames skip base64 and zlib: ~10x the throughput on a full-screen update, and the default when offered | base64 + zlib, capped near 48 fps for full-screen motion |
+| `t=s` shared memory | frames skip base64 and zlib, and a whole frame travels in one object: ~20x the throughput on a full-screen update, and the default when offered | base64 + zlib, capped near 70 fps for full-screen motion |
 
 Run `--print-caps` to see what your terminal answered. It reports the pixel geometry
 from both `TIOCGWINSZ` and `CSI 14 t`, and warns when they disagree — that
@@ -182,14 +182,22 @@ Measured on a 1600x832 update in 91 tiles, single threaded
 
 | stage | per frame | ceiling |
 |---|---|---|
-| pack BGRA → RGB (every path pays this) | 1.4 ms | 700 fps |
-| `direct`: + zlib + base64 | 21.0 ms | **48 fps** |
-| `shm`: + one object per tile | 2.1 ms | **466 fps** |
+| pack BGRA → RGB into a buffer | 1.1 ms | 899 fps |
+| `direct`: + zlib + base64 | 13.7 ms | **73 fps** |
+| `shm`: an object per tile | 1.5 ms | **670 fps** |
+| `shm`: one object per frame | 0.7 ms | **1479 fps** |
 
-zlib is the whole story: the 546 syscalls behind 91 shared memory objects cost 0.7 ms
-between them, and compression costs twenty. So on a local terminal, full-screen
-motion is not CPU-bound; over SSH, where shared memory cannot work, expect the
-compression ceiling. Server-side encoding and JPEG decode come on top of both.
+zlib is the whole story on the direct path: compression and base64 cost twelve
+milliseconds that shared memory does not pay at all. On the shared memory path it was
+syscalls — an object per tile is five of them per tile, where one object for the whole
+frame is five in total, with each tile placed out of it at an offset (`O=`/`S=`). Packing
+straight into that mapping also removes the copy that used to follow the pack, which is
+why the last row comes in below the buffered pack above it.
+
+So on a local terminal, full-screen motion is not CPU-bound on this side; over SSH, where
+shared memory cannot work, expect the compression ceiling. Server-side encoding and JPEG
+decode come on top of both, and on a busy screen the server is usually the one that runs
+out first — see `--quality`.
 
 What would help beyond this is the **continuous updates** extension, where the server
 pushes frames instead of answering a request each time. That saves one network round

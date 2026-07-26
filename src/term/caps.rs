@@ -74,7 +74,15 @@ pub fn probe() -> Result<Caps> {
     // validates the transmission without storing anything, so this costs one
     // 3-byte object that the terminal unlinks on the way out.
     let mut pool = super::shm::ShmPool::new();
-    let shm_name = pool.publish(&[0u8, 0, 0]).ok();
+    let mut probe = pool.frame(3).ok();
+    if let Some(frame) = probe.as_mut()
+        && let Some((_, pixel)) = frame.next(3)
+    {
+        pixel.fill(0);
+    }
+    // The name outlives the mapping on purpose: what the terminal reads is the object,
+    // which the pool holds until it is dropped at the end of this function.
+    let shm_name = probe.as_ref().map(|frame| frame.name().to_string());
     if let Some(name) = &shm_name {
         let encoded = BASE64.encode(name.as_bytes());
         write!(

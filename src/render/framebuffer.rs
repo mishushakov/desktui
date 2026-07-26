@@ -219,6 +219,35 @@ impl Framebuffer {
             }
         }
     }
+
+    /// The same, into a slice of exactly `r.w * r.h * 3` bytes.
+    ///
+    /// For packing straight into the shared memory the terminal will map, which is what
+    /// makes a frame one pass over its pixels rather than a pack followed by a copy.
+    /// Anything outside the framebuffer is black, as above.
+    pub fn pack_rgb_into(&self, r: Rect, out: &mut [u8]) {
+        let stride = (r.w as usize) * 3;
+        debug_assert_eq!(out.len(), stride * (r.h as usize));
+        for (row, line) in out.chunks_exact_mut(stride).enumerate() {
+            let y = r.y + row as u32;
+            let inside_w = if y < self.h {
+                r.w.min(self.w.saturating_sub(r.x))
+            } else {
+                0
+            };
+            let split = (inside_w as usize) * 3;
+            if inside_w > 0 {
+                let range = self.row_range(r.x, y, inside_w);
+                for (px, rgb) in self.data[range]
+                    .chunks_exact(4)
+                    .zip(line[..split].chunks_exact_mut(3))
+                {
+                    rgb.copy_from_slice(&[px[2], px[1], px[0]]);
+                }
+            }
+            line[split..].fill(0);
+        }
+    }
 }
 
 #[cfg(test)]

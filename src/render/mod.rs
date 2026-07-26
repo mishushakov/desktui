@@ -367,6 +367,11 @@ impl TileGrid {
     }
 }
 
+/// Packed RGB bytes one tile comes to.
+fn tile_bytes(tile: Rect) -> usize {
+    (tile.w as usize) * (tile.h as usize) * 3
+}
+
 /// One side of the tile grid, refused past what the id space has room for.
 fn grid_side(tiles: u32, what: &str) -> u16 {
     if tiles > u32::from(TILE_ID_STRIDE) {
@@ -711,6 +716,19 @@ impl Renderer {
         self.grid.len()
     }
 
+    /// Packed bytes the dirty tiles come to, which is the size of a frame's object.
+    fn dirty_bytes(&self) -> usize {
+        let mut total = 0;
+        for ty in 0..self.grid.ny {
+            for tx in 0..self.grid.nx {
+                if self.dirty[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)] {
+                    total += tile_bytes(self.grid.tile_rect(tx, ty));
+                }
+            }
+        }
+        total
+    }
+
     /// Compose the dirty tiles into `out`.
     ///
     /// The caller wraps this in synchronised-output markers and adds its own
@@ -748,6 +766,25 @@ impl Renderer {
 
         let cursor_rect = self.cursor_rect();
 
+        // One object for the whole frame, sized before anything is packed: its length is
+        // fixed at creation, so the tiles have to be measured first. Five system calls a
+        // frame instead of five a tile, and the pack writes into it rather than into a
+        // buffer for a copy to follow.
+        let mut shm = if self.transfer == Transfer::Shm && !self.shm_failed {
+            match self.shm.frame(self.dirty_bytes()) {
+                Ok(frame) => Some(frame),
+                Err(err) => {
+                    // One complaint, then carry on the slow way for the rest of the
+                    // session.
+                    tracing::warn!("shared memory unavailable, using base64: {err}");
+                    self.shm_failed = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         for ty in 0..self.grid.ny {
             for tx in 0..self.grid.nx {
                 let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
@@ -759,17 +796,7 @@ impl Renderer {
                     continue;
                 }
 
-                self.scratch.clear();
-                source.pack_rgb(
-                    Rect::new(tile.x + off_x, tile.y + off_y, tile.w, tile.h),
-                    &mut self.scratch,
-                );
-                // Borrowed apart from `scratch` on purpose: the cursor and the
-                // buffer both live in `self`.
-                if let (Some(cursor), Some(rect)) = (self.cursor.as_ref(), cursor_rect) {
-                    Self::blend_cursor(cursor, rect, tile, &mut self.scratch);
-                }
-
+                let from = Rect::new(tile.x + off_x, tile.y + off_y, tile.w, tile.h);
                 let col = self.layout.origin_col + tx * self.grid.tile_cols;
                 let row = self.layout.origin_row + ty * self.grid.tile_rows;
                 let at = Placement {
@@ -779,23 +806,30 @@ impl Renderer {
                     w: tile.w,
                     h: tile.h,
                 };
+                let bytes = tile_bytes(tile);
 
+                // Packed straight into the frame's object where there is one, and into a
+                // buffer to be encoded where there is not.
                 let mut sent = false;
-                if self.transfer == Transfer::Shm && !self.shm_failed {
-                    match self.shm.publish(&self.scratch) {
-                        Ok(name) => {
-                            self.enc.place_shm(out, at, &name);
-                            sent = true;
-                        }
-                        Err(err) => {
-                            // One complaint, then carry on the slow way for the
-                            // rest of the session.
-                            tracing::warn!("shared memory unavailable, using base64: {err}");
-                            self.shm_failed = true;
-                        }
+                if let Some(frame) = shm.as_mut()
+                    && let Some((at_byte, into)) = frame.next(bytes)
+                {
+                    source.pack_rgb_into(from, into);
+                    if let (Some(cursor), Some(rect)) = (self.cursor.as_ref(), cursor_rect) {
+                        Self::blend_cursor(cursor, rect, tile, into);
                     }
+                    self.enc
+                        .place_shm(out, at, frame.name(), at_byte, bytes as u32);
+                    sent = true;
                 }
                 if !sent {
+                    self.scratch.clear();
+                    source.pack_rgb(from, &mut self.scratch);
+                    // Borrowed apart from `scratch` on purpose: the cursor and the
+                    // buffer both live in `self`.
+                    if let (Some(cursor), Some(rect)) = (self.cursor.as_ref(), cursor_rect) {
+                        Self::blend_cursor(cursor, rect, tile, &mut self.scratch);
+                    }
                     self.enc.place_rgb(out, at, &self.scratch);
                 }
 

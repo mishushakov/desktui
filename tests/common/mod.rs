@@ -328,6 +328,19 @@ pub const DELETE_IMAGE: &[u8] = b"a=d,d=I";
 pub const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
 pub const END_SYNC: &[u8] = b"\x1b[?2026l";
 
+/// The synchronised block holding the first occurrence of `needle`, which is one frame.
+///
+/// What a frame contains is often the claim -- that an erase and the tiles that undo it
+/// travel together, that every tile of one frame came out of one shared memory object --
+/// and a claim about a frame has to be measured inside its own markers.
+pub fn frame_containing<'a>(out: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    let at = find(out, needle)?;
+    let open = offsets(out, BEGIN_SYNC).into_iter().rfind(|o| *o < at)?;
+    let from = open + BEGIN_SYNC.len();
+    let len = find(&out[from..], END_SYNC)?;
+    Some(&out[from..from + len])
+}
+
 /// A layout change since `before` never left the screen blank.
 ///
 /// Text and placements alike stay on the cells they were written to when the grid
