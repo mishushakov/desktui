@@ -112,6 +112,10 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let was_showing = show_menu;
                     match key.code {
+                        // Escape belongs to the menu while it is up, which is what the
+                        // menu's own title offers. Leaving it as the way out of the
+                        // pattern would have the box lie about what it does.
+                        KeyCode::Esc if show_menu => show_menu = false,
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Char('c')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
@@ -119,7 +123,8 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                             return Ok(());
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => show_menu = !show_menu,
-                        _ => show_menu = false,
+                        // Nothing else dismisses it, here as in a session.
+                        _ => {}
                     }
                     // The menu leaves text and a backdrop image behind it, and
                     // neither is undone by drawing the pattern again.

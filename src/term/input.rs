@@ -189,6 +189,25 @@ impl InputMapper {
         self.translate(ev)
     }
 
+    /// A key arriving while the menu has the focus.
+    ///
+    /// The prefix window still works, because the menu is the list of what it does,
+    /// but a keystroke meant for the remote is swallowed rather than sent -- which is
+    /// what having the focus means. It has to be swallowed *here* rather than by
+    /// dropping what comes back: a press is recorded as held the moment it is
+    /// translated, and throwing the event away after that would leave us believing
+    /// the server holds a key it was never sent, to be released later out of nowhere.
+    ///
+    /// Releases are let through for the mirror of that reason. A key pressed before
+    /// the menu opened is genuinely down on the remote, and its release is the only
+    /// thing that lets go of it.
+    pub fn on_key_local(&mut self, ev: KeyEvent) -> KeyOutcome {
+        if ev.kind != KeyEventKind::Release && !self.armed && !self.is_prefix(&ev) {
+            return KeyOutcome::Ignored;
+        }
+        self.on_key(ev)
+    }
+
     /// Let go of a key the server was told is down, and say nothing otherwise.
     fn release_if_held(&mut self, ev: KeyEvent) -> KeyOutcome {
         let Some(sym) = keysym(ev.code) else {
@@ -754,6 +773,56 @@ mod tests {
         for gone in ['h', '?'] {
             assert_eq!(command_for(KeyCode::Char(gone)), None, "{gone} still binds");
         }
+    }
+
+    #[test]
+    fn the_menu_swallows_what_would_have_reached_the_remote() {
+        let mut input = InputMapper::new('a', true, true);
+        assert_eq!(
+            input.on_key_local(press(KeyCode::Char('x'))),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(
+            input.on_key_local(release(KeyCode::Char('x'))),
+            KeyOutcome::Ignored
+        );
+        // The point of swallowing it here rather than dropping what comes back: a
+        // translated press is recorded as held, and would be released later for a key
+        // the server was never told about.
+        assert!(
+            input.release_all().is_empty(),
+            "a swallowed press must not be remembered as held"
+        );
+    }
+
+    #[test]
+    fn the_menu_still_lets_go_of_a_key_held_before_it_opened() {
+        let mut input = InputMapper::new('a', true, true);
+        let KeyOutcome::Keys(_) = input.on_key(press(KeyCode::Char('x'))) else {
+            panic!("the press should have gone to the remote");
+        };
+        let KeyOutcome::Keys(events) = input.on_key_local(release(KeyCode::Char('x'))) else {
+            panic!("the release was swallowed, so the key stays down on the remote");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].down);
+        assert!(input.release_all().is_empty(), "and it is no longer held");
+    }
+
+    #[test]
+    fn the_prefix_window_works_while_the_menu_is_up() {
+        // The menu is the list of what the prefix does, so the keys it lists have to
+        // work while it is being read.
+        let mut input = InputMapper::new('a', true, true);
+        assert_eq!(
+            input.on_key_local(ctrl('a', KeyEventKind::Press)),
+            KeyOutcome::Ignored
+        );
+        assert!(input.is_armed());
+        assert_eq!(
+            input.on_key_local(press(KeyCode::Char('q'))),
+            KeyOutcome::Local(Command::Quit)
+        );
     }
 
     #[test]

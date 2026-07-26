@@ -65,8 +65,13 @@ const CHOICE_GAP: u16 = 2;
 
 /// One line of the menu.
 enum Entry {
-    /// Heading of the whole box: name on the left, how to leave on the right.
-    Title(String, String),
+    /// Heading of the whole box: its name, and how to leave. The second is a
+    /// target as well as a label, being the one thing in here that always ends the
+    /// menu rather than doing something and leaving it up.
+    Title {
+        name: String,
+        close: String,
+    },
     /// A group of commands.
     Section(String),
     /// A command, the keys that reach it, and what a click on it runs.
@@ -122,6 +127,15 @@ fn option_spans(options: &[Option_]) -> Vec<(&Option_, u16, u16)> {
     out
 }
 
+/// Columns the title's dismissal covers, relative to the left of the row.
+///
+/// Right-aligned, like every shortcut, so it starts where it ends up rather than at
+/// a fixed offset. Drawing and hit testing both come through here, or a click would
+/// land next to the word rather than on it.
+fn close_span(close: &str, width: u16) -> (u16, u16) {
+    (width.saturating_sub(cells(close)), width)
+}
+
 /// Columns the options of a choice row occupy together.
 fn choice_width(options: &[Option_]) -> u16 {
     match option_spans(options).last() {
@@ -136,24 +150,31 @@ impl Entry {
         match self {
             Entry::Blank => 0,
             Entry::Section(text) => cells(text),
-            Entry::Title(left, right) => cells(left) + GAP + cells(right),
+            Entry::Title { name, close } => cells(name) + GAP + cells(close),
             Entry::Item { label, keys, .. } => cells(label) + GAP + cells(keys),
             Entry::Choice { options, keys } => choice_width(options) + GAP + cells(keys),
         }
     }
 
-    /// What clicking this line does, `offset` cells in from where its text starts.
+    /// What clicking this line does, `offset` cells in from where its text starts,
+    /// on a row `width` cells wide.
     ///
-    /// Signed, because the padding to the left of the text comes out negative: it is
-    /// part of a command's row, which is a target all the way across, but part of no
-    /// single option on a row of them.
-    fn command_at(&self, offset: i32) -> Option<Command> {
+    /// The offset is signed because the padding to the left of the text comes out
+    /// negative: it is part of a command's row, which is a target all the way across,
+    /// but part of no single option on a row of them. The width is needed because the
+    /// title's dismissal is pushed against the right edge, so where it starts depends
+    /// on how wide the box turned out.
+    fn command_at(&self, offset: i32, width: u16) -> Option<Command> {
         match self {
             Entry::Item { command, .. } => Some(*command),
             Entry::Choice { options, .. } => option_spans(options)
                 .into_iter()
                 .find(|(_, start, end)| offset >= i32::from(*start) && offset < i32::from(*end))
                 .map(|(option, ..)| option.command()),
+            Entry::Title { close, .. } => {
+                let (start, end) = close_span(close, width);
+                (offset >= i32::from(start) && offset < i32::from(end)).then_some(Command::Menu)
+            }
             _ => None,
         }
     }
@@ -194,7 +215,10 @@ impl Menu {
             command,
         };
         let entries = vec![
-            Entry::Title("Command menu".into(), "esc".into()),
+            Entry::Title {
+                name: "Command menu".into(),
+                close: "esc".into(),
+            },
             Entry::Blank,
             Entry::Section("Session".into()),
             // First, and the only line that names the binding that opened the box.
@@ -284,23 +308,32 @@ impl Menu {
     /// what the cells behind it are coloured -- one function, so the image and the
     /// colour cannot land on different cells.
     ///
-    /// A command's target is its whole row. An option's is the option itself: the
-    /// row holds four of them, and a bar across all of it would say the pointer is
-    /// on something it is not.
+    /// A command's target is its whole row. An option's is the option itself, and the
+    /// title's is the word that dismisses: those rows hold something other than the
+    /// one target, and a bar across all of it would say the pointer is on things it
+    /// is not.
     fn hover_bar(&self, area: Rect) -> Option<Rect> {
         let (index, command) = self.hover?;
         let y = area.y + PAD_Y + u16::try_from(index).ok()?;
+        let inner = area.width.saturating_sub(PAD_X * 2);
+        let span = |start: u16, width: u16| {
+            Some(Rect {
+                x: area.x + PAD_X + start,
+                y,
+                width,
+                height: 1,
+            })
+        };
         match self.entries.get(index)? {
             Entry::Choice { options, .. } => {
                 let (option, start, _) = option_spans(options)
                     .into_iter()
                     .find(|(option, ..)| option.command() == command)?;
-                Some(Rect {
-                    x: area.x + PAD_X + start,
-                    y,
-                    width: option.width(),
-                    height: 1,
-                })
+                span(start, option.width())
+            }
+            Entry::Title { close, .. } => {
+                let (start, end) = close_span(close, inner);
+                span(start, end - start)
             }
             _ => Some(Rect {
                 x: area.x,
@@ -343,7 +376,7 @@ impl Menu {
         // Counted from where the text starts, so the padding comes out negative: it
         // belongs to a command's row, but to no single option on a row of them.
         let offset = i32::from(col) - i32::from(area.x + PAD_X);
-        match entry.command_at(offset) {
+        match entry.command_at(offset, area.width.saturating_sub(PAD_X * 2)) {
             Some(command) => Hit::Item { index, command },
             None => Hit::Inside,
         }
@@ -463,13 +496,23 @@ impl Widget for MenuView<'_> {
                     Line::from(Span::styled(text.as_str(), Style::new().fg(ACCENT)))
                         .render(row, buf);
                 }
-                Entry::Title(left, right) => split(
-                    buf,
-                    row,
-                    left,
-                    right,
-                    Style::new().fg(INK).add_modifier(Modifier::BOLD),
-                ),
+                Entry::Title { name, close } => {
+                    Line::from(Span::styled(
+                        name.as_str(),
+                        Style::new().fg(INK).add_modifier(Modifier::BOLD),
+                    ))
+                    .render(row, buf);
+                    // A target, so it lifts under the pointer like everything else
+                    // rather than sitting there as a label that happens to work.
+                    let ink = if hovered(Command::Menu) {
+                        Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        Style::new().fg(MUTED)
+                    };
+                    Line::from(Span::styled(close.as_str(), ink))
+                        .right_aligned()
+                        .render(row, buf);
+                }
                 Entry::Item {
                     label,
                     keys,
@@ -827,6 +870,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_word_in_the_title_is_a_target_and_the_name_beside_it_is_not() {
+        let mut menu = Menu::new('a');
+        let m = metrics(100, 40);
+        let area = menu.area(&m).unwrap();
+        let row = area.y + PAD_Y;
+        // "esc" is pushed against the right edge of the padded area, so it ends there.
+        let end = area.x + area.width - PAD_X;
+        let dismiss = Hit::Item {
+            index: 0,
+            command: Command::Menu,
+        };
+        for col in [end - 3, end - 2, end - 1] {
+            assert_eq!(menu.hit(&m, col, row), dismiss, "column {col} of the title");
+        }
+        // Neither the name at the other end nor the space between them.
+        assert_eq!(menu.hit(&m, area.x + PAD_X, row), Hit::Inside, "the name");
+        assert_eq!(menu.hit(&m, end - 4, row), Hit::Inside, "the gap");
+
+        // And the bar covers the word, not the row: the rest of it does nothing.
+        menu.set_hover(menu.hit(&m, end - 1, row));
+        let bar = menu.hover_bar(area).expect("nothing highlighted");
+        assert_eq!((bar.x, bar.width, bar.y), (end - 3, 3, row));
     }
 
     #[test]

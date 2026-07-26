@@ -7,7 +7,9 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval};
@@ -740,12 +742,34 @@ impl Session {
     async fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) => {
-                // The menu promises that any other key dismisses it, so the key
-                // is caught here rather than interpreted. Presses only: the releases
-                // belonging to the chord that opened the menu are still to come,
-                // and would otherwise close it before it could be read.
-                if self.show_menu && key.kind == KeyEventKind::Press {
-                    self.dismiss_menu();
+                // The menu holds the focus while it is up. Escape is what it says
+                // puts it away, and the only key that does; everything else is a
+                // local command or is swallowed. Presses only, or the release of the
+                // chord that opened it would close it before it could be read.
+                if self.show_menu {
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                        self.dismiss_menu();
+                        return Ok(());
+                    }
+                    // Local commands still work -- the menu is the list of them --
+                    // and a release still reaches the remote, because a key held from
+                    // before the menu opened is down over there until it does.
+                    let locks = self.input.lock_state(&key);
+                    match self.input.on_key_local(key) {
+                        KeyOutcome::Ignored => {}
+                        KeyOutcome::Keys(keys) => {
+                            if !self.view_only {
+                                self.sync_lock_keys(locks).await?;
+                                for key in keys {
+                                    self.send(X11Event::KeyEvent(key)).await?;
+                                }
+                            }
+                        }
+                        // Not `SendPrefix`: nothing typed at the menu belongs to the
+                        // remote, and the menu no longer offers it.
+                        KeyOutcome::Local(Command::SendPrefix) => {}
+                        KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
+                    }
                     return Ok(());
                 }
                 let locks = self.input.lock_state(&key);
@@ -909,25 +933,24 @@ impl Session {
 
     /// Point at the menu, and run whatever is clicked on.
     ///
-    /// A click on a command runs it and puts the menu away, as the chord that
-    /// reached it would have; a click anywhere off the box puts it away without
-    /// running anything, which is what a menu is expected to do.
+    /// A click runs its command and leaves the menu up. Only the dismissal takes it
+    /// down -- the word in the title, the escape key, or the toggle at the top, which
+    /// are three ways of asking for the same thing. So panning twice is two clicks
+    /// rather than two trips through the menu, and picking a scaling mode shows the
+    /// brackets move to it.
+    ///
+    /// A click that lands on nothing does nothing, off the box included: the menu has
+    /// the focus, so there is nothing behind it to click on.
     async fn on_menu_mouse(&mut self, ev: MouseEvent) -> Result<()> {
         let (col, row) = self.input.terminal_cell(&ev, &self.metrics);
         let hit = self.menu.hit(&self.metrics, col, row);
         match ev.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => self.menu.set_hover(hit),
-            MouseEventKind::Down(MouseButton::Left) => match hit {
-                Hit::Item { command, .. } => {
-                    // Run it, then put the box away, in that order: a command that
-                    // toggles the menu would otherwise be handed a menu that is
-                    // already down and turn it back on.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Hit::Item { command, .. } = hit {
                     self.on_command(command).await?;
-                    self.dismiss_menu();
                 }
-                Hit::Outside => self.dismiss_menu(),
-                Hit::Inside => {}
-            },
+            }
             _ => {}
         }
         Ok(())
