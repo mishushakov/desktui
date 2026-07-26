@@ -90,14 +90,27 @@ The one piece of state that matters, and the one that makes resize cheap. For ea
 what the terminal is holding and where:
 
 ```rust
-struct Tile { held: Option<Held>, placed_at: Option<(u16, u16)> }
-struct Held { content: Content, generation: u32 }
+struct Tile { held: Option<Content>, placed_at: Option<(u16, u16)>, touched: u32 }
 
 /// Everything that decides a tile's pixels. Two equal keys are the same picture,
 /// whatever layout produced them.
 #[derive(PartialEq)]
-struct Content { src: Rect, size: (u32, u32), filter: Filter }
+struct Content {
+    dst: Rect,             // where it is, in destination pixels
+    from: (u32, u32),      // where the visible part of the source starts
+    scale: f64,            // destination pixels per source pixel
+    filter: Option<Filter>,
+    generation: u32,       // the damage that last touched it
+}
 ```
+
+The mapping goes in the key rather than the tile's source rectangle, and that is the part
+worth getting right. Under a scale the source region behind a destination rectangle is
+fractional, so rounding it to a `Rect` makes two different mappings compare equal -- which
+is a resize in `fit` keeping tiles whose pixels have all changed. `scale` decides the same
+thing exactly: it is `1.0` in the 1:1 modes however large the window is, which is why a
+window that grows keeps its interior tiles, and a different number every time a `fit` window
+is resized, which is why that one does not.
 
 A tile's id is its *position*: `IMAGE_ID_BASE + ty * TILE_ID_STRIDE + tx`. Numbering by
 drawing order instead -- `ty * nx + tx` -- renumbers every tile a row below whenever the
@@ -120,6 +133,10 @@ dirty bitmap, no record of how far the grid has been filled, and no comparison o
 layout against another to guess which tiles survived -- those are three approximations of
 this question. The generation is a dirty bit in disguise, but a dirty bit that composes
 with everything else that can make a tile wrong.
+
+The count of what is owed is still kept, because `has_work` is asked every tick and must not
+walk the grid to answer. It is maintained where the marks happen, which is the one piece of
+bookkeeping the plane does not remove.
 
 What a layout comparison cannot do, and this can: a frame that never reached the terminal
 cannot leave a tile counted as held, because being held is a fact about a tile rather than
@@ -234,17 +251,17 @@ Built:
   (`src/render/scale.rs`)
 - the server's own delivery in the statistics -- updates per second, delivery time,
   megapixels per update -- next to ours (`src/session.rs`)
+- the plane: per-tile content keys in place of a dirty bitmap, a placed extent and a
+  layout comparison (`src/render/mod.rs`)
 
 ## Not built yet
 
-Four things, ordered by what each is worth rather than by how tidy it would be. What each
+Three things, ordered by what each is worth rather than by how tidy it would be. What each
 one *is* is above; what follows is what it costs to build and the parts that are not
 obvious from the design.
 
-The first two are felt immediately; the last two are structural, worth building for the bugs
-they make impossible rather than for anything measurable. The one ordering constraint is
-that the cursor is easier before the plane, not after: it deletes two of the marking paths
-the plane would otherwise have to convert.
+The first two are felt immediately; the third is structural, worth building for the bugs it
+makes impossible rather than for anything measurable.
 
 ### 1. The cursor as a placement
 
@@ -320,51 +337,7 @@ worse failure than the flat-out pushing it replaces. It wants sustained load to 
 against, which `make desktop` plus a scrolling browser gives and a test does not. Build the
 policy behind a flag, default off, until it has been watched for a while.
 
-### 3. The plane
-
-Replaces three mechanisms with the one [Plane](#plane) describes: `dirty: Vec<bool>`,
-`placed: (u16, u16)` and `Layout::maps_alike`, all in `src/render/mod.rs`.
-
-Mechanical, once two things are seen:
-
-**`commit` can recompute rather than remember.** The obvious reading is that composing has
-to record what it sent so the commit can promote it, which wants a second structure
-alongside the plane. It does not: `want` is a pure function of the layout, the grid and the
-tile's damage generation, so the commit can compute it again. Every tile is then
-`held = want; placed_at = cell` -- which is what today's `placed = (nx, ny)` already is,
-generalised from an extent to a key.
-
-**The derived count stays.** `has_work` is called every tick and must not walk the grid
-computing keys. So the plane keeps its out-of-date count the way the dirty bitmap does
-today, maintained where the marks happen rather than recomputed: `mark`, `mark_dst`,
-`mark_cells`, `mark_all`, `move_cursor`, `set_cursor`, `relayout`. Those are the paths to
-change, and they are the same paths that carry today's bitmap -- the change is what a mark
-*writes*, not where marks come from. Two of them go away entirely if the cursor becomes a
-placement first, which is one reason to do that one before this one.
-
-The padding in `Layout::src_to_dst` stays as it is: it answers which tiles a source pixel
-can reach, which is still the question a damage rectangle asks.
-
-One behaviour changes, and it is the point of the exercise: the density invariant becomes
-structural. `placed` as a rectangle is only correct because frames arrive whole -- a per-tile
-key cannot be wrong that way, so "a frame dropped mid-resize leaves a hole" stops being
-something to reason about and becomes something that cannot happen.
-
-What it does *not* buy, despite an earlier claim here: tile reuse across a scaled resize.
-Comparing keys rather than layouts would allow it in principle, but a resize in `fit` changes
-the scale, which changes every tile's destination size, which changes every key. The case
-where a scaled tile's source *and* size both survive is real but rare -- a mode switch that
-happens to land on the same geometry -- and not a reason to do this.
-
-Verification is the existing suite, which is why this is worth doing carefully rather than
-quickly: `growing_the_window_sends_the_new_tiles_and_not_the_rest`,
-`moving_the_picture_costs_placements_and_not_pixels`,
-`a_frame_that_never_reached_the_terminal_leaves_its_tiles_owing` and
-`a_grid_that_only_grows_keeps_the_tiles_that_did_not_move` are the four that would catch a
-mistake. Add one for the invariant itself: a frame composed and dropped, then a resize,
-must not leave a tile counted as held.
-
-### 4. The chrome as one diffed plane
+### 3. The chrome as one diffed plane
 
 Replaces `Toast::drawn`/`stale`/`moved`, `Session::clear_menu`, `status::clear` and
 `Menu::clear` with a private cell buffer, double buffered and diffed per frame.

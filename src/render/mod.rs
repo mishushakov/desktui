@@ -178,29 +178,6 @@ impl Layout {
         }
     }
 
-    /// Do two layouts fill a given tile with the same source pixels?
-    ///
-    /// Not whether they are equal -- the grid either side may be wider or taller, and the
-    /// picture may sit on different cells. This is the question a tile the terminal
-    /// already holds turns on: whether the pixels under its id are still the pixels it
-    /// would be sent. Cells of another size or a crop that starts somewhere else mean no.
-    ///
-    /// So does scaling, either side. The resampled copy is made from the whole visible
-    /// source to the whole destination, so a destination of another size changes every
-    /// pixel in it, including the pixels of tiles that did not move.
-    ///
-    /// Where the tile then *goes* is a separate question, and a cheaper one: a picture
-    /// that only moved needs its placements put on other cells, not its pixels sent
-    /// again.
-    pub fn maps_alike(&self, other: &Self) -> bool {
-        self.cell_w == other.cell_w
-            && self.cell_h == other.cell_h
-            && self.src.x == other.src.x
-            && self.src.y == other.src.y
-            && !self.needs_scaling()
-            && !other.needs_scaling()
-    }
-
     /// True when the source has to be resampled to reach the destination.
     pub fn needs_scaling(&self) -> bool {
         self.dst_w != self.src.w || self.dst_h != self.src.h
@@ -425,20 +402,58 @@ pub enum Transfer {
     Shm,
 }
 
+/// Everything that decides a tile's pixels.
+///
+/// Two equal keys are the same picture, whatever layout produced them -- so a tile the
+/// terminal already holds can be compared against what it would be sent, which is the
+/// question, rather than one layout being compared against another, which is a guess at it.
+///
+/// `generation` is the damage side of the same question: bumped whenever the source under
+/// this tile changed, so a stale tile and a moved one are told apart by the same test.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Content {
+    /// The tile's rectangle in destination pixels: where it is, and how big.
+    dst: Rect,
+    /// Where the visible part of the source starts. Panning moves this and nothing else.
+    from: (u32, u32),
+    /// Destination pixels per source pixel, which is what says *which* source pixels reach
+    /// a given destination rectangle. Exactly `1.0` in the 1:1 modes however large the
+    /// window is -- which is why a window that grows keeps its interior tiles -- and a
+    /// different number every time a `fit` window is resized, which is why that one does
+    /// not.
+    scale: f64,
+    /// Which resampling produced it, if any. Two modes can land on the same scale and
+    /// filter it differently.
+    filter: Option<Filter>,
+    generation: u32,
+}
+
+/// One tile of the plane: what the terminal holds under its id, and where.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tile {
+    /// The content the terminal is holding. `None` means it has nothing under this id.
+    held: Option<Content>,
+    /// The cell its placement sits on, if it has one.
+    placed_at: Option<(u16, u16)>,
+    /// The generation of the last damage that touched this tile's source.
+    touched: u32,
+}
+
 pub struct Renderer {
     layout: Layout,
     grid: TileGrid,
-    dirty: Vec<bool>,
-    dirty_count: usize,
+    /// What the terminal holds, tile by tile, in the current grid's order.
+    tiles: Vec<Tile>,
+    /// How many tiles are not as they should be. Derived, and maintained where the marks
+    /// happen: `has_work` is asked every tick and must not walk the grid to answer.
+    owing: usize,
+    /// Bumped by every mark, so a tile that was damaged since it was last sent can be told
+    /// from one that was not by comparing a number rather than clearing a flag.
+    generation: u32,
     enc: KittyEncoder,
     scaler: Scaler,
     scaled: Framebuffer,
     scratch: Vec<u8>,
-    /// How far across and down the grid the terminal has been given tiles, so a
-    /// shrinking grid can clean up after itself and a growing one knows which
-    /// coordinates it has never sent. Every tile inside it has been transmitted:
-    /// a frame reaches the terminal whole or not at all.
-    placed: (u16, u16),
     cursor: Option<Cursor>,
     /// Where the cursor's hotspot is, in destination pixels.
     cursor_at: Option<(u32, u32)>,
@@ -453,15 +468,16 @@ impl Renderer {
     pub fn new(layout: Layout, compress: bool, transfer: Transfer) -> Self {
         let grid = TileGrid::new(&layout);
         Self {
-            dirty: vec![true; grid.len()],
-            dirty_count: grid.len(),
+            // Nothing is held, so every tile is owed.
+            tiles: vec![Tile::default(); grid.len()],
+            owing: grid.len(),
+            generation: 0,
             grid,
             layout,
             enc: KittyEncoder::new(compress),
             scaler: Scaler::new(),
             scaled: Framebuffer::new(0, 0),
             scratch: Vec::with_capacity(TILE_TARGET_PX as usize * TILE_TARGET_PX as usize * 3),
-            placed: (0, 0),
             cursor: None,
             cursor_at: None,
             transfer,
@@ -488,10 +504,10 @@ impl Renderer {
     /// say. Retransmitting the lot is what made a resize cost a whole screen, and erasing
     /// the screen first is what made it blank.
     ///
-    /// The whole grid is redrawn when the picture itself is laid out differently --
-    /// another scale, another crop, cells of another size. There every destination pixel
-    /// comes from somewhere new, so there is nothing to keep. [`Layout::maps_alike`] is
-    /// that question.
+    /// Nothing is compared layout against layout. Each tile is asked one question -- are
+    /// the pixels the terminal holds for you the pixels you would be sent? -- and the
+    /// answer covers a resize, a scale change, a pan, a font change and plain damage
+    /// without distinguishing between them. [`Content`] is that question written down.
     ///
     /// The stale *text* is not this layer's to erase -- it has drawn none -- and belongs
     /// to whoever owns the chrome. `ui::status::clear` and `Menu::clear` are that. What
@@ -508,50 +524,29 @@ impl Renderer {
             return Vec::new();
         }
         let grid = TileGrid::new(&layout);
-        let (was, was_grid) = (self.layout, self.grid);
-        let was_dirty = std::mem::take(&mut self.dirty);
+        let was_grid = self.grid;
+        let was = std::mem::take(&mut self.tiles);
 
-        // Everything the new grid does not reach, of what the terminal has been given.
+        // Everything the new grid has no place for, of what the terminal is holding. A
+        // tile it still reaches keeps its id and its pixels; only these have nobody
+        // coming for them.
         let mut cleanup = Vec::new();
-        for ty in 0..self.placed.1 {
-            for tx in 0..self.placed.0 {
-                if tx >= grid.nx || ty >= grid.ny {
+        for ty in 0..was_grid.ny {
+            for tx in 0..was_grid.nx {
+                let idx = usize::from(ty) * usize::from(was_grid.nx) + usize::from(tx);
+                if (tx >= grid.nx || ty >= grid.ny) && was[idx].held.is_some() {
                     delete_image(&mut cleanup, was_grid.id(tx, ty));
                 }
             }
         }
-        self.placed = (self.placed.0.min(grid.nx), self.placed.1.min(grid.ny));
 
-        // A tile is left alone only if the pixels the terminal holds for it are the ones
-        // it would be sent: the same rectangle of the same picture, and nothing owing on
-        // it from before. Anything else -- a tile that was clipped at the edge and is not
-        // any more, one the grid has only just reached, one still waiting on damage that
-        // arrived before the resize -- is drawn again.
-        //
-        // Where a kept tile goes is a separate question. Centring an image in a window of
-        // another width shifts every tile by a cell without changing a pixel of it, and
-        // that costs a placement rather than a transmission.
-        let alike = was.maps_alike(&layout);
-        let moved = (was.origin_col, was.origin_row) != (layout.origin_col, layout.origin_row);
-        self.dirty = Vec::with_capacity(grid.len());
-        self.dirty_count = 0;
-        for ty in 0..grid.ny {
-            for tx in 0..grid.nx {
-                let held = tx < self.placed.0 && ty < self.placed.1;
-                let clean = held
-                    && alike
-                    && was_grid.tile_rect(tx, ty) == grid.tile_rect(tx, ty)
-                    && !was_dirty[usize::from(ty) * usize::from(was_grid.nx) + usize::from(tx)];
-                self.dirty.push(!clean);
-                self.dirty_count += usize::from(!clean);
-                if clean && moved {
-                    place_existing(
-                        &mut cleanup,
-                        grid.id(tx, ty),
-                        layout.origin_col + tx * grid.tile_cols,
-                        layout.origin_row + ty * grid.tile_rows,
-                    );
-                }
+        // Carry each tile across to where it now sits. The grid's shape changed, so the
+        // index did; what the terminal holds did not.
+        self.tiles = vec![Tile::default(); grid.len()];
+        for ty in 0..grid.ny.min(was_grid.ny) {
+            for tx in 0..grid.nx.min(was_grid.nx) {
+                self.tiles[usize::from(ty) * usize::from(grid.nx) + usize::from(tx)] =
+                    was[usize::from(ty) * usize::from(was_grid.nx) + usize::from(tx)];
             }
         }
 
@@ -562,7 +557,66 @@ impl Renderer {
         } else {
             self.scaled.resize(0, 0);
         }
+
+        // And now what is owed, which is the same reckoning a damaged frame does: the
+        // pixels a tile holds against the pixels it would be sent. A tile whose content
+        // survived but whose cell moved -- centring an image in a window of another width
+        // shifts every one of them -- costs a placement and no pixels.
+        self.owing = 0;
+        for ty in 0..self.grid.ny {
+            for tx in 0..self.grid.nx {
+                let want = self.want(tx, ty);
+                let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
+                let cell = self.cell_of(tx, ty);
+                let tile = &mut self.tiles[idx];
+                if tile.held != Some(want) {
+                    self.owing += 1;
+                } else if tile.placed_at != Some(cell) {
+                    place_existing(&mut cleanup, self.grid.id(tx, ty), cell.0, cell.1);
+                    tile.placed_at = Some(cell);
+                }
+            }
+        }
         cleanup
+    }
+
+    /// The content a tile should be holding, as the layout in force describes it.
+    ///
+    /// Not the source rectangle: under a scale the source region behind a destination
+    /// rectangle is fractional, and rounding it would make two different mappings compare
+    /// equal. The mapping itself goes in the key instead -- where the crop starts and how
+    /// many destination pixels a source pixel becomes -- which decides the same thing
+    /// exactly.
+    fn want(&self, tx: u16, ty: u16) -> Content {
+        Content {
+            dst: self.grid.tile_rect(tx, ty),
+            from: (self.layout.src.x, self.layout.src.y),
+            scale: self.layout.scale,
+            filter: self.layout.needs_scaling().then(|| self.layout.filter()),
+            generation: self.tiles[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)]
+                .touched,
+        }
+    }
+
+    /// The cell a tile's placement belongs on.
+    fn cell_of(&self, tx: u16, ty: u16) -> (u16, u16) {
+        (
+            self.layout.origin_col + tx * self.grid.tile_cols,
+            self.layout.origin_row + ty * self.grid.tile_rows,
+        )
+    }
+
+    /// Note that a tile's source has changed, and whether that leaves it owing.
+    fn touch(&mut self, tx: u16, ty: u16) {
+        let generation = self.generation;
+        let want = self.want(tx, ty);
+        let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
+        let tile = &mut self.tiles[idx];
+        let was_owed = tile.held != Some(want);
+        tile.touched = generation;
+        if !was_owed {
+            self.owing += 1;
+        }
     }
 
     /// Mark damage, in source-framebuffer pixels.
@@ -584,15 +638,14 @@ impl Renderer {
         let Some(dst) = r.intersect(&Rect::new(0, 0, self.layout.dst_w, self.layout.dst_h)) else {
             return;
         };
+        // One generation per mark, so a tile touched by this damage is distinguishable
+        // from one holding pixels taken before it.
+        self.generation = self.generation.wrapping_add(1);
         let (x0, y0, x1, y1) = self.grid.tiles_covering(dst);
         for ty in y0..=y1 {
             for tx in x0..=x1 {
-                let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
-                if let Some(slot) = self.dirty.get_mut(idx)
-                    && !*slot
-                {
-                    *slot = true;
-                    self.dirty_count += 1;
+                if tx < self.grid.nx && ty < self.grid.ny {
+                    self.touch(tx, ty);
                 }
             }
         }
@@ -692,24 +745,29 @@ impl Renderer {
     }
 
     pub fn mark_all(&mut self) {
-        for slot in &mut self.dirty {
-            *slot = true;
+        self.generation = self.generation.wrapping_add(1);
+        for ty in 0..self.grid.ny {
+            for tx in 0..self.grid.nx {
+                self.touch(tx, ty);
+            }
         }
-        self.dirty_count = self.dirty.len();
     }
 
     pub fn has_work(&self) -> bool {
-        self.dirty_count > 0
+        self.owing > 0
     }
 
     #[cfg(test)]
     pub fn dirty_tiles(&self) -> usize {
-        self.dirty_count
+        self.owing
     }
 
+    /// Is this tile owed pixels? Not whether it is owed a *placement*, which is the other
+    /// half of the reckoning and costs no transmission.
     #[cfg(test)]
     fn is_dirty(&self, tx: u16, ty: u16) -> bool {
-        self.dirty[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)]
+        let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
+        self.tiles[idx].held != Some(self.want(tx, ty))
     }
 
     pub fn tile_count(&self) -> usize {
@@ -731,7 +789,9 @@ impl Renderer {
         let mut region: Option<Rect> = None;
         for ty in 0..self.grid.ny {
             for tx in 0..self.grid.nx {
-                if !self.dirty[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)] {
+                if self.tiles[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)].held
+                    == Some(self.want(tx, ty))
+                {
                     continue;
                 }
                 let tile = self.grid.tile_rect(tx, ty);
@@ -761,7 +821,7 @@ impl Renderer {
     /// chrome; nothing here writes to the terminal directly.
     pub fn compose(&mut self, fb: &Framebuffer, out: &mut Vec<u8>) -> FrameStats {
         let mut stats = FrameStats::default();
-        if self.dirty_count == 0 || self.grid.len() == 0 {
+        if self.owing == 0 || self.grid.len() == 0 {
             return stats;
         }
         let before = out.len();
@@ -810,7 +870,8 @@ impl Renderer {
         for ty in 0..self.grid.ny {
             for tx in 0..self.grid.nx {
                 let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
-                if !self.dirty[idx] {
+                let want = self.want(tx, ty);
+                if self.tiles[idx].held == Some(want) {
                     continue;
                 }
                 let tile = self.grid.tile_rect(tx, ty);
@@ -881,14 +942,21 @@ impl Renderer {
     /// `compose`: a frame the writer was too busy for never arrived, and a tile counted as
     /// held that was never sent is a hole in the next resize that keeps it.
     ///
-    /// Every tile in the grid is now there. The dirty ones have just been transmitted, and
-    /// a tile that was not dirty was one the terminal already held.
+    /// Every tile now holds what the layout asks of it: the ones that were owed have just
+    /// been transmitted, and the rest already held it. Recomputed rather than remembered --
+    /// `want` is a pure function of the layout and the tile's damage generation, so there is
+    /// nothing to carry from the compose except the fact that it reached the terminal.
     pub fn commit(&mut self) {
-        for slot in &mut self.dirty {
-            *slot = false;
+        for ty in 0..self.grid.ny {
+            for tx in 0..self.grid.nx {
+                let want = self.want(tx, ty);
+                let cell = self.cell_of(tx, ty);
+                let idx = usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx);
+                self.tiles[idx].held = Some(want);
+                self.tiles[idx].placed_at = Some(cell);
+            }
         }
-        self.dirty_count = 0;
-        self.placed = (self.grid.nx, self.grid.ny);
+        self.owing = 0;
     }
 }
 
@@ -1439,10 +1507,9 @@ mod tests {
 
     #[test]
     fn a_frame_that_never_reached_the_terminal_leaves_its_tiles_owing() {
-        // `placed` is what a later relayout trusts when it decides to keep a tile, so it
-        // moves on the commit rather than on the compose. A frame the writer was too busy
-        // for was composed and thrown away, and a tile counted as held that was never sent
-        // is a hole that survives every resize that keeps it.
+        // What a tile holds is settled on the commit, not the compose: a frame the writer
+        // was too busy for was composed and thrown away, and a tile counted as held that
+        // was never sent is a hole that survives every resize that keeps it.
         let m = ghostty();
         let (w, h) = m.image_area();
         let mut r = Renderer::new(
@@ -1461,6 +1528,37 @@ mod tests {
             r.dirty_tiles(),
             r.tile_count(),
             "nothing reached the terminal, so nothing can be kept"
+        );
+    }
+
+    #[test]
+    fn a_tile_that_is_owed_pixels_stays_owed_across_a_resize() {
+        // Damage that arrived before a resize is not answered by the resize. The tile it
+        // touched has to survive as owing, or a change the server reported once is lost --
+        // which a bitmap cleared by the relayout could do and a per-tile key cannot.
+        let m = ghostty();
+        let (w, h) = m.image_area();
+        let mut r = Renderer::new(
+            Layout::compute(&m, ScaleMode::Native, w, h, (0, 0)),
+            true,
+            Transfer::Direct,
+        );
+        let fb = Framebuffer::new(w, h);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        r.commit();
+        assert!(!r.has_work(), "the screen is up to date");
+
+        // One tile's worth of damage, in a corner a growing window does not disturb.
+        r.mark(Rect::new(0, 0, 8, 8));
+        assert!(r.is_dirty(0, 0));
+
+        let bigger = metrics(202, 50, 8, 17);
+        let (bw, bh) = bigger.image_area();
+        r.relayout(Layout::compute(&bigger, ScaleMode::Native, bw, bh, (0, 0)));
+        assert!(
+            r.is_dirty(0, 0),
+            "the tile was owed pixels before the resize and is still owed them after"
         );
     }
 
