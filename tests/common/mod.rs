@@ -424,6 +424,9 @@ pub const DELETE_IMAGE: &[u8] = b"a=d,d=I";
 /// inside a block that puts the new one there.
 pub const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
 pub const END_SYNC: &[u8] = b"\x1b[?2026l";
+/// An image the terminal already holds, put on a cell. The other way a block can put
+/// the picture back, and the cheap one: no pixels travel.
+pub const PLACE_IMAGE: &[u8] = b"a=p,";
 
 /// The synchronised block holding the first occurrence of `needle`, which is one frame.
 ///
@@ -479,6 +482,16 @@ pub fn assert_a_relayout_never_blanks_the_screen(term: &FakeTerm, before: usize)
         "the new layout was never drawn: {}",
         show(seen)
     );
+    assert_erases_travel_with_what_undoes_them(seen);
+}
+
+/// The claim itself, over a stream that has already been waited for.
+///
+/// Split out from the waiting so it can be put to bytes directly: this is where the
+/// suite went red on slower machines, and a case that reaches it without a pty is the
+/// only way to hold a fix to the frames that actually provoked it.
+#[track_caller]
+pub fn assert_erases_travel_with_what_undoes_them(seen: &[u8]) {
     let opens = offsets(seen, BEGIN_SYNC);
     let closes = offsets(seen, END_SYNC);
 
@@ -505,10 +518,18 @@ pub fn assert_a_relayout_never_blanks_the_screen(term: &FakeTerm, before: usize)
             .copied()
             .find(|c| *c > at)
             .unwrap_or(seen.len());
+        // Either way of putting it back counts. A relayout erases and then calls
+        // `replace_all`, which places images the terminal is already holding; whether
+        // the compose after it also has pixels to send depends on whether a tile
+        // happened to be dirty just then, and on a slow machine it often does not.
+        // Requiring a transmission here asked for the expensive half of a redraw and
+        // failed the frames where the picture moved for free -- which is the behaviour
+        // `moving_the_picture_costs_placements_and_not_pixels` exists to require.
+        let block = &seen[open..close];
         assert!(
-            contains(&seen[open..close], session::DREW),
-            "the screen was erased at {at} in a block that drew nothing back: {}",
-            show(&seen[open..close])
+            contains(block, session::DREW) || contains(block, PLACE_IMAGE),
+            "the screen was erased at {at} in a block that put nothing back: {}",
+            show(block)
         );
     }
 

@@ -653,3 +653,43 @@ fn a_drag_is_still_coalesced_into_a_few_requests() {
     quit(&mut term);
     term.wait(Duration::from_secs(10));
 }
+
+/// A relayout frame that moves the picture without sending a pixel, byte for byte as
+/// the client writes one: the cleanup, the erase, and then `replace_all` releasing and
+/// re-placing each image the terminal already holds.
+fn a_frame_that_moves_the_picture(ids: &[u32]) -> Vec<u8> {
+    let mut frame = b"\x1b[?2026h".to_vec();
+    frame.extend_from_slice(b"\x1b[2J");
+    for (n, id) in ids.iter().enumerate() {
+        frame.extend_from_slice(format!("\x1b_Ga=d,d=i,i={id},p=1,q=2\x1b\\").as_bytes());
+        frame.extend_from_slice(format!("\x1b[6;{}H", 11 + n * 16).as_bytes());
+        frame.extend_from_slice(format!("\x1b_Ga=p,q=2,C=1,z=-1,i={id},p=1\x1b\\").as_bytes());
+    }
+    frame.extend_from_slice(b"\x1b[?2026l");
+    frame
+}
+
+#[test]
+fn a_relayout_may_put_the_picture_back_without_sending_a_pixel() {
+    // The frame this is built from is the one CI failed on: an erase, and then every
+    // image put back by id with no payload behind any of them. That is `replace_all`
+    // working -- `moving_the_picture_costs_placements_and_not_pixels` requires exactly
+    // this shape elsewhere in this file -- but the check read a placement as nothing at
+    // all and wanted a transmission, so the assertion fired on its own optimisation.
+    //
+    // Whether a transmission joins the placements is a matter of whether any tile
+    // happened to be dirty when the window changed, which is why this only ever went
+    // red on the slower runner and never locally.
+    assert_erases_travel_with_what_undoes_them(&a_frame_that_moves_the_picture(&[
+        30208, 30209, 30210,
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "put nothing back")]
+fn an_erase_that_puts_nothing_back_is_still_caught() {
+    // The bug the check exists for: the erase went out in a block of its own, ahead of
+    // the frame that fills the screen in, so the terminal stood blank in between.
+    // Accepting placements must not have let that through.
+    assert_erases_travel_with_what_undoes_them(b"\x1b[?2026h\x1b[2J\x1b[?2026l");
+}
