@@ -304,7 +304,7 @@ fn a_real_server_negotiates_continuous_updates() {
     // negotiation works against something that was not written to agree with us.
     let mut term = start(&["--scale", "native", "--log-file", "/tmp/desktui-live.log"]);
     assert!(
-        term.wait_for(b"continuous updates", Duration::from_secs(30)),
+        term.wait_for(b"pushing frames", Duration::from_secs(30)),
         "the server never enabled continuous updates: {}",
         tail(&term.output())
     );
@@ -524,12 +524,17 @@ fn a_real_server_answers_the_latency_probe() {
     // A measured round trip appears in the status line as a number of milliseconds.
     // Before the fix it was there too, but climbing; now it can only appear at all if a
     // fence came back.
+    //
+    // Matched on the figure alone rather than on the binding that used to follow it: the
+    // status line gained per-span colours, so an escape sequence sits between the two and
+    // no contiguous needle can span them. `ms` with the trailing pad is enough on its
+    // own -- an unmeasured round trip is drawn as dashes, so the unit only appears when
+    // there is a number in front of it.
     let start = std::time::Instant::now();
     let mut seen = false;
     while start.elapsed() < Duration::from_secs(20) {
         let out = term.output();
-        // Two samples a second apart: a real measurement stays small, the old bug grew.
-        if contains(&out, b"ms  Ctrl+") {
+        if contains(&out, b"ms  ") {
             seen = true;
             break;
         }
@@ -544,7 +549,7 @@ fn a_real_server_answers_the_latency_probe() {
     // And it must not be a figure that only grows. Sample it twice, far apart.
     let sample = |out: &[u8]| -> Option<u128> {
         let text = String::from_utf8_lossy(out).into_owned();
-        text.rmatch_indices("ms  Ctrl+").next().and_then(|(i, _)| {
+        text.rmatch_indices("ms  ").next().and_then(|(i, _)| {
             let head = &text[..i];
             let digits: String = head
                 .chars()

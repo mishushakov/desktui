@@ -1,8 +1,13 @@
-//! A live VNC session.
+//! A live remote desktop session.
 //!
-//! One loop selects over three sources: events decoded from the server, input
-//! from the terminal, and a render tick. Everything on screen is composed in the
-//! tick and handed to the writer thread as a single frame.
+//! One loop selects over three sources: updates from the remote, input from the
+//! terminal, and a render tick. Everything on screen is composed in the tick and
+//! handed to the writer thread as a single frame.
+//!
+//! Nothing here names a protocol. What arrives comes through [`crate::remote`], and
+//! the two capabilities this loop changes shape around -- whether frames arrive
+//! unasked, and whether a round trip can be measured -- are announced by the backend
+//! rather than assumed.
 
 use std::time::{Duration, Instant};
 
@@ -11,17 +16,16 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
-use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::app::{FpsMeter, describe, human_bytes};
 use crate::cli::{Args, ScaleMode};
+use crate::remote::{
+    Backend, Connect, ConnectError, Input, Key, ResizeStatus, Screen, ScreenInfo, ScreenLayout,
+    Update,
+};
 use crate::render::framebuffer::Framebuffer;
 use crate::render::{FrameStats, Layout, Rect, Renderer};
-use crate::rfb::{
-    ClipboardCaps, PixelFormat, ResizeStatus, Screen, ScreenInfo, ScreenLayout, VncClient,
-    VncConnector, VncEncoding, VncError, VncEvent, X11Event,
-};
 use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
@@ -30,9 +34,6 @@ use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
 use crate::ui::theme::Theme;
 use crate::ui::toast::Toast;
-
-/// How long to wait for the TCP connection.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A server that has gone quiet for this long gets its update request repeated.
 /// Some servers drop one under load, and without this the session would simply
@@ -48,14 +49,11 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// incremental request instantly cannot spin us at full speed.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
 
-/// How often to measure the round trip with a fence, once frames stop being requested.
+/// How often to measure the round trip, once frames stop being requested.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A probe this old was dropped by the server; stop waiting for it.
 const RTT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Marks a fence as our own latency probe rather than a synchronisation request.
-const RTT_PROBE_MARKER: &[u8] = b"desktui-rtt";
 
 /// First pause before a reconnect attempt, doubling up to the cap.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
@@ -99,32 +97,32 @@ impl Resize {
     }
 }
 
-pub async fn run(
+pub async fn run<C: Connect>(
     args: &Args,
     caps: &Caps,
     guard: &TerminalGuard,
-    addr: &str,
-    password: Option<String>,
+    remote: &mut C,
 ) -> Result<()> {
     // The first connection is made before the alternate screen, so that a
     // password prompt is somewhere the user can see it. Later attempts reuse the
     // password and need no prompt.
-    let (client, password) = connect(addr, password, args).await?;
+    let backend = connect(remote).await?;
     guard.begin_full_screen()?;
 
-    let mut next = Some(client);
+    let addr = remote.address().to_string();
+    let mut next = Some(backend);
     let mut backoff = RECONNECT_BACKOFF;
 
     loop {
-        let client = match next.take() {
-            Some(client) => {
+        let backend = match next.take() {
+            Some(backend) => {
                 backoff = RECONNECT_BACKOFF;
-                client
+                backend
             }
-            None => match try_connect(addr, password.clone(), args).await {
-                Ok(client) => {
+            None => match remote.connect().await {
+                Ok(backend) => {
                     backoff = RECONNECT_BACKOFF;
-                    client
+                    backend
                 }
                 Err(err) => {
                     notice(&format!(
@@ -138,12 +136,12 @@ pub async fn run(
             },
         };
 
-        let mut session = Session::new(args, caps, client).await?;
+        let mut session = Session::new(args, caps, backend).await?;
         let result = session.run(args).await;
         // Let go of anything held on the remote before leaving, so a modifier does
         // not stay stuck in whatever had focus over there.
         session.release_input().await;
-        session.client.close().await;
+        session.backend.close().await;
         drop(session);
 
         match result {
@@ -171,92 +169,28 @@ fn notice(text: &str) {
     let _ = out.flush();
 }
 
-/// Open the connection, prompting for a password only if the server asks for one
+/// Open the connection, prompting for a password only if the remote asks for one
 /// and none was supplied.
-async fn connect(
-    addr: &str,
-    password: Option<String>,
-    args: &Args,
-) -> Result<(VncClient, Option<String>)> {
-    match try_connect(addr, password.clone(), args).await {
-        Ok(client) => Ok((client, password)),
-        Err(VncError::NoPassword) => {
-            let password = crate::prompt_password(addr)?;
-            let client = try_connect(addr, Some(password.clone()), args)
+///
+/// The password is handed back to the connector rather than kept here, so that a
+/// reconnect an hour later needs no prompt.
+async fn connect<C: Connect>(remote: &mut C) -> Result<C::Backend> {
+    match remote.connect().await {
+        Ok(backend) => Ok(backend),
+        Err(ConnectError::NeedsPassword) => {
+            let password = crate::prompt_password(remote.address())?;
+            remote.use_password(password);
+            remote
+                .connect()
                 .await
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
-            Ok((client, Some(password)))
+                .map_err(|err| anyhow::anyhow!("{err}"))
         }
-        Err(err) => Err(anyhow::anyhow!("{err}")).with_context(|| format!("connecting to {addr}")),
+        Err(ConnectError::Failed(err)) => Err(err),
     }
 }
 
-async fn try_connect(
-    addr: &str,
-    password: Option<String>,
-    args: &Args,
-) -> Result<VncClient, VncError> {
-    // Not in a view-only session: there is no local pointer worth drawing there, and
-    // letting the server composite its own is the only way to see where the real one
-    // is.
-    let local_cursor = !args.view_only;
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| VncError::General(format!("timed out connecting to {addr}")))?
-        .map_err(VncError::IoError)?;
-    // Input latency is the whole point; do not let Nagle sit on a click.
-    stream.set_nodelay(true).map_err(VncError::IoError)?;
-
-    VncConnector::new(stream)
-        .set_auth_method(async move { password.ok_or(VncError::NoPassword) })
-        // Order is preference order. Tight first: it is what every modern server
-        // does best, and its JPEG rectangles are the cheapest way to move a busy
-        // screen.
-        .add_encoding(VncEncoding::Tight)
-        .add_encoding(VncEncoding::Zrle)
-        .add_encoding(VncEncoding::CopyRect)
-        .add_encoding(VncEncoding::Raw)
-        .add_encoding(VncEncoding::ExtendedDesktopSizePseudo)
-        .add_encoding(VncEncoding::DesktopSizePseudo)
-        .add_encoding(VncEncoding::LastRectPseudo)
-        // Ask the server to push frames rather than answer a request each time, which
-        // saves a round trip per frame; Fence is what makes that safe to negotiate.
-        .add_encoding(VncEncoding::ContinuousUpdatesPseudo)
-        .add_encoding(VncEncoding::FencePseudo)
-        // And to tell us its lock-key state, so a caps lock that disagrees with the
-        // local keyboard can be corrected instead of shouting.
-        .add_encoding(VncEncoding::QemuLedStatePseudo)
-        // Asking for the cursor shape stops the server drawing the pointer into the
-        // framebuffer, which is what lets it move at local speed instead of waiting for
-        // a round trip.
-        .add_encodings(if local_cursor {
-            &[VncEncoding::CursorPseudo][..]
-        } else {
-            &[]
-        })
-        // The clipboard in UTF-8 rather than Latin-1, and announced rather than pushed.
-        // Left out entirely with --no-clipboard: the encoding is a standing offer to
-        // exchange clipboards, and a session that wants none should not make it.
-        .add_encodings(if args.no_clipboard {
-            &[]
-        } else {
-            &[VncEncoding::ExtendedClipboardPseudo][..]
-        })
-        .set_quality(args.quality)
-        .set_compression(args.compression)
-        .allow_shared(true)
-        // BGRA is what an x86 server produces natively, so this is the format
-        // that costs neither side a swizzle on the wire. The pack to RGB happens
-        // once per tile at the end of the pipeline.
-        .set_pixel_format(PixelFormat::bgra())
-        .build()?
-        .try_start()
-        .await?
-        .finish()
-}
-
-struct Session {
-    client: VncClient,
+struct Session<B: Backend> {
+    backend: B,
     fb: Framebuffer,
     renderer: Renderer,
     writer: FrameWriter,
@@ -285,18 +219,15 @@ struct Session {
     /// measure against, and showing the age of the last request we happened to send
     /// would be a number that only ever grows.
     rtt: Option<Duration>,
-    /// The server has sent us a fence, so it understands them and can be asked to
-    /// bounce one back.
-    fence_supported: bool,
+    /// The backend has said it can measure a round trip.
+    can_probe_latency: bool,
     /// When the outstanding latency probe went out.
     rtt_probe_at: Option<Instant>,
     /// When the last measurement completed, to space the probes out.
     rtt_measured_at: Option<Instant>,
-    /// The server pushes updates without being asked, so no requests are sent.
-    continuous_updates: bool,
-    /// The rectangle continuous updates was last enabled for, so a resize can tell
-    /// whether it needs to say so again.
-    continuous_rect: Option<(u16, u16)>,
+    /// Frames arrive without being asked for, so no requests are sent. How the
+    /// backend arranged that is its own business.
+    pushed_frames: bool,
     /// The remote lock-key state, when the server tells us. `None` means unknown,
     /// which is also what it becomes right after a correction is sent: the answer
     /// takes a moment to arrive and acting twice would toggle it back.
@@ -305,16 +236,11 @@ struct Session {
 
     view_only: bool,
     no_clipboard: bool,
-    /// What the server accepts on the extended clipboard, once its `caps` message has
-    /// arrived. `None` means the extension is not in play, and the Latin-1 `CutText`
-    /// messages are all there is.
-    clipboard_caps: Option<ClipboardCaps>,
-    /// Text we have told the server we hold and have not been asked for yet.
-    ///
-    /// The extension moves ownership before it moves data: a local paste announces
-    /// itself, and the bytes go over when something on the remote side pastes. Kept
-    /// rather than taken when that happens, because it can be pasted more than once.
-    announced_clipboard: Option<String>,
+    /// Text put on the remote clipboard will not survive intact, so anything outside
+    /// Latin-1 has to be warned about. True until a backend says otherwise: the
+    /// answer takes a negotiation, and the pessimistic assumption is the safe one to
+    /// start on.
+    clipboard_lossy: bool,
     /// Which palette the chrome wears. Dark to start, the bar having been that colour
     /// before there was a choice.
     theme: Theme,
@@ -338,11 +264,11 @@ struct Session {
     quit: bool,
 }
 
-impl Session {
-    async fn new(args: &Args, caps: &Caps, client: VncClient) -> Result<Self> {
+impl<B: Backend> Session<B> {
+    async fn new(args: &Args, caps: &Caps, backend: B) -> Result<Self> {
         let metrics = Metrics::query()?;
-        let remote = client.resolution().await;
-        let server_name = client.name().await;
+        let remote = backend.resolution().await;
+        let server_name = backend.name().await;
 
         let fb = Framebuffer::new(u32::from(remote.0), u32::from(remote.1));
         let layout = Layout::compute(
@@ -354,7 +280,7 @@ impl Session {
         );
 
         Ok(Self {
-            client,
+            backend,
             fb,
             renderer: Renderer::new(layout, true, args.transfer.resolve(caps)),
             writer: FrameWriter::spawn(),
@@ -371,17 +297,15 @@ impl Session {
             awaiting_update: true, // the engine asks for the first frame itself
             requested_at: Instant::now(),
             rtt: None,
-            fence_supported: false,
+            can_probe_latency: false,
             rtt_probe_at: None,
             rtt_measured_at: None,
-            continuous_updates: false,
-            continuous_rect: None,
+            pushed_frames: false,
             remote_caps_lock: None,
             remote_num_lock: None,
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
-            clipboard_caps: None,
-            announced_clipboard: None,
+            clipboard_lossy: true,
             theme: Theme::Dark,
             menu: Menu::new(args.prefix_char()),
             show_menu: false,
@@ -406,8 +330,8 @@ impl Session {
 
         while !self.quit {
             tokio::select! {
-                event = self.client.recv_event() => match event {
-                    Ok(event) => self.on_vnc(event).await?,
+                update = self.backend.recv() => match update {
+                    Ok(update) => self.on_update(update).await?,
                     Err(err) => {
                         anyhow::bail!("the session ended: {err}");
                     }
@@ -422,14 +346,14 @@ impl Session {
         Ok(())
     }
 
-    async fn on_vnc(&mut self, event: VncEvent) -> Result<()> {
-        match event {
-            VncEvent::RawImage(rect, data) => {
+    async fn on_update(&mut self, update: Update) -> Result<()> {
+        match update {
+            Update::Bgra(rect, data) => {
                 if let Some(damage) = self.fb.apply_bgra(convert(rect), &data) {
                     self.renderer.mark(damage);
                 }
             }
-            VncEvent::JpegImage(rect, data) => match decode_jpeg(&data) {
+            Update::Jpeg(rect, data) => match decode_jpeg(&data) {
                 Ok((w, h, rgb)) => {
                     // Trust the rectangle header for placement, but the JPEG for
                     // its own dimensions.
@@ -440,27 +364,26 @@ impl Session {
                 }
                 Err(err) => tracing::warn!("dropping an undecodable JPEG rectangle: {err}"),
             },
-            VncEvent::Copy(dst, src) => {
+            Update::Copy { dst, from } => {
                 if let Some(damage) =
                     self.fb
-                        .copy_rect(convert(dst), u32::from(src.x), u32::from(src.y))
+                        .copy_rect(convert(dst), u32::from(from.0), u32::from(from.1))
                 {
                     self.renderer.mark(damage);
                 }
             }
-            VncEvent::SetResolution(screen) => self.on_remote_size(screen, None).await?,
-            VncEvent::DesktopLayout(layout) => self.on_layout(layout).await?,
-            VncEvent::FramebufferUpdateEnd => {
-                // Only meaningful when this update answers a request of ours. With
-                // continuous updates there is no pair, and the fence probe measures it
-                // instead.
-                if self.awaiting_update && !self.continuous_updates {
+            Update::Resolution(screen) => self.on_remote_size(screen, None).await?,
+            Update::Layout(layout) => self.on_layout(layout).await?,
+            Update::FrameEnd => {
+                // Only meaningful when this frame answers a request of ours. With
+                // frames arriving unbidden there is no pair, and the latency probe
+                // measures it instead.
+                if self.awaiting_update && !self.pushed_frames {
                     self.rtt = Some(self.requested_at.elapsed());
                 }
                 self.awaiting_update = false;
-                // The first update is also the answer to our capability probe: a
-                // server that supports resizing must have included a layout
-                // rectangle in it.
+                // The first frame is also the answer to our capability probe: a
+                // remote that supports resizing must have reported a layout with it.
                 if self.resize == Resize::Probing {
                     self.resize = Resize::Unsupported;
                     if let Some(note) = self.resize.note() {
@@ -468,110 +391,74 @@ impl Session {
                     }
                     self.fall_back_from_native();
                 }
-                // Ask for the next update now, not on the next render tick. The
-                // server can then encode the following frame while we are still
+                // Ask for the next frame now, not on the next render tick. The
+                // remote can then encode the following one while we are still
                 // drawing this one; waiting for the tick leaves it idle for up to a
                 // whole frame interval, which roughly halves the rate a moving
                 // picture can reach.
                 self.request_update().await?;
             }
-            VncEvent::Text(text) => {
+            Update::Clipboard(text) => {
                 if !self.no_clipboard {
                     self.copy_to_local_clipboard(&text);
                 }
             }
-            VncEvent::ClipboardCaps(caps) => {
-                // The extension is live from here: the clipboard is UTF-8 in both
-                // directions, and a remote selection arrives as an announcement rather
-                // than as a copy of itself.
-                tracing::debug!("extended clipboard negotiated: {caps:?}");
-                self.clipboard_caps = Some(caps);
+            Update::ClipboardLossy(lossy) => {
+                // Whether text put on the remote clipboard survives intact. A session
+                // assumes it does not until told otherwise, because the answer takes a
+                // negotiation and the pessimistic path is the safe one to start on.
+                tracing::debug!(
+                    "remote clipboard is {}",
+                    if lossy { "Latin-1" } else { "UTF-8" }
+                );
+                self.clipboard_lossy = lossy;
             }
-            VncEvent::ClipboardNotify { text } => {
-                // Nothing has been transferred yet -- that is the point of a notify --
-                // so ask for it. With --no-clipboard the extension was never
-                // advertised, so this cannot arrive; the check is belt and braces
-                // around a server that sends one anyway.
-                if text && !self.no_clipboard {
-                    self.send(X11Event::ClipboardRequest).await?;
-                }
-            }
-            VncEvent::ClipboardRequest => {
-                // Something on the remote side pasted, so the text we announced is
-                // wanted now.
-                match self.announced_clipboard.clone() {
-                    Some(text) if !self.view_only && !self.no_clipboard => {
-                        tracing::debug!("sending the announced clipboard, {} bytes", text.len());
-                        self.send(X11Event::ClipboardProvide(text)).await?;
-                    }
-                    _ => tracing::debug!("server asked for a clipboard we never announced"),
-                }
-            }
-            VncEvent::Bell => {
+            Update::Bell => {
                 // A bell is the one thing worth passing straight through.
                 let mut buf = self.writer.take_buffer();
                 buf.push(0x07);
                 let _ = self.writer.submit_blocking(buf);
             }
-            VncEvent::SetPixelFormat(pf) => {
-                tracing::debug!("server pixel format: {pf:?}");
-            }
-            VncEvent::LedState { num, caps, .. } => {
+            Update::LockKeys { num, caps } => {
                 // Only useful as something to compare the local keyboard against, so
-                // scroll lock is ignored: no terminal reports it.
+                // scroll lock never crosses the seam: no terminal reports it.
                 tracing::debug!("remote lock keys: caps={caps} num={num}");
                 self.remote_caps_lock = Some(caps);
                 self.remote_num_lock = Some(num);
             }
-            VncEvent::EndOfContinuousUpdates => {
-                // The first one of these is the server saying the extension exists.
-                // Any later one means it stopped, and asking again is how it restarts.
-                if !self.continuous_updates {
-                    tracing::info!("server supports continuous updates; enabling");
-                    self.set_note("continuous updates: the server pushes frames".into());
+            Update::Pushing(pushing) => {
+                if pushing && !self.pushed_frames {
+                    tracing::info!("frames now arrive without being asked for");
+                    self.set_note("the remote is pushing frames".into());
                 }
-                self.continuous_updates = false;
-                self.continuous_rect = None;
-                self.enable_continuous_updates().await?;
-            }
-            VncEvent::Fence { flags, payload } => {
-                tracing::debug!(
-                    "fence from server, flags {flags:#x}, {} bytes",
-                    payload.len()
-                );
-                // A fence at all means the server understands them, which is what makes
-                // the latency probe possible.
-                self.fence_supported = true;
-                // A fence with the request bit set has to come back with that bit
-                // cleared, along with any flag we do not understand. Ours arrive in
-                // order and are handled one at a time, which is what BlockBefore and
-                // BlockAfter ask for, so echoing is all there is to do.
-                if flags & crate::rfb::fence::REQUEST != 0 {
-                    let echo =
-                        flags & (crate::rfb::fence::BLOCK_BEFORE | crate::rfb::fence::BLOCK_AFTER);
-                    self.send(X11Event::Fence {
-                        flags: echo,
-                        payload,
-                    })
-                    .await?;
-                } else if payload == RTT_PROBE_MARKER {
-                    // Our own probe, back again: the gap is the round trip.
-                    if let Some(sent) = self.rtt_probe_at.take() {
-                        self.rtt = Some(sent.elapsed());
-                        self.rtt_measured_at = Some(Instant::now());
-                    }
-                } else {
-                    tracing::debug!("unsolicited fence response, flags {flags:#x}");
+                self.pushed_frames = pushing;
+                // Nothing is outstanding any more: frames arrive unbidden from here.
+                if pushing {
+                    self.awaiting_update = false;
                 }
             }
-            VncEvent::SetCursor(rect, pixels) => {
-                // The rectangle's x and y are the hotspot rather than a position.
+            Update::LatencyAvailable => {
+                tracing::debug!("the remote can measure a round trip");
+                self.can_probe_latency = true;
+            }
+            Update::LatencyProbe => {
+                // Our own probe, back again: the gap is the round trip.
+                if let Some(sent) = self.rtt_probe_at.take() {
+                    self.rtt = Some(sent.elapsed());
+                    self.rtt_measured_at = Some(Instant::now());
+                }
+            }
+            Update::Cursor {
+                size,
+                hotspot,
+                bgra,
+            } => {
                 let cursor = crate::render::Cursor {
-                    w: u32::from(rect.width),
-                    h: u32::from(rect.height),
-                    hot_x: u32::from(rect.x),
-                    hot_y: u32::from(rect.y),
-                    pixels,
+                    w: u32::from(size.0),
+                    h: u32::from(size.1),
+                    hot_x: u32::from(hotspot.0),
+                    hot_y: u32::from(hotspot.1),
+                    pixels: bgra,
                 };
                 tracing::debug!(
                     "cursor shape {}x{} hotspot {},{}",
@@ -582,7 +469,7 @@ impl Session {
                 );
                 self.renderer.set_cursor(Some(cursor));
             }
-            VncEvent::Error(err) => anyhow::bail!("the server connection failed: {err}"),
+            Update::Error(err) => anyhow::bail!("the remote connection failed: {err}"),
         }
         Ok(())
     }
@@ -616,15 +503,6 @@ impl Session {
         self.relayout();
         if let Some(note) = note {
             self.set_note(note);
-        }
-
-        // The server remembers which rectangle it was told to push, and a resize does
-        // not change its mind. Saying so again is the whole difference between a
-        // desktop that grows and one that grows a black band down two sides: the region
-        // beyond the old rectangle is never sent otherwise.
-        if self.continuous_updates {
-            self.continuous_rect = None;
-            self.enable_continuous_updates().await?;
         }
         Ok(())
     }
@@ -741,14 +619,13 @@ impl Session {
         self.resize = Resize::Waiting { want };
         self.requested_size = Some(want);
         self.requested_at = Instant::now();
-        self.client
-            .input(X11Event::SetDesktopSize {
+        self.backend
+            .send(Input::Resize {
                 width: want.0,
                 height: want.1,
                 screens,
             })
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+            .await?;
         Ok(())
     }
 
@@ -790,7 +667,7 @@ impl Session {
                             if !self.view_only {
                                 self.sync_lock_keys(locks).await?;
                                 for key in keys {
-                                    self.send(X11Event::KeyEvent(key)).await?;
+                                    self.send(Input::Key(key)).await?;
                                 }
                             }
                         }
@@ -810,7 +687,7 @@ impl Session {
                             // remote interprets *this* key with the right lock state.
                             self.sync_lock_keys(locks).await?;
                             for key in keys {
-                                self.send(X11Event::KeyEvent(key)).await?;
+                                self.send(Input::Key(key)).await?;
                             }
                         }
                     }
@@ -870,7 +747,7 @@ impl Session {
                         self.input.on_mouse(mouse, &layout, &self.metrics)
                     };
                     for event in events {
-                        self.send(X11Event::PointerEvent(event)).await?;
+                        self.send(Input::Pointer(event)).await?;
                     }
                 }
             }
@@ -899,13 +776,13 @@ impl Session {
             Command::SendPrefix => {
                 if !self.view_only {
                     for key in self.input.literal_prefix() {
-                        self.send(X11Event::KeyEvent(key)).await?;
+                        self.send(Input::Key(key)).await?;
                     }
                 }
             }
             Command::FullRefresh => {
                 self.renderer.mark_all();
-                self.send(X11Event::FullRefresh).await?;
+                self.send(Input::Refresh { incremental: false }).await?;
                 self.awaiting_update = true;
                 self.requested_at = Instant::now();
                 self.set_note("full refresh requested".into());
@@ -1071,15 +948,15 @@ impl Session {
             }
         }
 
-        // With frames arriving unbidden there is no request to time, so ask the server
-        // to bounce a fence back and measure that instead.
+        // With frames arriving unbidden there is no request to time, so ask for a
+        // round trip and measure that instead.
         self.probe_round_trip().await?;
 
         // A pointer that stopped moving mid-rate-limit still has to arrive.
         if !self.view_only
             && let Some(pointer) = self.input.flush_motion()
         {
-            self.send(X11Event::PointerEvent(pointer)).await?;
+            self.send(Input::Pointer(pointer)).await?;
         }
 
         // Normally the request went out the moment the last update finished, so
@@ -1087,43 +964,16 @@ impl Session {
         // gone quiet.
         if !self.awaiting_update {
             self.request_update().await?;
-        } else if !self.continuous_updates && self.requested_at.elapsed() > UPDATE_WATCHDOG {
+        } else if !self.pushed_frames && self.requested_at.elapsed() > UPDATE_WATCHDOG {
             tracing::debug!(
                 "no update for {:?}; asking again",
                 self.requested_at.elapsed()
             );
             self.requested_at = Instant::now();
-            self.send(X11Event::Refresh).await?;
+            self.send(Input::Refresh { incremental: true }).await?;
         }
 
         self.draw()
-    }
-
-    /// Ask the server to push updates for the whole framebuffer.
-    ///
-    /// Re-sent after a resize: the rectangle is remembered by the server, and the
-    /// spec says a second enable replaces the coordinates rather than adding to them.
-    async fn enable_continuous_updates(&mut self) -> Result<()> {
-        let size = self.remote;
-        if self.continuous_updates && self.continuous_rect == Some(size) {
-            return Ok(());
-        }
-        self.send(X11Event::EnableContinuousUpdates {
-            enable: true,
-            rect: crate::rfb::Rect {
-                x: 0,
-                y: 0,
-                width: size.0,
-                height: size.1,
-            },
-        })
-        .await?;
-        tracing::debug!("continuous updates enabled for {}x{}", size.0, size.1);
-        self.continuous_updates = true;
-        self.continuous_rect = Some(size);
-        // Nothing is outstanding any more: frames arrive unbidden from here.
-        self.awaiting_update = false;
-        Ok(())
     }
 
     /// Bring the remote lock keys into line with the local keyboard.
@@ -1153,23 +1003,21 @@ impl Session {
         for (name, keysym) in corrections {
             tracing::debug!("correcting remote {name}");
             for down in [true, false] {
-                self.send(X11Event::KeyEvent(crate::rfb::ClientKeyEvent {
-                    keycode: keysym,
-                    down,
-                }))
-                .await?;
+                self.send(Input::Key(Key { keysym, down })).await?;
             }
         }
         Ok(())
     }
 
-    /// Measure the round trip with a fence, when there are no requests to measure.
+    /// Measure the round trip, when there are no requests to measure.
     ///
-    /// Frames pushed by the server carry no timing information: they answer nothing.
-    /// A fence does -- the server bounces it straight back, which is the only honest
-    /// latency figure available once requests stop.
+    /// Frames that arrive unbidden carry no timing information: they answer nothing.
+    /// A probe does -- the remote sends it straight back -- and is the only honest
+    /// latency figure available once requests stop. A backend that cannot measure one
+    /// leaves the figure unknown, which the status line shows as dashes rather than
+    /// inventing a number.
     async fn probe_round_trip(&mut self) -> Result<()> {
-        if !self.continuous_updates || !self.fence_supported {
+        if !self.pushed_frames || !self.can_probe_latency {
             return Ok(());
         }
         // A probe that never came back was dropped; stop waiting on it.
@@ -1189,12 +1037,7 @@ impl Session {
         }
 
         self.rtt_probe_at = Some(Instant::now());
-        // No block flags: the server can answer immediately, which is the point.
-        self.send(X11Event::Fence {
-            flags: crate::rfb::fence::REQUEST,
-            payload: RTT_PROBE_MARKER.to_vec(),
-        })
-        .await
+        self.send(Input::ProbeLatency).await
     }
 
     /// Ask for the next incremental update, keeping one in flight at a time.
@@ -1204,8 +1047,8 @@ impl Session {
     /// request until something changes, and a server that does not would otherwise
     /// have us both spinning at full tilt.
     async fn request_update(&mut self) -> Result<()> {
-        // The server is pushing frames; asking as well would undo the point of it.
-        if self.continuous_updates {
+        // Frames are being pushed; asking as well would undo the point of it.
+        if self.pushed_frames {
             return Ok(());
         }
         if self.awaiting_update {
@@ -1217,7 +1060,7 @@ impl Session {
         }
         self.awaiting_update = true;
         self.requested_at = Instant::now();
-        self.send(X11Event::Refresh).await
+        self.send(Input::Refresh { incremental: true }).await
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -1352,61 +1195,37 @@ impl Session {
         }
     }
 
-    async fn send(&self, event: X11Event) -> Result<()> {
-        self.client
-            .input(event)
+    async fn send(&self, input: Input) -> Result<()> {
+        self.backend
+            .send(input)
             .await
-            .map_err(|err| anyhow::anyhow!("failed to send input: {err}"))
+            .context("failed to send input")
     }
 
     /// Let go of every key and button we told the server about.
     async fn release_input(&mut self) {
         for key in self.input.release_all() {
-            let _ = self.client.input(X11Event::KeyEvent(key)).await;
+            let _ = self.backend.send(Input::Key(key)).await;
         }
         if let Some(pointer) = self.input.release_buttons() {
-            let _ = self.client.input(X11Event::PointerEvent(pointer)).await;
+            let _ = self.backend.send(Input::Pointer(pointer)).await;
         }
     }
 
     /// Put locally pasted text on the remote clipboard.
     ///
-    /// Over the extension the text goes as UTF-8 and arrives whole. Without it the
-    /// payload is Latin-1 and everything outside it has to be substituted, which is
-    /// why a server that negotiated the extension is worth the extra round trip.
+    /// How it gets there is the backend's business -- which message, whether the text
+    /// goes now or is announced and fetched later. The one thing that belongs here is
+    /// telling the user when the remote cannot carry what they pasted, because a
+    /// substitution they were not warned about is a substitution they will find later
+    /// in whatever they pasted into.
     async fn paste_to_remote(&mut self, text: String) -> Result<()> {
-        if let Some(caps) = self
-            .clipboard_caps
-            .filter(|caps: &ClipboardCaps| caps.takes_text() && caps.takes_provide())
-        {
-            // The size the server's limit applies to is the text as it goes on the
-            // wire: CRLF line endings, and the terminating null that the length counts.
-            let wire_len = text.len() + text.matches('\n').count() + 1;
-            if wire_len as u64 <= u64::from(caps.unsolicited_text()) || !caps.takes_notify() {
-                // Either small enough to push unasked, or a server that offered no way
-                // to announce it, which leaves pushing it the only thing left to try.
-                self.send(X11Event::ClipboardProvide(text)).await?;
-            } else {
-                // Announce it and keep it. The server asks when something over there
-                // pastes, which is the point: a clipboard nobody reads costs one small
-                // message instead of the whole text.
-                self.send(X11Event::ClipboardNotify).await?;
-                self.announced_clipboard = Some(text);
-            }
-            self.set_note("pasted to the remote clipboard".into());
-            return Ok(());
-        }
-
-        // Legacy `ClientCutText` is Latin-1 only. Substitute rather than drop:
-        // deleting characters silently shortens the text and moves everything after
-        // them, where a question mark leaves the shape intact and is visibly a
-        // substitution. noVNC does the same.
-        let dropped = text.chars().filter(|c| (*c as u32) > 0xff).count();
-        let latin1: String = text
-            .chars()
-            .map(|c| if (c as u32) > 0xff { '?' } else { c })
-            .collect();
-        self.send(X11Event::CopyText(latin1)).await?;
+        let dropped = if self.clipboard_lossy {
+            text.chars().filter(|c| (*c as u32) > 0xff).count()
+        } else {
+            0
+        };
+        self.send(Input::Clipboard(text)).await?;
         self.set_note(if dropped > 0 {
             format!("pasted; {dropped} character(s) are not Latin-1 and became '?'")
         } else {
@@ -1451,7 +1270,7 @@ fn format_rtt(rtt: Option<Duration>) -> String {
     }
 }
 
-fn convert(rect: crate::rfb::Rect) -> Rect {
+fn convert(rect: crate::remote::Rect) -> Rect {
     Rect::new(
         u32::from(rect.x),
         u32::from(rect.y),
@@ -1531,7 +1350,7 @@ mod tests {
 
     #[test]
     fn a_rectangle_widens_from_the_protocol_type() {
-        let rect = convert(crate::rfb::Rect {
+        let rect = convert(crate::remote::Rect {
             x: 10,
             y: 20,
             width: 30,

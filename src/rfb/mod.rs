@@ -50,10 +50,7 @@ pub use client::clipboard::Caps as ClipboardCaps;
 pub use client::{VncClient, VncConnector};
 pub use config::{PixelFormat, VncEncoding, VncVersion, hint};
 pub use error::VncError;
-pub use event::{
-    ClientKeyEvent, ClientMouseEvent, Rect, ResizeStatus, Screen, ScreenInfo, ScreenLayout,
-    VncEvent, X11Event, fence,
-};
+pub use event::{VncEvent, X11Event, fence};
 
 /// Largest allocation we will make on a server's word alone.
 ///

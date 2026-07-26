@@ -17,10 +17,8 @@ use tracing::*;
 
 use super::clipboard;
 use super::messages::{ClientMsg, ServerMsg};
-use crate::rfb::{
-    PixelFormat, Rect, ResizeStatus, ScreenInfo, ScreenLayout, VncEncoding, VncError, VncEvent,
-    X11Event, codec,
-};
+use crate::remote::{Rect, ResizeStatus, ScreenInfo, ScreenLayout};
+use crate::rfb::{PixelFormat, VncEncoding, VncError, VncEvent, X11Event, codec};
 
 const CHANNEL_SIZE: usize = 4096;
 
@@ -206,9 +204,9 @@ impl VncInner {
         let msg = match event {
             X11Event::Refresh => ClientMsg::FramebufferUpdateRequest(self.full_rect(), 1),
             X11Event::FullRefresh => ClientMsg::FramebufferUpdateRequest(self.full_rect(), 0),
-            X11Event::KeyEvent(key) => ClientMsg::KeyEvent(key.keycode, key.down),
+            X11Event::KeyEvent(key) => ClientMsg::KeyEvent(key.keysym, key.down),
             X11Event::PointerEvent(mouse) => {
-                ClientMsg::PointerEvent(mouse.position_x, mouse.position_y, mouse.buttons)
+                ClientMsg::PointerEvent(mouse.x, mouse.y, mouse.buttons)
             }
             X11Event::CopyText(text) => ClientMsg::ClientCutText(text),
             X11Event::ClipboardRequest => ClientMsg::ExtendedCutText(clipboard::request()),
@@ -475,7 +473,7 @@ where
         screen: (rect.width, rect.height).into(),
         screens,
         reason: rect.x,
-        status: ResizeStatus::from(rect.y),
+        status: ResizeStatus::from_wire(rect.y),
     })
 }
 

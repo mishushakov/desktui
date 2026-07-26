@@ -141,7 +141,7 @@ fn continuous_updates_are_enabled_and_stop_the_request_traffic() {
         other => panic!("unexpected {other:?}"),
     }
     assert!(
-        term.wait_for(b"continuous updates", Duration::from_secs(10)),
+        term.wait_for(b"pushing frames", Duration::from_secs(10)),
         "the user was not told: {}",
         show(&term.output())
     );

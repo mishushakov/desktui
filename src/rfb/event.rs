@@ -1,49 +1,32 @@
+//! RFB's own event types.
+//!
+//! The geometry these carry belongs to [`crate::remote`]: it is the same on every
+//! wire. What stays here is RFB-shaped -- the wire form of a screen, the events the
+//! decoder produces, and the fence flags.
+
+use crate::remote::{Key, Pointer, Rect, ResizeStatus, Screen, ScreenInfo, ScreenLayout};
 use crate::rfb::PixelFormat;
 use crate::rfb::client::clipboard::Caps as ClipboardCaps;
 
 type ImageData = Vec<u8>;
 
-/// A rect where the image should be updated
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-}
-
-/// Resolution format to resize window
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Screen {
-    pub width: u16,
-    pub height: u16,
-}
-
-impl From<(u16, u16)> for Screen {
-    fn from(tuple: (u16, u16)) -> Self {
-        Self {
-            width: tuple.0,
-            height: tuple.1,
+impl ResizeStatus {
+    /// The status codes an `ExtendedDesktopSize` rectangle carries, which are RFB's
+    /// own numbering and mean nothing on another wire.
+    pub fn from_wire(code: u16) -> Self {
+        match code {
+            0 => ResizeStatus::Success,
+            1 => ResizeStatus::Prohibited,
+            2 => ResizeStatus::OutOfResources,
+            3 => ResizeStatus::InvalidLayout,
+            4 => ResizeStatus::Forwarded,
+            other => ResizeStatus::Unknown(other),
         }
     }
 }
 
-/// One screen in the layout, as carried by `ExtendedDesktopSize` and
-/// `SetDesktopSize`.
-///
-/// The `id` and any unrecognised `flags` bits must be preserved when asking for a
-/// new size: the id is how the server tells a moved screen from a new one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScreenInfo {
-    pub id: u32,
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-    pub flags: u32,
-}
-
 impl ScreenInfo {
+    /// Bytes one screen takes in `ExtendedDesktopSize` and `SetDesktopSize`.
     pub const WIRE_LEN: usize = 16;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -63,66 +46,6 @@ impl ScreenInfo {
             width: u16::from_be_bytes(buf[8..10].try_into().unwrap()),
             height: u16::from_be_bytes(buf[10..12].try_into().unwrap()),
             flags: u32::from_be_bytes(buf[12..16].try_into().unwrap()),
-        }
-    }
-}
-
-/// The desktop layout the server reports, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScreenLayout {
-    pub screen: Screen,
-    pub screens: Vec<ScreenInfo>,
-    /// Why the layout was sent: 0 the server changed it itself, 1 this client
-    /// asked, 2 another client asked. Unknown values are treated as 0.
-    pub reason: u16,
-    /// Only meaningful when `reason` is 1 or 2.
-    pub status: ResizeStatus,
-}
-
-impl ScreenLayout {
-    /// Did this arrive because we asked for it?
-    pub fn is_reply_to_us(&self) -> bool {
-        self.reason == 1
-    }
-}
-
-/// Status codes a server returns for a `SetDesktopSize` request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResizeStatus {
-    Success,
-    Prohibited,
-    OutOfResources,
-    InvalidLayout,
-    /// The server does not control the layout directly -- a hypervisor handing
-    /// the request to a guest, say -- and cannot say yet whether it worked. A
-    /// later `ExtendedDesktopSize` may report success, possibly much later.
-    Forwarded,
-    Unknown(u16),
-}
-
-impl From<u16> for ResizeStatus {
-    fn from(code: u16) -> Self {
-        match code {
-            0 => ResizeStatus::Success,
-            1 => ResizeStatus::Prohibited,
-            2 => ResizeStatus::OutOfResources,
-            3 => ResizeStatus::InvalidLayout,
-            4 => ResizeStatus::Forwarded,
-            other => ResizeStatus::Unknown(other),
-        }
-    }
-}
-
-impl ResizeStatus {
-    /// A short reason, for the status line.
-    pub fn describe(self) -> &'static str {
-        match self {
-            ResizeStatus::Success => "accepted",
-            ResizeStatus::Prohibited => "resize prohibited",
-            ResizeStatus::OutOfResources => "server out of resources",
-            ResizeStatus::InvalidLayout => "layout rejected",
-            ResizeStatus::Forwarded => "request forwarded",
-            ResizeStatus::Unknown(_) => "resize refused",
         }
     }
 }
@@ -223,44 +146,6 @@ pub mod fence {
     pub const REQUEST: u32 = 1 << 31;
 }
 
-/// X11 keyboard event to notify the server.
-///
-/// See [RFC6143, section-7.5.4](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.5.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientKeyEvent {
-    pub keycode: u32,
-    pub down: bool,
-}
-
-impl From<(u32, bool)> for ClientKeyEvent {
-    fn from(tuple: (u32, bool)) -> Self {
-        Self {
-            keycode: tuple.0,
-            down: tuple.1,
-        }
-    }
-}
-
-/// X11 mouse event to notify the server.
-///
-/// See [RFC6143, section-7.5.5](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.5.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientMouseEvent {
-    pub position_x: u16,
-    pub position_y: u16,
-    pub buttons: u8,
-}
-
-impl From<(u16, u16, u8)> for ClientMouseEvent {
-    fn from(tuple: (u16, u16, u8)) -> Self {
-        Self {
-            position_x: tuple.0,
-            position_y: tuple.1,
-            buttons: tuple.2,
-        }
-    }
-}
-
 /// Client-side events, asking the engine to send something to the server.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -274,9 +159,9 @@ pub enum X11Event {
     /// with a layout rectangle.
     FullRefresh,
     /// Key down or up.
-    KeyEvent(ClientKeyEvent),
+    KeyEvent(Key),
     /// Mouse move, button or scroll.
-    PointerEvent(ClientMouseEvent),
+    PointerEvent(Pointer),
     /// Send text to the server's clipboard, the legacy way. Latin-1 only.
     CopyText(String),
     /// Ask the server for the clipboard it announced with
@@ -344,24 +229,11 @@ mod tests {
 
     #[test]
     fn resize_status_codes_match_the_spec() {
-        assert_eq!(ResizeStatus::from(0), ResizeStatus::Success);
-        assert_eq!(ResizeStatus::from(1), ResizeStatus::Prohibited);
-        assert_eq!(ResizeStatus::from(2), ResizeStatus::OutOfResources);
-        assert_eq!(ResizeStatus::from(3), ResizeStatus::InvalidLayout);
-        assert_eq!(ResizeStatus::from(4), ResizeStatus::Forwarded);
-        assert_eq!(ResizeStatus::from(99), ResizeStatus::Unknown(99));
-    }
-
-    #[test]
-    fn only_reason_one_is_a_reply_to_this_client() {
-        let layout = |reason| ScreenLayout {
-            screen: (100, 100).into(),
-            screens: vec![],
-            reason,
-            status: ResizeStatus::Success,
-        };
-        assert!(layout(1).is_reply_to_us());
-        assert!(!layout(0).is_reply_to_us());
-        assert!(!layout(2).is_reply_to_us());
+        assert_eq!(ResizeStatus::from_wire(0), ResizeStatus::Success);
+        assert_eq!(ResizeStatus::from_wire(1), ResizeStatus::Prohibited);
+        assert_eq!(ResizeStatus::from_wire(2), ResizeStatus::OutOfResources);
+        assert_eq!(ResizeStatus::from_wire(3), ResizeStatus::InvalidLayout);
+        assert_eq!(ResizeStatus::from_wire(4), ResizeStatus::Forwarded);
+        assert_eq!(ResizeStatus::from_wire(99), ResizeStatus::Unknown(99));
     }
 }

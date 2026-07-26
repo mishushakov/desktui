@@ -96,6 +96,17 @@ impl Caps {
     pub fn unsolicited_text(&self) -> u32 {
         self.text_size
     }
+
+    /// Caps as a server that takes everything would report them, with a ceiling on
+    /// unsolicited text. Lets the backend's paste decisions be tested without a
+    /// handshake to build them from.
+    #[cfg(test)]
+    pub fn taking_text_up_to(text_size: u32) -> Self {
+        Self {
+            flags: flag::TEXT | flag::PROVIDE | flag::NOTIFY,
+            text_size,
+        }
+    }
 }
 
 /// A decoded extended clipboard message.
