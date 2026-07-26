@@ -8,6 +8,10 @@ https://github.com/user-attachments/assets/f897d7f1-bd6d-41dc-af56-a9d50dfba15e
 
 No server handy? `make desktop` starts one in Docker and `make run` connects to it.
 
+> [!NOTE]
+> This was made over a weekend using Claude Code and Opus 5 with xhigh, to test
+> frontier model capabilities.
+
 ## Features
 
 **Any VNC server, addressed the way you already do it.** `desktui host`,
@@ -254,7 +258,3 @@ VNC_PASSWORD=… desktui localhost::5901
 
 `--log-file` is the only way to get diagnostics; anything written to stdout would
 land in the middle of a graphics escape sequence.
-
-> [!NOTE]
-> This was made over a weekend using Claude Code and Opus 5 with xhigh, to test
-> frontier model capabilities.
