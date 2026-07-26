@@ -7,6 +7,9 @@
 //!
 //! The other half of it is *when* the request goes out: at once for a lone resize,
 //! coalesced for a drag, and without waiting for the server to say anything first.
+//!
+//! And what the screen looks like while all that happens: a resize that redraws
+//! everything is expected, a resize that shows the screen mid-redraw is not.
 
 mod common;
 
@@ -92,6 +95,30 @@ fn asks_for_the_new_size_when_the_terminal_is_resized() {
         count <= 3,
         "expected the resize to be debounced, saw {count} requests"
     );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn the_wipe_a_resize_needs_travels_with_the_frame_that_redraws() {
+    // A layout change erases the screen and drops every placement, because text and
+    // placements both stay on the cells they were written to. Written on its own that
+    // erase is a blank screen that lasts until the next frame composes -- a flicker per
+    // resize, and a resize settles through several paths. Inside the frame that fills
+    // the screen back in, the terminal shows one layout or the other and never neither.
+    let (_server, mut term) = start(Resize::Accept, (1024, 768));
+    assert_drew(&term, Duration::from_secs(10));
+
+    // Everything from here on is the resize: the erase in the setup sequence, which is
+    // the alternate screen being entered and has nothing to redraw, is behind us.
+    let before = term.output().len();
+    term.resize(100, 25, 800, 425);
+    // The new size in the status line, not a cursor move to the new last row: the rows
+    // tiles are placed on are cursor moves too, and one of them is the row that used to
+    // be a quarter of the way down.
+    assert_reports_size(&term, "800x408", Duration::from_secs(10));
+    assert_the_wipe_rides_with_the_redraw(&term, before);
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));

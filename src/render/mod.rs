@@ -417,7 +417,16 @@ impl Renderer {
     ///
     /// Every tile is retransmitted immediately after this, so dropping all of them
     /// costs only the bytes.
+    ///
+    /// A layout equal to the one in force is left alone. One resize settles through
+    /// several paths -- the debounce, the request that follows it, the server's reply,
+    /// the re-check after that -- and all but the first arrive with the geometry they
+    /// are asking for already adopted. Wiping the screen to redraw the same pixels is
+    /// the flicker, so the ones with nothing to say are not allowed to.
     pub fn relayout(&mut self, layout: Layout) -> Vec<u8> {
+        if layout == self.layout {
+            return Vec::new();
+        }
         let grid = TileGrid::new(&layout);
         let mut cleanup = Vec::new();
         // Text first, then images, so this does not depend on whether a given
@@ -1124,6 +1133,27 @@ mod tests {
         );
         assert!(r.has_work(), "everything has to be redrawn afterwards");
         assert_eq!(r.dirty_tiles(), r.tile_count());
+    }
+
+    #[test]
+    fn a_relayout_to_the_layout_already_in_force_does_nothing() {
+        // One resize settles through several paths, and all but the first are handed the
+        // geometry they are asking for. Each of them used to wipe the screen and mark
+        // every tile again, so a single resize flickered two or three times over.
+        let m = ghostty();
+        let (w, h) = m.image_area();
+        let same = Layout::compute(&m, ScaleMode::Native, w, h, (0, 0));
+        let mut r = Renderer::new(same, true, Transfer::Direct);
+        let fb = Framebuffer::new(w, h);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        r.commit();
+
+        assert!(
+            r.relayout(same).is_empty(),
+            "an unchanged layout must not wipe the screen"
+        );
+        assert!(!r.has_work(), "nor redraw a screen that already shows it");
     }
 
     #[test]

@@ -100,6 +100,11 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     let ink = state.theme.palette();
     let mut show_menu = false;
     let mut clear_menu = false;
+    // The wipe a relayout asks for, waiting for the frame that fills the screen back
+    // in. Written on its own it is a blank screen that lasts until the next frame
+    // composes; carried into that frame's synchronised block, the old picture stands
+    // until the new one replaces it.
+    let mut pending_cleanup: Vec<u8> = Vec::new();
     let mut last_stats = crate::render::FrameStats::default();
     let mut dropped: u64 = 0;
 
@@ -176,8 +181,11 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     pattern.paint_all(&mut fb);
                     let layout = Layout::compute(&metrics, args.scale, area_w, area_h, (0, 0));
                     let cleanup = renderer.relayout(layout);
-                    if !cleanup.is_empty() {
-                        let _ = writer.submit_blocking(cleanup);
+                    // Held for the next frame rather than written now. The bytes are the
+                    // same full-screen wipe every time, so a second resize before that
+                    // frame goes out has nothing to add.
+                    if !cleanup.is_empty() && pending_cleanup.is_empty() {
+                        pending_cleanup = cleanup;
                     }
                 }
                 _ => {}
@@ -199,7 +207,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         for r in &damage {
             renderer.mark(*r);
         }
-        if !renderer.has_work() && !show_menu && !clear_menu {
+        if !renderer.has_work() && pending_cleanup.is_empty() && !show_menu && !clear_menu {
             continue;
         }
 
@@ -207,6 +215,11 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         if caps.sync_output {
             kitty::begin_sync(&mut buf);
         }
+        // A relayout's wipe, if one is owed: erase and delete inside the same
+        // synchronised block that puts the screen back, so the terminal only ever shows
+        // one of the two layouts and never the gap between them.
+        let cleanup = std::mem::take(&mut pending_cleanup);
+        buf.extend_from_slice(&cleanup);
         if clear_menu {
             menu.clear(&mut buf, &metrics);
             clear_menu = false;
@@ -255,6 +268,12 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             Err(Busy::Full(buf)) => {
                 dropped += 1;
                 writer.recycle(buf);
+                // The wipe went out with the frame or not at all: dropping it here would
+                // leave the old layout's status line and tiles on screen for good, since
+                // the damage that would have painted over them was never composed.
+                if !cleanup.is_empty() {
+                    pending_cleanup = cleanup;
+                }
             }
             Err(Busy::Closed) => break,
         }

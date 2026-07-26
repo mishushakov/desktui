@@ -250,6 +250,11 @@ struct Session<B: Backend> {
     /// The menu was dismissed and its cells still have to be blanked. Drawing
     /// the image over them does not do it: the image sits below the text.
     clear_menu: bool,
+    /// The wipe a relayout asks for, waiting for the frame that fills the screen
+    /// back in. Written on its own it is a blank screen that lasts until the next
+    /// frame composes, which is what a resize looked like; carried into that frame's
+    /// synchronised block, the old picture stands until the new one replaces it.
+    pending_cleanup: Vec<u8>,
     show_stats: bool,
     /// The notification popup in the top-right corner, and the note it is showing.
     toast: Toast,
@@ -310,6 +315,7 @@ impl<B: Backend> Session<B> {
             menu: Menu::new(args.prefix_char()),
             show_menu: false,
             clear_menu: false,
+            pending_cleanup: Vec::new(),
             show_stats: false,
             toast: Toast::default(),
             fps: FpsMeter::new(),
@@ -1070,7 +1076,12 @@ impl<B: Backend> Session<B> {
             self.renderer.mark_all();
         }
         let has_work = self.renderer.has_work();
-        if !has_work && !self.toast.is_live() && !self.show_menu && !self.clear_menu {
+        if !has_work
+            && self.pending_cleanup.is_empty()
+            && !self.toast.is_live()
+            && !self.show_menu
+            && !self.clear_menu
+        {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1082,6 +1093,11 @@ impl<B: Backend> Session<B> {
         if self.caps.sync_output {
             kitty::begin_sync(&mut buf);
         }
+        // A relayout's wipe, if one is owed: erase and delete inside the same
+        // synchronised block that puts the screen back, so the terminal only ever shows
+        // one of the two layouts and never the gap between them.
+        let cleanup = std::mem::take(&mut self.pending_cleanup);
+        buf.extend_from_slice(&cleanup);
         // Text first, then images, exactly as a relayout does it: erasing cells may
         // take the placements under them with it, so the tiles have to go out after.
         if self.clear_menu {
@@ -1114,6 +1130,12 @@ impl<B: Backend> Session<B> {
             Err(Busy::Full(buf)) => {
                 self.dropped += 1;
                 self.writer.recycle(buf);
+                // The wipe went out with the frame or not at all: dropping it here would
+                // leave the old layout's chrome and tiles on screen for good, since the
+                // damage that would have painted over them was never composed.
+                if !cleanup.is_empty() {
+                    self.pending_cleanup = cleanup;
+                }
             }
             Err(Busy::Closed) => anyhow::bail!("the terminal stopped accepting output"),
         }
@@ -1190,8 +1212,11 @@ impl<B: Backend> Session<B> {
             self.pan,
         );
         let cleanup = self.renderer.relayout(layout);
-        if !cleanup.is_empty() {
-            let _ = self.writer.submit_blocking(cleanup);
+        // Held for the next frame rather than written now. The bytes are the same
+        // full-screen wipe every time, so a second relayout before that frame goes out
+        // has nothing to add.
+        if !cleanup.is_empty() && self.pending_cleanup.is_empty() {
+            self.pending_cleanup = cleanup;
         }
     }
 

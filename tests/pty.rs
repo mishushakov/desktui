@@ -406,6 +406,38 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
 }
 
 #[test]
+fn the_wipe_a_resize_needs_travels_with_the_frame_that_redraws() {
+    // The pattern loop erases and redraws exactly as a session does, so it has the same
+    // way to get it wrong: writing that erase on its own is a blank screen that lasts
+    // until the next frame composes. Its session counterpart is
+    // `resize::the_wipe_a_resize_needs_travels_with_the_frame_that_redraws`.
+    let mut term = FakeTerm::spawn(80, 24, 640, 408, &["--test-pattern", "--fps", "20"]);
+    term.answer_probe(GHOSTTY_REPLIES);
+    // The image area in the status line, 8x17 cells over 23 usable rows. Not a cursor
+    // move to the last row: tiles are placed with cursor moves too, and one of them
+    // lands on the row that used to be the last one of a smaller window.
+    assert!(
+        term.wait_for(b"640x391", Duration::from_secs(10)),
+        "the pattern never reported its size: {}",
+        show(&term.output())
+    );
+
+    // Everything from here on is the resize: the erase in the setup sequence, which is
+    // the alternate screen being entered and has nothing to redraw, is behind us.
+    let before = term.output().len();
+    term.resize(120, 36, 960, 612);
+    assert!(
+        term.wait_for(b"960x595", Duration::from_secs(10)),
+        "the new size never reached the status line: {}",
+        show(&term.output())
+    );
+    assert_the_wipe_rides_with_the_redraw(&term, before);
+
+    term.send(b"q");
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
 fn focus_reporting_is_enabled_so_held_keys_can_be_released() {
     // Without mode 1004 the terminal never reports focus loss, so the code that
     // releases everything held on the remote is unreachable and a modifier held while
