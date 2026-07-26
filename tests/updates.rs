@@ -201,6 +201,77 @@ fn requests_the_encodings_it_can_actually_decode() {
 }
 
 #[test]
+fn the_statistics_say_what_the_other_end_is_doing() {
+    // Everything else in the bar is this side. A session that crawls because the server is
+    // re-encoding a whole screen looks exactly like one that crawls because we are, and
+    // that question has cost a working day before now.
+    //
+    // The split-update server delivers one picture per stall, so its rate is known ahead
+    // of time: a shade under five a second, where the client is free to draw sixty.
+    let (_server, mut term) = start_with(
+        Extensions {
+            split_updates: true,
+            ..Default::default()
+        },
+        (1024, 768),
+        &[],
+    );
+    assert_drew(&term, Duration::from_secs(10));
+
+    // Ctrl+A then c turns the figures on.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"c");
+    assert!(
+        term.wait_for(b"up/s", Duration::from_secs(10)),
+        "the bar never reported an update rate: {}",
+        tail(&term.output())
+    );
+    // Long enough for the rolling window to hold several stalls.
+    std::thread::sleep(SPLIT_STALL * 6);
+
+    let out = term.output();
+    let (rate, delivery) = last_delivery(&out).expect("no delivery figures in the bar");
+    assert!(
+        (2.0..8.0).contains(&rate),
+        "expected about five updates a second from a {SPLIT_STALL:?} stall, bar said \
+         {rate}: {}",
+        tail(&out)
+    );
+    // Measured from the first rectangle *arriving*, where the server's stall starts before
+    // it writes one, so this reads a few milliseconds under the stall rather than over it.
+    assert!(
+        delivery + 20 >= SPLIT_STALL.as_millis() as u32,
+        "an update split across a {SPLIT_STALL:?} stall cannot have been delivered in \
+         {delivery}ms: {}",
+        tail(&out)
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+/// The update rate and per-update delivery time from the last time the bar was drawn.
+fn last_delivery(out: &[u8]) -> Option<(f64, u32)> {
+    let text = String::from_utf8_lossy(out);
+    let at = text.rfind("up/s")?;
+    let before = &text[..at];
+    // "  4.9 up/s   215ms /up" -- the rate runs back to the space before it, and the
+    // delivery is the next figure along.
+    let rate: f64 = before.rsplit(' ').find(|s| !s.is_empty())?.parse().ok()?;
+    let after = &text[at + "up/s".len()..];
+    let ms: u32 = after
+        .split("ms")
+        .next()?
+        .trim()
+        .rsplit(' ')
+        .find(|s| !s.is_empty())?
+        .parse()
+        .ok()?;
+    Some((rate, ms))
+}
+
+#[test]
 fn no_push_never_offers_the_extension_and_keeps_asking() {
     // Pushed frames are cheaper by a round trip and unbounded: the server decides how
     // hard both ends work, and every update has to be decoded whether or not there is

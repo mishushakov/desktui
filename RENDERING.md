@@ -121,9 +121,9 @@ layout against another to guess which tiles survived -- those are three approxim
 this question. The generation is a dirty bit in disguise, but a dirty bit that composes
 with everything else that can make a tile wrong.
 
-Two cases fall out of it that a layout comparison gets wrong: a scaled resize where a
-given tile's source and size happen to survive is kept for free, and a frame that never
-reached the terminal cannot leave a tile counted as held.
+What a layout comparison cannot do, and this can: a frame that never reached the terminal
+cannot leave a tile counted as held, because being held is a fact about a tile rather than
+about how far the grid was filled.
 
 ### Frame builder
 
@@ -195,11 +195,25 @@ per motion event, where a placement is forty bytes.
 ## What to measure
 
 Tiles sent, moved and dropped per frame; bytes and system calls per frame; resample, pack
-and emit in milliseconds -- and, the half that is missing, what the *other* end is doing.
-Without it a slow session looks like a rendering problem whichever end is slow, and the
-first thing to reach for is `--quality`, which decides how hard the server works and is
-invisible unless you read `--help`. See
-[Server delivery in the statistics](#1-server-delivery-in-the-statistics).
+and emit in milliseconds. And the other half, which is the half that decides whether any of
+the rest is worth touching: what the *server* is doing.
+
+`Ctrl+A c` reports both. Ours is the frame rate, tiles and bytes; theirs is three numbers
+that fall out of the update boundary `mid_update` already tracks -- **updates per second**,
+which with frames being pushed *is* the server's frame rate; **delivery time**, from an
+update's first rectangle to its `FrameEnd`; and **picture per update** in megapixels, which
+turns the two into a rate and separates a big screen from a slow server. Six updates
+arriving while we could draw sixty is not a rendering problem, and no amount of work on
+this side will move it -- the thing to reach for is `--quality`, which decides how hard the
+server works and is otherwise invisible unless you read `--help`.
+
+Megapixels rather than wire bytes because the byte count the server actually sent is behind
+the protocol seam; getting at it wants a counting reader in the vendored client. And encode
+time is not separable from wire time yet: `rtt` is measured from the request to `FrameEnd`,
+so it contains the server's encoding. Splitting them wants a fence sent behind the update
+request, whose reply says the server reached that point in its stream -- worth doing
+alongside [Fence as flow control](#2-fence-as-flow-control), which has to solve the same
+probe-versus-flow-control problem anyway.
 
 ## Where this stands
 
@@ -218,49 +232,21 @@ Built:
   (`src/term/shm.rs`)
 - resampling only the region a frame is about to send, grown by the filter's reach
   (`src/render/scale.rs`)
+- the server's own delivery in the statistics -- updates per second, delivery time,
+  megapixels per update -- next to ours (`src/session.rs`)
 
 ## Not built yet
 
-Five things, ordered by what each is worth rather than by how tidy it would be. What each
+Four things, ordered by what each is worth rather than by how tidy it would be. What each
 one *is* is above; what follows is what it costs to build and the parts that are not
 obvious from the design.
 
-Two of them are felt immediately -- the cursor, and Fence -- and two are structural, worth
-building for the bugs they make impossible rather than for anything measurable. The one
-ordering constraint is that the cursor is easier before the plane, not after: it deletes two
-of the marking paths the plane would otherwise have to convert.
+The first two are felt immediately; the last two are structural, worth building for the bugs
+they make impossible rather than for anything measurable. The one ordering constraint is
+that the cursor is easier before the plane, not after: it deletes two of the marking paths
+the plane would otherwise have to convert.
 
-### 1. Server delivery in the statistics
-
-Nothing on screen says which end is slow. The bar reports our frame rate, tiles, bytes and
-round trip -- all of it this side -- so a session that crawls because the server is
-re-encoding a whole screen losslessly looks exactly like a session that crawls because we
-are. That question cost most of a working session once already, and the answer was
-`--quality`.
-
-No protocol work is needed, because the update boundary is already known: `mid_update` in
-`src/session.rs` opens on the first rectangle of an update and closes at `FrameEnd`. Three
-numbers fall out of it.
-
-- **Updates per second**, counted at `FrameEnd`. With frames being pushed this *is* the
-  server's frame rate, and next to our own it says immediately who is behind: six updates
-  arriving while we could draw sixty is not a rendering problem.
-- **Delivery time**, from an update's first rectangle to its `FrameEnd`. How long the server
-  took to get one picture out, encoding and wire together.
-- **Bytes per update**, which turns the two above into a rate and separates "a big screen"
-  from "a slow server".
-
-The one thing genuinely not separable without more work is encode time from wire time. The
-round trip already conflates them -- in a request-paced session `rtt` is measured from the
-request to `FrameEnd`, so it contains the server's encoding. Splitting them wants a fence
-sent behind the update request, whose reply says the server reached that point in its
-stream; the gap to `FrameEnd` is then encoding and transmission alone. Worth doing after
-[Fence as flow control](#3-fence-as-flow-control), which has to solve the same
-probe-versus-flow-control problem anyway.
-
-Smallest of the five, and the one that tells you whether the others are worth building.
-
-### 2. The cursor as a placement
+### 1. The cursor as a placement
 
 Replaces `blend_cursor`, `cursor_rect` and the cursor's dirty-marking in
 `src/render/mod.rs` with one image whose id is above every tile's, placed with sub-cell
@@ -289,7 +275,7 @@ resize changes what a given screen position maps to, but nothing re-derives it -
 a resize the pointer is drawn at a stale spot until it next moves. A placement is
 re-placed from the new map as a matter of course.
 
-### 3. Fence as flow control
+### 2. Fence as flow control
 
 `--no-push` declines continuous updates wholesale, at a round trip per frame. Fence exists
 to bound in-flight work without giving that up: the server answers one when it reaches that
@@ -312,7 +298,7 @@ queue.
 `--no-push` stays regardless -- it is the fallback for a server without Fence, and the
 thing to reach for when the question is "is the server the problem?".
 
-### 4. The plane
+### 3. The plane
 
 Replaces three mechanisms with the one [Plane](#plane) describes: `dirty: Vec<bool>`,
 `placed: (u16, u16)` and `Layout::maps_alike`, all in `src/render/mod.rs`.
@@ -356,7 +342,7 @@ quickly: `growing_the_window_sends_the_new_tiles_and_not_the_rest`,
 mistake. Add one for the invariant itself: a frame composed and dropped, then a resize,
 must not leave a tile counted as held.
 
-### 5. The chrome as one diffed plane
+### 4. The chrome as one diffed plane
 
 Replaces `Toast::drawn`/`stale`/`moved`, `Session::clear_menu`, `status::clear` and
 `Menu::clear` with a private cell buffer, double buffered and diffed per frame.

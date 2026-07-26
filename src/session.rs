@@ -285,6 +285,20 @@ struct Session<B: Backend> {
     /// over. Drawing now would put half of one picture on the screen and half of
     /// another -- which on a page being scrolled is half of it at each scroll position.
     mid_update: bool,
+    /// When the update being received started arriving, and how much of the picture it
+    /// has carried so far.
+    ///
+    /// The other end's half of the statistics. Everything else in the bar is this side --
+    /// our frame rate, our tiles, our bytes -- so a session that crawls because the
+    /// server is re-encoding a whole screen looks exactly like one that crawls because we
+    /// are. These say which: an update rate well under the frame rate is a server that
+    /// cannot keep up, whatever this end manages.
+    update_started: Option<Instant>,
+    update_pixels: u64,
+    /// Updates that carried picture, as a rate, and what the last one cost.
+    updates: FpsMeter,
+    delivery: Option<Duration>,
+    last_update_pixels: u64,
     last_stats: FrameStats,
     dropped: u64,
     pending_metrics: Option<Instant>,
@@ -346,6 +360,11 @@ impl<B: Backend> Session<B> {
             fps: FpsMeter::new(),
             frame_time: Duration::from_micros(1_000_000 / u64::from(args.fps)),
             mid_update: false,
+            update_started: None,
+            update_pixels: 0,
+            updates: FpsMeter::new(),
+            delivery: None,
+            last_update_pixels: 0,
             last_stats: FrameStats::default(),
             dropped: 0,
             pending_metrics: None,
@@ -382,11 +401,23 @@ impl<B: Backend> Session<B> {
     async fn on_update(&mut self, update: Update) -> Result<()> {
         // Anything that changes the picture opens an update, and `FrameEnd` closes it. The
         // rectangles between the two are one picture and belong on the screen together.
+        //
+        // An update of nothing but pseudo-rectangles -- a cursor shape, a layout, the lock
+        // keys -- is not a picture and does not open one, which is also what keeps it out
+        // of the delivery figures.
         if matches!(
             update,
             Update::Bgra(..) | Update::Jpeg(..) | Update::Copy { .. }
         ) {
             self.mid_update = true;
+            self.update_started.get_or_insert_with(Instant::now);
+            self.update_pixels += match &update {
+                Update::Bgra(rect, _) | Update::Jpeg(rect, _) => {
+                    u64::from(rect.width) * u64::from(rect.height)
+                }
+                Update::Copy { dst, .. } => u64::from(dst.width) * u64::from(dst.height),
+                _ => 0,
+            };
         }
         match update {
             Update::Bgra(rect, data) => {
@@ -444,6 +475,14 @@ impl<B: Backend> Session<B> {
                 // pace this, not to choose the moment: a frame is owed only if one has not
                 // gone out inside the last frame interval.
                 self.mid_update = false;
+                // What the other end just took to deliver one picture, before drawing it:
+                // the delivery is the server's, the frame that follows is ours, and telling
+                // them apart is the whole point of measuring here.
+                if let Some(at) = self.update_started.take() {
+                    self.delivery = Some(at.elapsed());
+                    self.last_update_pixels = std::mem::take(&mut self.update_pixels);
+                    self.updates.tick();
+                }
                 if self.fps.since_last() >= self.frame_time {
                     self.draw()?;
                 }
@@ -1227,12 +1266,18 @@ impl<B: Backend> Session<B> {
         // Lower case, as the menu writes its shortcuts: the two should read alike.
         let key = format!("ctrl+{} p", self.input.prefix());
         let (figures, label) = if self.show_stats {
+            // Ours, then theirs. An update rate far below the frame rate is a server that
+            // cannot keep up, and no amount of work on this side will move it.
             (
                 format!(
-                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>6} rtt  {} dropped  ",
+                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>5.1} up/s  {:>6} /up  \
+                     {:>5.2} MP  {:>6} rtt  {} dropped  ",
                     self.fps.fps(),
                     self.last_stats.tiles,
                     human_bytes(self.last_stats.bytes),
+                    self.updates.fps(),
+                    format_rtt(self.delivery),
+                    self.last_update_pixels as f64 / 1e6,
                     format_rtt(self.rtt),
                     self.dropped,
                 ),

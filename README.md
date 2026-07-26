@@ -130,7 +130,7 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | `m` | cycle the scaling mode: native / fit / integer / 1:1 |
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
-| `c` | toggle statistics (fps, tiles, bytes per frame, server RTT) |
+| `c` | toggle statistics: ours (fps, tiles, bytes per frame) and the server's (updates per second, delivery time, megapixels per update), plus RTT and dropped frames |
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
 Clipboard works in both directions: paste into the terminal and it reaches the
