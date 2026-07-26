@@ -171,29 +171,29 @@ fn clicking_a_scaling_option_selects_that_one() {
         tail(&term.output())
     );
 
-    // Where fit is. Twenty entries and their padding make a box 53 by 22, centred
-    // across 200 columns and the 49 rows above the status line, so its top left is
-    // cell 73,13. The options are the fifteenth entry, three columns in past the
-    // padding, and fit is the second of them -- ten cells along, native taking eight
-    // and the gap two. Cell 89,29, which in 8x17 cells is pixel 716,501, and mouse
-    // reports are one-based.
+    // Where fit is. Twenty-three entries and their padding make a box 53 by 25,
+    // centred across 200 columns and the 49 rows above the status line, so its top
+    // left is cell 73,12. The scaling options are the sixteenth entry, three columns
+    // in past the padding, and fit is the second of them -- ten cells along, native
+    // taking eight and the gap two. Cell 89,28, which in 8x17 cells is pixel 716,484,
+    // and mouse reports are one-based.
     //
     // Checked rather than assumed, because a click aimed at a row that has moved
     // would fail somewhere far less obvious than here.
     let out = term.output();
-    let at = find(&out, b"\x1b[30;74H").unwrap_or_else(|| {
+    let at = find(&out, b"\x1b[29;74H").unwrap_or_else(|| {
         panic!(
-            "the menu does not reach cell 74,30 any more: {}",
+            "the menu does not reach cell 74,29 any more: {}",
             tail(&out)
         )
     });
     assert!(
         contains(&out[at..(at + 160).min(out.len())], b"Native"),
-        "cell 74,30 is no longer the row of scaling options, so the click would miss"
+        "cell 74,29 is no longer the row of scaling options, so the click would miss"
     );
     let mark = out.len();
-    term.send(b"\x1b[<0;717;502M");
-    term.send(b"\x1b[<0;717;502m");
+    term.send(b"\x1b[<0;717;485M");
+    term.send(b"\x1b[<0;717;485m");
 
     assert!(
         term.wait_for(b"scaling: scaled", Duration::from_secs(10)),

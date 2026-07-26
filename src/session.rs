@@ -26,8 +26,9 @@ use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
-use crate::ui::menu::{Hit, Menu};
+use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
+use crate::ui::theme::Theme;
 
 /// How long to wait for the TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -320,6 +321,9 @@ struct Session {
 
     view_only: bool,
     no_clipboard: bool,
+    /// Which palette the chrome wears. Dark to start, the bar having been that colour
+    /// before there was a choice.
+    theme: Theme,
     /// The command menu, and where the pointer is on it.
     menu: Menu,
     show_menu: bool,
@@ -381,6 +385,7 @@ impl Session {
             remote_num_lock: None,
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
+            theme: Theme::Dark,
             menu: Menu::new(args.prefix_char()),
             show_menu: false,
             clear_menu: false,
@@ -905,6 +910,19 @@ impl Session {
                 );
             }
             Command::ToggleStats => self.show_stats = !self.show_stats,
+            Command::Theme(theme) => {
+                self.theme = theme;
+                // The menu is redrawn in the new palette on the next tick; the cells it
+                // has already coloured are overwritten there rather than erased.
+                self.set_note(format!(
+                    "theme: {}",
+                    if theme == Theme::Dark {
+                        "dark"
+                    } else {
+                        "light"
+                    }
+                ));
+            }
             Command::Menu => {
                 if self.show_menu {
                     self.dismiss_menu();
@@ -954,6 +972,14 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+
+    /// What the menu should mark as being in force.
+    fn menu_state(&self) -> menu::State {
+        menu::State {
+            mode: self.mode,
+            theme: self.theme,
+        }
     }
 
     /// Hide the menu and arrange for the cells it used to be blanked.
@@ -1179,7 +1205,7 @@ impl Session {
         }
         self.draw_status(&mut buf);
         if self.show_menu {
-            self.menu.draw(&mut buf, &self.metrics, self.mode);
+            self.menu.draw(&mut buf, &self.metrics, self.menu_state());
         }
         if self.caps.sync_output {
             kitty::end_sync(&mut buf);
@@ -1255,21 +1281,19 @@ impl Session {
         // the word is what it means: the next key is a command, not a keystroke. In the
         // colour the menu picks things out with, so the light and the box it is about
         // read as the same idea.
-        let mut left = vec![status::bright(&name), status::text(&rest)];
+        let ink = self.theme.palette();
+        let mut left = vec![ink.bright(&name), ink.text(&rest)];
         if self.input.is_armed() {
-            left.push(status::accent("  ● CMD"));
+            left.push(ink.accent("  ● CMD"));
         }
-        left.push(status::text(&note));
+        left.push(ink.text(&note));
 
         status::draw(
             buf,
             &self.metrics,
+            ink,
             left,
-            vec![
-                status::text(&figures),
-                status::bright(&key),
-                status::text(&label),
-            ],
+            vec![ink.text(&figures), ink.bright(&key), ink.text(&label)],
         );
     }
 

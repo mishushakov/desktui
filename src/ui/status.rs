@@ -2,53 +2,32 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use super::ACCENT;
 use super::paint::write_cells;
+use super::theme::{Palette, colour};
 use crate::term::Metrics;
 
-/// The bar's own colours, rather than the terminal's.
+/// Draw the status line on the bottom row, in `ink`.
 ///
-/// It can have them at all because this is the row below the image area: no graphics
-/// placement is ever put on it, so a colour set on its cells is the colour that
-/// shows. The menu has no such luxury, which is why its backdrop is an image.
-///
-/// Reverse video used to do the work, and followed whatever the terminal was set to
-/// -- a light band under a light theme, a dark one under a dark theme, the same
-/// escape making two different pieces of chrome. A pair of its own is the same bar
-/// wherever it runs.
-const BAR: Color = Color::Rgb(10, 10, 10);
-
-/// The bar reads as one grey line, with two things lifted out of it: what this is
-/// connected to, and the key that opens the menu. Everything else is a figure you
-/// look at when you are looking for it.
-const TEXT: Color = Color::Rgb(0x80, 0x80, 0x80);
-const BRIGHT: Color = Color::Rgb(0xee, 0xee, 0xee);
-
-/// Ordinary status text.
-pub fn text(text: &str) -> Span<'_> {
-    Span::styled(text, Style::new().fg(TEXT))
-}
-
-/// Text worth reading at a glance.
-pub fn bright(text: &str) -> Span<'_> {
-    Span::styled(text, Style::new().fg(BRIGHT))
-}
-
-/// A mark in the menu's own colour. Used once: the light that comes on while the
-/// prefix waits for the key that follows it.
-pub fn accent(text: &str) -> Span<'_> {
-    Span::styled(text, Style::new().fg(ACCENT))
-}
-
-/// Draw the status line on the bottom row.
+/// The bar has colours of its own rather than the terminal's reverse video, which
+/// followed whatever the theme was set to -- a light band under a light one, a dark
+/// band under a dark one, the same escape making two different pieces of chrome. It
+/// can have them because this is the row below the image area: no graphics placement
+/// is ever put on it, so a colour set on its cells is the colour that shows. The menu
+/// has no such luxury, which is why its backdrop is an image.
 ///
 /// `left` is truncated before `right` is dropped: the right-hand side carries the
 /// frame statistics, which are the first thing to go when space runs out.
-pub fn draw(out: &mut Vec<u8>, metrics: &Metrics, left: Vec<Span>, right: Vec<Span>) {
+pub fn draw(
+    out: &mut Vec<u8>,
+    metrics: &Metrics,
+    ink: &Palette,
+    left: Vec<Span>,
+    right: Vec<Span>,
+) {
     if metrics.cols == 0 || metrics.rows == 0 {
         return;
     }
@@ -63,7 +42,7 @@ pub fn draw(out: &mut Vec<u8>, metrics: &Metrics, left: Vec<Span>, right: Vec<Sp
     // whether or not the text reaches the end. Every cell is written every time,
     // which is what a `CSI K` used to be there for.
     let mut buf = Buffer::empty(area);
-    buf.set_style(area, Style::new().bg(BAR).fg(TEXT));
+    buf.set_style(area, Style::new().bg(colour(ink.bar)).fg(colour(ink.text)));
 
     let left = Line::from(left);
     let right = Line::from(right).right_aligned();
@@ -85,6 +64,13 @@ pub fn draw(out: &mut Vec<u8>, metrics: &Metrics, left: Vec<Span>, right: Vec<Sp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::Theme;
+    use crate::ui::theme::probe::{bg, fg};
+
+    /// The palette the tests draw in, unless they are about the palettes themselves.
+    fn ink() -> &'static Palette {
+        Theme::Dark.palette()
+    }
 
     fn metrics(cols: u16, rows: u16) -> Metrics {
         Metrics {
@@ -99,7 +85,8 @@ mod tests {
 
     /// Draw a plain two-sided bar, for the tests that reason about layout not ink.
     fn draw_str(out: &mut Vec<u8>, m: &Metrics, left: &str, right: &str) {
-        draw(out, m, vec![text(left)], vec![text(right)]);
+        let ink = ink();
+        draw(out, m, ink, vec![ink.text(left)], vec![ink.text(right)]);
     }
 
     /// The row as it lands on screen, with the escapes taken out.
@@ -111,7 +98,7 @@ mod tests {
             "the line must start at column one of row {row}: {text:?}"
         );
         assert!(
-            text.contains("\x1b[48;2;10;10;10m") && text.contains("\x1b[38;2;128;128;128m"),
+            text.contains(&bg(ink().bar)) && text.contains(&fg(ink().text)),
             "the row carries the bar's own colours, not the terminal's: {text:?}"
         );
         assert!(
@@ -198,12 +185,18 @@ mod tests {
         // Two inks and no more: the bar should read as one line with a couple of
         // things lifted out of it, not as a row of competing colours.
         let m = metrics(60, 10);
+        let ink = ink();
         let mut out = Vec::new();
         draw(
             &mut out,
             &m,
-            vec![bright(" a-server"), text("  1600x832  native 1:1")],
-            vec![text("23ms  "), bright("ctrl+a p"), text(" commands ")],
+            ink,
+            vec![ink.bright(" a-server"), ink.text("  1600x832  native 1:1")],
+            vec![
+                ink.text("23ms  "),
+                ink.bright("ctrl+a p"),
+                ink.text(" commands "),
+            ],
         );
         let text_of = String::from_utf8(out.clone()).unwrap();
         let inks: Vec<&str> = text_of
@@ -229,16 +222,18 @@ mod tests {
     fn the_prefix_mark_is_the_menu_colour() {
         // Not a third colour of the bar's own: it is the menu's accent, so the light
         // and the menu it is about are the same idea. One constant serves both.
+        let ink = ink();
         let mut out = Vec::new();
         draw(
             &mut out,
             &metrics(40, 10),
-            vec![text(" a-server"), accent("  ● CMD")],
+            ink,
+            vec![ink.text(" a-server"), ink.accent("  ● CMD")],
             vec![],
         );
         let text = String::from_utf8(out).unwrap();
         let inked = text
-            .split("\x1b[38;2;124;58;237m")
+            .split(&fg(ink.accent))
             .nth(1)
             .expect("the accent was never used");
         assert!(

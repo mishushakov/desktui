@@ -12,10 +12,4 @@
 pub mod menu;
 mod paint;
 pub mod status;
-
-/// The colour both pieces of chrome pick things out with: the menu's headings and
-/// whatever the pointer is on, and the bar's mark for a prefix waiting on its key.
-///
-/// One definition rather than one each, because the whole of its job is being the
-/// same colour in both places.
-const ACCENT: ratatui::style::Color = ratatui::style::Color::Rgb(0x7c, 0x3a, 0xed);
+pub mod theme;

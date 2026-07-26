@@ -26,6 +26,7 @@ use super::keysym::{bitmask, keysym};
 use crate::cli::ScaleMode;
 use crate::render::Layout;
 use crate::rfb::{ClientKeyEvent, ClientMouseEvent};
+use crate::ui::theme::Theme;
 
 /// Shortest gap between two motion reports, about 60 a second.
 ///
@@ -63,6 +64,9 @@ pub enum Command {
     ToggleStats,
     /// Show the command menu, or put it away if it is already up.
     Menu,
+    /// Wear a palette. No key reaches this either: it is a choice rather than a step,
+    /// so the menu offers the two side by side and a click names one.
+    Theme(Theme),
     /// The prefix was pressed twice: send it through to the server.
     SendPrefix,
 }

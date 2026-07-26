@@ -18,8 +18,9 @@ use crate::term::caps::Caps;
 use crate::term::kitty;
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard};
-use crate::ui::menu::Menu;
+use crate::ui::menu::{self, Menu};
 use crate::ui::status;
+use crate::ui::theme::Theme;
 
 /// Rolling frame-rate estimate over a short window.
 pub struct FpsMeter {
@@ -90,8 +91,13 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     let mut damage: Vec<Rect> = Vec::new();
     let mut fps = FpsMeter::new();
     // Listed, not clickable: none of the prefix commands mean anything to a loop
-    // with no server behind it.
+    // with no server behind it, and nothing here can change what it shows either.
     let menu = Menu::new(args.prefix_char());
+    let state = menu::State {
+        mode: args.scale,
+        theme: Theme::Dark,
+    };
+    let ink = state.theme.palette();
     let mut show_menu = false;
     let mut clear_menu = false;
     let mut last_stats = crate::render::FrameStats::default();
@@ -229,15 +235,12 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         status::draw(
             &mut buf,
             &metrics,
-            vec![status::bright(" test-pattern"), status::text(&rest)],
-            vec![
-                status::text(&figures),
-                status::bright("h"),
-                status::text(" menu "),
-            ],
+            ink,
+            vec![ink.bright(" test-pattern"), ink.text(&rest)],
+            vec![ink.text(&figures), ink.bright("h"), ink.text(" menu ")],
         );
         if show_menu {
-            menu.draw(&mut buf, &metrics, args.scale);
+            menu.draw(&mut buf, &metrics, state);
         }
         if caps.sync_output {
             kitty::end_sync(&mut buf);

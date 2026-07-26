@@ -15,42 +15,31 @@ use std::io::Write as _;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Widget};
 
-use super::ACCENT;
 use super::paint::write_cells;
+use super::theme::{Palette, Theme, colour};
 use crate::cli::ScaleMode;
 use crate::term::input::Command;
 use crate::term::{Metrics, kitty};
 
-/// The box is white with dark ink, whichever way it ends up being painted.
-///
-/// Twice over, because one way is not enough. The cell colours are the whole
-/// story in a terminal with no graphics protocol, which `--force` allows, and are
-/// why the box looks right in Terminal.app or Alacritty.
-///
-/// Where the protocol does work the cell colour is invisible. Tiles are placed at
-/// `z=-1` (see `term::kitty`): below the text, but *above* the cell background, so
-/// a colour set there is painted under the remote screen and only the glyphs come
-/// out on top -- dark text adrift on the wallpaper. Probing Ghostty settled it:
-/// reverse video, an explicit `48;` pair and the basic pairs were every one of them
-/// buried, and only an image of our own -- same z-index, higher id than any tile --
-/// was composited over the desktop. So the backdrop and the highlight bar are
-/// images, and the text is written on them.
-const PAPER: Color = Color::Rgb(0xff, 0xff, 0xff);
-const PAPER_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
-
-/// The row under the pointer. Light enough to read dark ink on, and the same
-/// colour whether it arrives as an image or as a cell background.
-const HOVER: Color = Color::Rgb(0xed, 0xe9, 0xfe);
-const HOVER_RGB: (u8, u8, u8) = (0xed, 0xe9, 0xfe);
-
-/// Inks. The background is set once by the block and left alone, so these only
-/// ever change the glyph colour. `ACCENT` is shared with the status bar.
-const INK: Color = Color::Rgb(0x11, 0x11, 0x11);
-const MUTED: Color = Color::Rgb(0x88, 0x88, 0x88);
+// Every colour comes from the palette (see `ui::theme`), and each one is needed
+// twice over, because one way is not enough.
+//
+// The cell colours are the whole story in a terminal with no graphics protocol,
+// which `--force` allows, and are why the box looks right in Terminal.app or
+// Alacritty.
+//
+// Where the protocol does work the cell colour is invisible. Tiles are placed at
+// `z=-1` (see `term::kitty`): below the text, but *above* the cell background, so
+// a colour set there is painted under the remote screen and only the glyphs come
+// out on top -- dark text adrift on the wallpaper. Probing Ghostty settled it:
+// reverse video, an explicit `48;` pair and the basic pairs were every one of them
+// buried, and only an image of our own -- same z-index, higher id than any tile --
+// was composited over the desktop. So the backdrop and the highlight bar are
+// images, and the text is written on them.
 
 /// Breathing room inside the box, in cells. There is no border to hold the text
 /// off the edge, so the padding is the only thing that does.
@@ -97,7 +86,7 @@ enum Entry {
 /// drawing without being told which one is selected.
 struct Option_ {
     name: &'static str,
-    mode: ScaleMode,
+    command: Command,
 }
 
 impl Option_ {
@@ -105,9 +94,28 @@ impl Option_ {
         cells(self.name) + 2
     }
 
-    fn command(&self) -> Command {
-        Command::Mode(self.mode)
+    /// Is this the one in force?
+    ///
+    /// Read off the command rather than stored beside it: an option's command is
+    /// precisely the request to be the one in force, so it already says which state
+    /// would make it so, and a second copy of that could only disagree.
+    fn in_force(&self, state: State) -> bool {
+        match self.command {
+            Command::Mode(mode) => state.mode == mode,
+            Command::Theme(theme) => state.theme == theme,
+            _ => false,
+        }
     }
+}
+
+/// What the menu has to show as being in force.
+///
+/// Passed in at draw time rather than remembered: the session owns both of these, and
+/// a second copy here could only ever drift from the first.
+#[derive(Debug, Clone, Copy)]
+pub struct State {
+    pub mode: ScaleMode,
+    pub theme: Theme,
 }
 
 /// Every option with the columns it covers, relative to the left of the row.
@@ -170,7 +178,7 @@ impl Entry {
             Entry::Choice { options, .. } => option_spans(options)
                 .into_iter()
                 .find(|(_, start, end)| offset >= i32::from(*start) && offset < i32::from(*end))
-                .map(|(option, ..)| option.command()),
+                .map(|(option, ..)| option.command),
             Entry::Title { close, .. } => {
                 let (start, end) = close_span(close, width);
                 (offset >= i32::from(start) && offset < i32::from(end)).then_some(Command::Menu)
@@ -251,22 +259,39 @@ impl Menu {
                 options: vec![
                     Option_ {
                         name: "Native",
-                        mode: ScaleMode::Native,
+                        command: Command::Mode(ScaleMode::Native),
                     },
                     Option_ {
                         name: "Fit",
-                        mode: ScaleMode::Fit,
+                        command: Command::Mode(ScaleMode::Fit),
                     },
                     Option_ {
                         name: "Integer",
-                        mode: ScaleMode::Integer,
+                        command: Command::Mode(ScaleMode::Integer),
                     },
                     Option_ {
                         name: "1:1",
-                        mode: ScaleMode::OneToOne,
+                        command: Command::Mode(ScaleMode::OneToOne),
                     },
                 ],
                 keys: format!("{p} m"),
+            },
+            Entry::Blank,
+            Entry::Section("Theme".into()),
+            // No keys: two of anything is a choice rather than a cycle, and a click
+            // names one where a single binding could only alternate.
+            Entry::Choice {
+                options: vec![
+                    Option_ {
+                        name: "Dark",
+                        command: Command::Theme(Theme::Dark),
+                    },
+                    Option_ {
+                        name: "Light",
+                        command: Command::Theme(Theme::Light),
+                    },
+                ],
+                keys: String::new(),
             },
             Entry::Blank,
             Entry::Section("View".into()),
@@ -328,7 +353,7 @@ impl Menu {
             Entry::Choice { options, .. } => {
                 let (option, start, _) = option_spans(options)
                     .into_iter()
-                    .find(|(option, ..)| option.command() == command)?;
+                    .find(|(option, ..)| option.command == command)?;
                 span(start, option.width())
             }
             Entry::Title { close, .. } => {
@@ -384,13 +409,11 @@ impl Menu {
 
     /// Draw the menu, centred over the remote screen.
     ///
-    /// `mode` is the scaling in force, which the row of scaling options marks. It is
-    /// passed in rather than remembered: the session owns it, and a second copy here
-    /// could only ever drift from the first.
+    /// `state` says which option each row of them should mark as in force.
     ///
     /// No border: the box is held off the remote screen by its padding and its own
     /// backdrop, which is a good deal quieter than a rule around the outside.
-    pub fn draw(&self, out: &mut Vec<u8>, metrics: &Metrics, mode: ScaleMode) {
+    pub fn draw(&self, out: &mut Vec<u8>, metrics: &Metrics, state: State) {
         let Some(area) = self.area(metrics) else {
             return;
         };
@@ -405,7 +428,7 @@ impl Menu {
             usize::from(area.y) + 1,
             usize::from(area.width),
             usize::from(area.height),
-            PAPER_RGB,
+            state.theme.palette().paper,
         );
         // The bar moves with the pointer, and every placement releases the one it
         // replaces (see `term::kitty`), so a row the pointer has left keeps nothing.
@@ -419,13 +442,13 @@ impl Menu {
                 usize::from(bar.y) + 1,
                 usize::from(bar.width),
                 usize::from(bar.height),
-                HOVER_RGB,
+                state.theme.palette().hover,
             ),
             None => kitty::delete_image(out, kitty::MENU_HIGHLIGHT_IMAGE_ID),
         }
 
         let mut buf = Buffer::empty(area);
-        MenuView { menu: self, mode }.render(area, &mut buf);
+        MenuView { menu: self, state }.render(area, &mut buf);
         write_cells(out, &buf);
     }
 
@@ -453,26 +476,27 @@ impl Menu {
     }
 }
 
-/// The menu together with the scaling mode it has to show as in force. A `Widget`
-/// takes no arguments beyond the area, and this is the one thing the entries cannot
-/// know for themselves.
+/// The menu together with what it has to show as in force. A `Widget` takes no
+/// arguments beyond the area, and this is the one thing the entries cannot know for
+/// themselves.
 struct MenuView<'a> {
     menu: &'a Menu,
-    mode: ScaleMode,
+    state: State,
 }
 
 impl Widget for MenuView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let ink = self.state.theme.palette();
         let block = Block::new()
             .padding(Padding::symmetric(PAD_X, PAD_Y))
-            .style(Style::new().bg(PAPER).fg(INK));
+            .style(Style::new().bg(colour(ink.paper)).fg(colour(ink.ink)));
         let inner = block.inner(area);
         block.render(area, buf);
 
         // The cells under the highlight, coloured for a terminal with no graphics
         // protocol. The same rectangle the bar image is placed over.
         if let Some(bar) = self.menu.hover_bar(area) {
-            buf.set_style(bar, Style::new().bg(HOVER));
+            buf.set_style(bar, Style::new().bg(colour(ink.hover)));
         }
 
         for (index, entry) in self.menu.entries.iter().enumerate() {
@@ -493,23 +517,30 @@ impl Widget for MenuView<'_> {
             match entry {
                 Entry::Blank => {}
                 Entry::Section(text) => {
-                    Line::from(Span::styled(text.as_str(), Style::new().fg(ACCENT)))
-                        .render(row, buf);
+                    Line::from(Span::styled(
+                        text.as_str(),
+                        Style::new().fg(colour(ink.accent)),
+                    ))
+                    .render(row, buf);
                 }
                 Entry::Title { name, close } => {
                     Line::from(Span::styled(
                         name.as_str(),
-                        Style::new().fg(INK).add_modifier(Modifier::BOLD),
+                        Style::new()
+                            .fg(colour(ink.ink))
+                            .add_modifier(Modifier::BOLD),
                     ))
                     .render(row, buf);
                     // A target, so it lifts under the pointer like everything else
                     // rather than sitting there as a label that happens to work.
-                    let ink = if hovered(Command::Menu) {
-                        Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED)
+                    let style = if hovered(Command::Menu) {
+                        Style::new()
+                            .fg(colour(ink.accent))
+                            .add_modifier(Modifier::UNDERLINED)
                     } else {
-                        Style::new().fg(MUTED)
+                        Style::new().fg(colour(ink.muted))
                     };
-                    Line::from(Span::styled(close.as_str(), ink))
+                    Line::from(Span::styled(close.as_str(), style))
                         .right_aligned()
                         .render(row, buf);
                 }
@@ -518,26 +549,32 @@ impl Widget for MenuView<'_> {
                     keys,
                     command,
                 } => {
-                    let ink = if hovered(*command) {
-                        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    let style = if hovered(*command) {
+                        Style::new()
+                            .fg(colour(ink.accent))
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::new().fg(INK)
+                        Style::new().fg(colour(ink.ink))
                     };
-                    split(buf, row, label, keys, ink);
+                    split(buf, row, label, keys, style, ink);
                 }
                 Entry::Choice { options, keys } => {
                     for (option, start, _) in option_spans(options) {
                         // Brackets on the one in force, blanks on the rest, so every
                         // option is the same width whichever is selected and the
                         // options do not shuffle sideways as it changes.
-                        let selected = option.mode == self.mode;
+                        let selected = option.in_force(self.state);
                         let mut style = if selected {
-                            Style::new().fg(INK).add_modifier(Modifier::BOLD)
+                            Style::new()
+                                .fg(colour(ink.ink))
+                                .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::new().fg(MUTED)
+                            Style::new().fg(colour(ink.muted))
                         };
-                        if hovered(option.command()) {
-                            style = style.fg(ACCENT).add_modifier(Modifier::UNDERLINED);
+                        if hovered(option.command) {
+                            style = style
+                                .fg(colour(ink.accent))
+                                .add_modifier(Modifier::UNDERLINED);
                         }
                         let text = if selected {
                             format!("[{}]", option.name)
@@ -551,9 +588,12 @@ impl Widget for MenuView<'_> {
                         };
                         Line::from(Span::styled(text, style)).render(at, buf);
                     }
-                    Line::from(Span::styled(keys.as_str(), Style::new().fg(MUTED)))
-                        .right_aligned()
-                        .render(row, buf);
+                    Line::from(Span::styled(
+                        keys.as_str(),
+                        Style::new().fg(colour(ink.muted)),
+                    ))
+                    .right_aligned()
+                    .render(row, buf);
                 }
             }
         }
@@ -564,10 +604,10 @@ impl Widget for MenuView<'_> {
 ///
 /// The colour goes on the spans rather than on the lines, because a `Line` styles
 /// the whole row it is given and the second one would repaint the first.
-fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, ink: Style) {
-    Line::from(Span::styled(left, ink)).render(row, buf);
+fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, style: Style, ink: &Palette) {
+    Line::from(Span::styled(left, style)).render(row, buf);
     if !right.is_empty() {
-        Line::from(Span::styled(right, Style::new().fg(MUTED)))
+        Line::from(Span::styled(right, Style::new().fg(colour(ink.muted))))
             .right_aligned()
             .render(row, buf);
     }
@@ -577,6 +617,15 @@ fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, ink: Style) {
 mod tests {
     use super::*;
     use crate::cli::ScaleMode;
+    use crate::ui::theme::probe::bg;
+
+    /// A settled state, for the tests that reason about geometry rather than marks.
+    fn state() -> State {
+        State {
+            mode: ScaleMode::Fit,
+            theme: Theme::Dark,
+        }
+    }
 
     fn metrics(cols: u16, rows: u16) -> Metrics {
         Metrics {
@@ -652,11 +701,11 @@ mod tests {
     fn menu_fits_or_is_skipped() {
         let menu = Menu::new('a');
         let mut out = Vec::new();
-        menu.draw(&mut out, &metrics(100, 40), ScaleMode::Fit);
+        menu.draw(&mut out, &metrics(100, 40), state());
         assert!(!out.is_empty());
 
         out.clear();
-        menu.draw(&mut out, &metrics(20, 6), ScaleMode::Fit);
+        menu.draw(&mut out, &metrics(20, 6), state());
         assert!(out.is_empty(), "must not draw a menu that does not fit");
     }
 
@@ -667,7 +716,7 @@ mod tests {
         // of our own, outranking every tile id so it is composited over them.
         let menu = Menu::new('a');
         let mut out = Vec::new();
-        menu.draw(&mut out, &metrics(100, 40), ScaleMode::Fit);
+        menu.draw(&mut out, &metrics(100, 40), state());
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains(&format!("i={},", kitty::OVERLAY_IMAGE_ID)),
@@ -678,7 +727,7 @@ mod tests {
             "the backdrop shares the tiles' z-index; above it would cover the text"
         );
         assert!(
-            text.contains("\x1b[48;2;255;255;255m"),
+            text.contains(&bg(state().theme.palette().paper)),
             "the cells are coloured too, for a terminal with no graphics protocol"
         );
         assert!(
@@ -694,7 +743,7 @@ mod tests {
     fn menu_is_padded_and_right_aligns_its_shortcuts() {
         let menu = Menu::new('a');
         let mut out = Vec::new();
-        menu.draw(&mut out, &metrics(100, 40), ScaleMode::Fit);
+        menu.draw(&mut out, &metrics(100, 40), state());
         let lines = rendered(&out);
 
         assert!(!lines.is_empty(), "nothing was drawn");
@@ -740,7 +789,7 @@ mod tests {
         let menu = Menu::new('a');
         let m = metrics(100, 40);
         let mut drawn = Vec::new();
-        menu.draw(&mut drawn, &m, ScaleMode::Fit);
+        menu.draw(&mut drawn, &m, state());
         let mut cleared = Vec::new();
         menu.clear(&mut cleared, &m);
 
@@ -794,7 +843,7 @@ mod tests {
         // the check below would pass by having nothing to look at.
         let m = metrics(100, 40);
         let mut out = Vec::new();
-        Menu::new('a').draw(&mut out, &m, ScaleMode::Fit);
+        Menu::new('a').draw(&mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
         // Every cursor move must stay above the last row. Only sequences that
         // actually terminate in `H` are positions: the colour set-up ends in `m`,
@@ -960,7 +1009,7 @@ mod tests {
         menu.set_hover(menu.hit(&m, m.cols / 2, row));
 
         let mut out = Vec::new();
-        menu.draw(&mut out, &m, ScaleMode::Fit);
+        menu.draw(&mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
         // A bar the pointer's row wide, drawn as an image with an id above the
         // backdrop's: a cell background would be buried, and a lower id would put
@@ -970,7 +1019,7 @@ mod tests {
             "the highlight must be an image; a cell background is buried"
         );
         assert!(
-            text.contains("\x1b[48;2;237;233;254m"),
+            text.contains(&bg(state().theme.palette().hover)),
             "the cells are coloured too, for a terminal with no graphics protocol"
         );
         // And on the row that was pointed at, not merely somewhere on the box: the
@@ -1000,9 +1049,9 @@ mod tests {
         // so nothing releases the last placement either, and only this delete does.
         let mut out = Vec::new();
         menu.set_hover(Hit::Outside);
-        menu.draw(&mut out, &m, ScaleMode::Fit);
+        menu.draw(&mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains("\x1b[48;2;237;233;254m"));
+        assert!(!text.contains(&bg(state().theme.palette().hover)));
         assert!(
             text.contains(&format!("a=d,d=I,i={}", kitty::MENU_HIGHLIGHT_IMAGE_ID)),
             "a bar that is no longer wanted has to be deleted, not just left off"
@@ -1044,7 +1093,7 @@ mod tests {
             let row = row_of(&menu, &m, label);
             menu.set_hover(menu.hit(&m, col, row));
             let mut out = Vec::new();
-            menu.draw(&mut out, &m, ScaleMode::Fit);
+            menu.draw(&mut out, &m, state());
             let text = String::from_utf8(out).unwrap();
             assert!(
                 bar_command(&text, "a=d").is_some_and(|release| release < placement(&text)),
@@ -1069,18 +1118,24 @@ mod tests {
     }
 
     /// Every option of the scaling row with the column its text starts at.
-    fn options(menu: &Menu, m: &Metrics) -> Vec<(ScaleMode, u16, u16)> {
-        let (_, left) = choice_row(menu, m);
-        let Some(Entry::Choice { options, .. }) = menu
+    fn options(menu: &Menu, m: &Metrics) -> Vec<(Command, u16, u16)> {
+        let index = menu
             .entries
             .iter()
-            .find(|e| matches!(e, Entry::Choice { .. }))
-        else {
-            panic!("no row of options");
+            .position(|e| matches!(e, Entry::Choice { .. }))
+            .expect("no row of options");
+        options_of(menu, m, index)
+    }
+
+    /// The same for whichever row of options is asked for.
+    fn options_of(menu: &Menu, m: &Metrics, index: usize) -> Vec<(Command, u16, u16)> {
+        let left = menu.area(m).expect("the menu must fit").x + PAD_X;
+        let Some(Entry::Choice { options, .. }) = menu.entries.get(index) else {
+            panic!("entry {index} is not a row of options");
         };
         option_spans(options)
             .into_iter()
-            .map(|(option, start, end)| (option.mode, left + start, left + end))
+            .map(|(option, start, end)| (option.command, left + start, left + end))
             .collect()
     }
 
@@ -1090,14 +1145,12 @@ mod tests {
         let m = metrics(100, 40);
         let (row, left) = choice_row(&menu, &m);
 
-        for (mode, start, end) in options(&menu, &m) {
+        for (want, start, end) in options(&menu, &m) {
             for col in [start, end - 1] {
                 match menu.hit(&m, col, row) {
-                    Hit::Item { command, .. } => assert_eq!(
-                        command,
-                        Command::Mode(mode),
-                        "column {col} of the scaling row"
-                    ),
+                    Hit::Item { command, .. } => {
+                        assert_eq!(command, want, "column {col} of the scaling row");
+                    }
                     other => panic!("column {col} of the scaling row hit {other:?}"),
                 }
             }
@@ -1129,7 +1182,7 @@ mod tests {
             (ScaleMode::OneToOne, "1:1"),
         ] {
             let mut out = Vec::new();
-            menu.draw(&mut out, &m, mode);
+            menu.draw(&mut out, &m, State { mode, ..state() });
             let lines = rendered(&out);
             let drawn = &lines[usize::from(row - menu.area(&m).unwrap().y)];
             assert!(drawn.contains(&format!("[{name}]")), "{mode:?}: {drawn:?}");
@@ -1149,6 +1202,46 @@ mod tests {
     }
 
     #[test]
+    fn the_theme_row_marks_the_one_in_force_and_a_click_names_the_other() {
+        let menu = Menu::new('a');
+        let m = metrics(100, 40);
+        let index = menu
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Choice { .. }))
+            .expect("no theme row");
+        let area = menu.area(&m).unwrap();
+        let row = area.y + PAD_Y + u16::try_from(index).unwrap();
+
+        // Two options, each its own target, and each naming the theme it would put on.
+        for (want, start, end) in options_of(&menu, &m, index) {
+            for col in [start, end - 1] {
+                match menu.hit(&m, col, row) {
+                    Hit::Item { command, .. } => {
+                        assert_eq!(command, want, "column {col} of the theme row");
+                    }
+                    other => panic!("column {col} of the theme row hit {other:?}"),
+                }
+            }
+        }
+
+        // The brackets follow whichever is in force, and the row is drawn in it too:
+        // choosing a theme shows you the theme.
+        for (theme, name) in [(Theme::Dark, "Dark"), (Theme::Light, "Light")] {
+            let mut out = Vec::new();
+            menu.draw(&mut out, &m, State { theme, ..state() });
+            let text = String::from_utf8(out).unwrap();
+            let drawn = &rendered(text.as_bytes())[usize::from(row - area.y)];
+            assert!(drawn.contains(&format!("[{name}]")), "{theme:?}: {drawn:?}");
+            assert_eq!(drawn.matches('[').count(), 1, "{theme:?}: {drawn:?}");
+            assert!(
+                text.contains(&bg(theme.palette().paper)),
+                "{theme:?}: the box is not in the theme it says is in force"
+            );
+        }
+    }
+
+    #[test]
     fn the_highlight_covers_one_option_not_the_whole_row() {
         // A row of four targets cannot take a bar across all of it: that would say
         // the pointer is on things it is not.
@@ -1156,18 +1249,18 @@ mod tests {
         let mut menu = Menu::new('a');
         let (row, _) = choice_row(&menu, &m);
         let area = menu.area(&m).unwrap();
-        let (mode, start, _) = options(&menu, &m)[2];
+        let (command, start, _) = options(&menu, &m)[2];
 
         menu.set_hover(menu.hit(&m, start, row));
         let mut out = Vec::new();
-        menu.draw(&mut out, &m, ScaleMode::Fit);
+        menu.draw(&mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
 
         let bar = menu.hover_bar(area).expect("nothing highlighted");
         assert_eq!(bar.x, start, "the bar does not start at the option");
         assert_eq!(bar.width, cells("Integer") + 2);
         assert!(bar.width < area.width, "the bar spans the whole row");
-        assert_eq!(mode, ScaleMode::Integer);
+        assert_eq!(command, Command::Mode(ScaleMode::Integer));
         // And the image is placed on exactly those cells.
         let cup = positions(&text.as_bytes()[..placement(&text)])
             .pop()
@@ -1181,7 +1274,7 @@ mod tests {
         assert!(text.contains("\x1b[4m"), "the option is not underlined");
         let mut plain = Vec::new();
         menu.clear_hover();
-        menu.draw(&mut plain, &m, ScaleMode::Fit);
+        menu.draw(&mut plain, &m, state());
         assert!(!String::from_utf8(plain).unwrap().contains("\x1b[4m"));
     }
 
