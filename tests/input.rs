@@ -483,14 +483,9 @@ fn a_pasted_selection_goes_to_the_remote_clipboard() {
     assert_drew(&term, Duration::from_secs(10));
 
     // Bracketed paste, as a terminal delivers it.
-    paste(&mut term, "hello there", &server, |r| {
+    let cut = paste(&mut term, "hello there", &server, |r| {
         matches!(r, Request::CutText(_))
     });
-    let cut = server
-        .wait_for(Duration::from_secs(10), |r| {
-            matches!(r, Request::CutText(_))
-        })
-        .expect("the paste never reached the server");
     match cut {
         Request::CutText(text) => assert_eq!(text, "hello there"),
         other => panic!("unexpected request {other:?}"),
@@ -574,18 +569,15 @@ fn a_pasted_selection_is_announced_first_and_sent_when_asked() {
     // goes out: without them the client falls back to Latin-1 cut text, correctly, and
     // nothing would ever announce anything. `assert_drew` above is the wait for them --
     // they answer the `SetEncodings`, so no frame can have overtaken them.
-    paste(&mut term, "Привет, мир", &server, |r| {
-        // Either way it went, so that a fallback fails the assertion below rather than
-        // being taken for a paste that never arrived and said again.
+    let sent = paste(&mut term, "Привет, мир", &server, |r| {
+        // Either way it went, so that a fallback is caught below rather than taken for a
+        // paste that never arrived and said again.
         matches!(r, Request::ClipboardNotify | Request::CutText(_))
     });
     assert!(
-        server
-            .requests()
-            .iter()
-            .any(|r| matches!(r, Request::ClipboardNotify)),
-        "the paste was never announced: {:?}",
-        server.requests()
+        matches!(sent, Request::ClipboardNotify),
+        "the paste went out as {sent:?} instead of being announced, which is the fallback \
+         for a server that never offered the extension"
     );
     // The fake server answers a notify with a request, so the text should follow --
     // whole, which is the other half of what the extension is for.
@@ -651,14 +643,9 @@ fn a_paste_outside_latin1_is_substituted_not_silently_shortened() {
     let (server, mut term) = start(Resize::Accept, (800, 600));
     assert_drew(&term, Duration::from_secs(10));
 
-    paste(&mut term, "caf\u{e9} \u{2615} tea", &server, |r| {
+    let cut = paste(&mut term, "caf\u{e9} \u{2615} tea", &server, |r| {
         matches!(r, Request::CutText(_))
     });
-    let cut = server
-        .wait_for(Duration::from_secs(10), |r| {
-            matches!(r, Request::CutText(_))
-        })
-        .expect("the paste never reached the server");
     match cut {
         Request::CutText(text) => {
             // The e-acute is Latin-1 and survives; the coffee cup is not and becomes

@@ -95,17 +95,19 @@ pub fn quit(term: &mut FakeTerm) {
 ///
 /// The ambiguity itself belongs to the client, which cannot tell the two apart either.
 /// Worth remembering when a paste is reported lost in real use.
+/// Answers with the request that satisfied `acted`, that being the thing a caller wants to
+/// look inside and there being no sense in waiting for it twice.
 #[track_caller]
 pub fn paste(
     term: &mut FakeTerm,
     text: &str,
     server: &FakeServer,
     acted: impl Fn(&Request) -> bool,
-) {
+) -> Request {
     for attempt in 1..=3 {
         term.send(format!("\x1b[200~{text}\x1b[201~").as_bytes());
-        if server.wait_for(Duration::from_secs(2), &acted).is_some() {
-            return;
+        if let Some(request) = server.wait_for(Duration::from_secs(2), &acted) {
+            return request;
         }
         eprintln!("the paste was not read as one; saying it again (attempt {attempt})");
     }
