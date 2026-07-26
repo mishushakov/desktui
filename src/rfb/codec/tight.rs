@@ -456,3 +456,432 @@ impl Decoder {
             .to_le_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rfb::VncEvent;
+    use crate::rfb::codec::testing::{Sink, bgra, bgra_repeated, deflate, format, rect, tight_len};
+
+    /// The control byte: the low nibble resets zlib streams, the high nibble picks the
+    /// compression. Written out here because every test below starts with one and the
+    /// two halves are easy to transpose.
+    fn ctrl(compression: u8, resets: u8) -> u8 {
+        (compression << 4) | resets
+    }
+
+    const FILL: u8 = 8;
+    const JPEG: u8 = 9;
+    const PNG: u8 = 10;
+    /// Basic compression, stream 0, with an explicit filter byte following (bit 2).
+    const BASIC_FILTERED: u8 = 4;
+    /// Basic compression, stream 0, filter implied to be `copy`.
+    const BASIC_COPY: u8 = 0;
+
+    /// Successive chunks compressed through one stream, as a server does across the
+    /// rectangles of a session. Each is sync-flushed, never finished.
+    fn deflate_stream(chunks: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut compress = flate2::Compress::new(flate2::Compression::default(), true);
+        chunks
+            .iter()
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len() + 128);
+                compress
+                    .compress_vec(chunk, &mut out, flate2::FlushCompress::Sync)
+                    .expect("compressing test data");
+                out
+            })
+            .collect()
+    }
+
+    async fn decode(bytes: &[u8], width: u16, height: u16) -> Result<Sink, VncError> {
+        let sink = Sink::default();
+        let mut input = bytes;
+        Decoder::new()
+            .decode(
+                &format(),
+                &rect(width, height),
+                &mut input,
+                &sink.collector(),
+            )
+            .await?;
+        Ok(sink)
+    }
+
+    // ------------------------------------------------------------------ fill
+
+    #[tokio::test]
+    async fn a_fill_rectangle_is_one_colour_everywhere() {
+        // Three bytes of colour stand for the whole rectangle: the cheapest thing
+        // Tight can send, and what a flat desktop background arrives as.
+        let sink = decode(&[ctrl(FILL, 0), 10, 20, 30], 2, 3).await.unwrap();
+
+        let (got, pixels) = sink.image();
+        assert_eq!(got, rect(2, 3));
+        assert_eq!(pixels, bgra_repeated(10, 20, 30, 6));
+    }
+
+    // ------------------------------------------------------------------ jpeg
+
+    #[tokio::test]
+    async fn a_jpeg_rectangle_is_handed_on_whole() {
+        // The Tight decoder does not decode JPEG itself; it hands the payload to the
+        // renderer, so what matters is that the length prefix is read exactly right and
+        // no byte is added or dropped.
+        let payload: Vec<u8> = (0..40u8).collect();
+        let mut bytes = vec![ctrl(JPEG, 0)];
+        bytes.extend(tight_len(payload.len()));
+        bytes.extend_from_slice(&payload);
+
+        let sink = decode(&bytes, 4, 4).await.unwrap();
+
+        match sink.events().as_slice() {
+            [VncEvent::JpegImage(got, data)] => {
+                assert_eq!(*got, rect(4, 4));
+                assert_eq!(*data, payload);
+            }
+            other => panic!("expected one JpegImage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_compact_length_is_read_in_all_three_widths() {
+        // Tight writes a length as 7 bits per byte, low group first, the top bit
+        // meaning "another follows". One byte up to 127, two to 16383, three beyond --
+        // and getting the third wrong desynchronises every later rectangle rather than
+        // failing here.
+        for len in [1usize, 127, 128, 200, 16383, 16384, 20000] {
+            let payload = vec![0xab; len];
+            let mut bytes = vec![ctrl(JPEG, 0)];
+            bytes.extend(tight_len(len));
+            bytes.extend_from_slice(&payload);
+            // A trailing byte that must still be on the stream afterwards.
+            bytes.push(0xff);
+
+            let sink = Sink::default();
+            let mut input = &bytes[..];
+            Decoder::new()
+                .decode(&format(), &rect(4, 4), &mut input, &sink.collector())
+                .await
+                .unwrap_or_else(|e| panic!("length {len} failed: {e}"));
+
+            match sink.events().as_slice() {
+                [VncEvent::JpegImage(_, data)] => {
+                    assert_eq!(data.len(), len, "wrong payload length for {len}")
+                }
+                other => panic!("length {len}: {other:?}"),
+            }
+            assert_eq!(input, &[0xff], "length {len} left the stream misaligned");
+        }
+    }
+
+    // ------------------------------------------------------------- copy filter
+
+    #[tokio::test]
+    async fn a_short_copy_rectangle_is_sent_uncompressed() {
+        // Under twelve bytes Tight skips zlib, because the header would cost more than
+        // the pixels. Three bytes per pixel on the wire become four in the framebuffer.
+        let sink = decode(&[ctrl(BASIC_COPY, 0), 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 1)
+            .await
+            .unwrap();
+
+        let (_, pixels) = sink.image();
+        let mut expected = Vec::new();
+        expected.extend(bgra(1, 2, 3));
+        expected.extend(bgra(4, 5, 6));
+        expected.extend(bgra(7, 8, 9));
+        assert_eq!(pixels, expected);
+    }
+
+    #[tokio::test]
+    async fn a_longer_copy_rectangle_comes_through_zlib() {
+        // Twelve bytes and up is the compressed path, with its own length prefix.
+        let rgb: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let compressed = deflate(&rgb);
+        let mut bytes = vec![ctrl(BASIC_COPY, 0)];
+        bytes.extend(tight_len(compressed.len()));
+        bytes.extend_from_slice(&compressed);
+
+        let sink = decode(&bytes, 2, 2).await.unwrap();
+
+        let (_, pixels) = sink.image();
+        let mut expected = Vec::new();
+        for chunk in rgb.chunks(3) {
+            expected.extend(bgra(chunk[0], chunk[1], chunk[2]));
+        }
+        assert_eq!(pixels, expected);
+    }
+
+    // ---------------------------------------------------------- palette filter
+
+    #[tokio::test]
+    async fn a_two_colour_rectangle_is_one_bit_per_pixel() {
+        // The mono case packs eight pixels into a byte, most significant bit first, and
+        // starts a fresh byte on every row. Getting the bit order backwards mirrors
+        // every glyph on the screen, which is what this pins down.
+        let red = [255, 0, 0];
+        let blue = [0, 0, 255];
+        let mut bytes = vec![ctrl(BASIC_FILTERED, 0), 1, 1];
+        bytes.extend_from_slice(&red);
+        bytes.extend_from_slice(&blue);
+        // Row 0 alternating from red, row 1 alternating from blue.
+        bytes.extend_from_slice(&[0b0101_0101, 0b1010_1010]);
+
+        let sink = decode(&bytes, 8, 2).await.unwrap();
+
+        let (_, pixels) = sink.image();
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            expected.extend(bgra(255, 0, 0));
+            expected.extend(bgra(0, 0, 255));
+        }
+        for _ in 0..4 {
+            expected.extend(bgra(0, 0, 255));
+            expected.extend(bgra(255, 0, 0));
+        }
+        assert_eq!(pixels, expected);
+    }
+
+    #[tokio::test]
+    async fn a_small_palette_is_one_byte_per_pixel() {
+        // Three colours and up: a whole byte of index per pixel, however few colours
+        // there are.
+        let mut bytes = vec![ctrl(BASIC_FILTERED, 0), 1, 2];
+        bytes.extend_from_slice(&[10, 11, 12]); // index 0
+        bytes.extend_from_slice(&[20, 21, 22]); // index 1
+        bytes.extend_from_slice(&[30, 31, 32]); // index 2
+        bytes.extend_from_slice(&[2, 0, 1, 0]);
+
+        let sink = decode(&bytes, 4, 1).await.unwrap();
+
+        let (_, pixels) = sink.image();
+        let mut expected = Vec::new();
+        expected.extend(bgra(30, 31, 32));
+        expected.extend(bgra(10, 11, 12));
+        expected.extend(bgra(20, 21, 22));
+        expected.extend(bgra(10, 11, 12));
+        assert_eq!(pixels, expected);
+    }
+
+    #[tokio::test]
+    async fn a_palette_index_past_the_end_is_refused() {
+        // The index is a whole byte, so it reaches 255 whatever the palette holds.
+        // Upstream sliced the palette with it and panicked the process; a server only
+        // has to send one byte to do that, so it is worth a test of its own.
+        let mut bytes = vec![ctrl(BASIC_FILTERED, 0), 1, 2];
+        bytes.extend_from_slice(&[10, 11, 12]);
+        bytes.extend_from_slice(&[20, 21, 22]);
+        bytes.extend_from_slice(&[30, 31, 32]);
+        bytes.extend_from_slice(&[0, 200, 0, 0]);
+
+        let result = decode(&bytes, 4, 1).await;
+
+        assert!(
+            matches!(result, Err(VncError::InvalidImageData)),
+            "expected a refusal, got {:?}",
+            result.map(|s| s.images())
+        );
+    }
+
+    // --------------------------------------------------------- gradient filter
+
+    #[tokio::test]
+    async fn the_gradient_filter_predicts_from_the_neighbours() {
+        // Each channel arrives as a difference from a prediction made out of the pixel
+        // to the left, the one above, and the one above-left. On the first row the
+        // prediction is just the pixel to the left, so these three pixels accumulate.
+        let mut bytes = vec![ctrl(BASIC_FILTERED, 0), 2];
+        bytes.extend_from_slice(&[10, 20, 30, 1, 2, 3, 5, 5, 5]);
+
+        let sink = decode(&bytes, 3, 1).await.unwrap();
+
+        let (_, pixels) = sink.image();
+        // 10,20,30 then +1,+2,+3 then +5,+5,+5.
+        let channels: Vec<[u8; 3]> = pixels
+            .chunks_exact(4)
+            .map(|px| [px[2], px[1], px[0]])
+            .collect();
+        assert_eq!(channels, vec![[10, 20, 30], [11, 22, 33], [16, 27, 38]]);
+
+        // Unlike every other filter, the gradient path never sets the alpha byte. That
+        // is harmless only because `Framebuffer::pack_rgb` reads three bytes of four
+        // and ignores this one -- asserted here so that if the renderer ever starts
+        // reading it, this fails rather than the picture going transparent.
+        assert!(
+            pixels.chunks_exact(4).all(|px| px[3] == 0),
+            "the gradient filter now sets alpha; pack_rgb has to be checked"
+        );
+    }
+
+    // ---------------------------------------------------------- malformed input
+
+    #[tokio::test]
+    async fn png_in_a_standard_tight_rectangle_is_refused() {
+        // PNG belongs to TightPNG, which this client never negotiates. Upstream fell
+        // through to the basic path and desynchronised the stream.
+        let result = decode(&[ctrl(PNG, 0)], 2, 2).await;
+        assert!(
+            matches!(result, Err(VncError::InvalidImageData)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_compression_is_refused() {
+        // Compression 11 has the high bit of the nibble set but is not fill, jpeg or
+        // png, so there is nothing to do but refuse it.
+        let result = decode(&[ctrl(11, 0)], 2, 2).await;
+        assert!(
+            matches!(result, Err(VncError::InvalidImageData)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_filter_is_refused() {
+        // Filters are copy, palette and gradient. A fourth would leave us guessing at
+        // the length of what follows.
+        let result = decode(&[ctrl(BASIC_FILTERED, 0), 3], 2, 2).await;
+        assert!(
+            matches!(result, Err(VncError::InvalidImageData)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_pixel_format_is_refused_rather_than_panicking() {
+        // The colour channels have to leave one byte of the pixel free for alpha.
+        // Upstream had `unreachable!()` here, reachable from a server that ignored our
+        // SetPixelFormat.
+        let mut odd = format();
+        odd.red_max = 31;
+        odd.green_max = 63;
+        odd.blue_max = 31;
+        odd.red_shift = 11;
+        odd.green_shift = 5;
+        odd.blue_shift = 0;
+
+        let sink = Sink::default();
+        let mut input = &[ctrl(FILL, 0), 1, 2, 3][..];
+        let result = Decoder::new()
+            .decode(&odd, &rect(2, 2), &mut input, &sink.collector())
+            .await;
+
+        assert!(
+            matches!(result, Err(VncError::WrongPixelFormat)),
+            "{result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------- zlib streams
+
+    #[tokio::test]
+    async fn a_zlib_stream_persists_across_rectangles() {
+        // The four streams stay open for the whole session, so a rectangle can only be
+        // decompressed in the context the previous one left behind. Decoding each
+        // rectangle with a fresh decompressor would work on the first and fail on the
+        // second, which is why both are checked here on one decoder.
+        let first: Vec<u8> = (0..12u8).collect();
+        let second: Vec<u8> = (100..112u8).collect();
+        let chunks = deflate_stream(&[&first, &second]);
+
+        let mut decoder = Decoder::new();
+        for (rgb, compressed) in [(&first, &chunks[0]), (&second, &chunks[1])] {
+            let mut bytes = vec![ctrl(BASIC_COPY, 0)];
+            bytes.extend(tight_len(compressed.len()));
+            bytes.extend_from_slice(compressed);
+
+            let sink = Sink::default();
+            let mut input = &bytes[..];
+            decoder
+                .decode(&format(), &rect(2, 2), &mut input, &sink.collector())
+                .await
+                .expect("a rectangle continuing the same zlib stream");
+
+            let expected: Vec<u8> = rgb.chunks(3).flat_map(|c| bgra(c[0], c[1], c[2])).collect();
+            assert_eq!(sink.image().1, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reset_bit_starts_the_stream_over() {
+        // A server that resets a stream sets the matching bit in the control byte, and
+        // what follows is a new zlib stream with its own header. Without honouring the
+        // reset the decompressor would still be mid-stream and reject it.
+        let first: Vec<u8> = (0..12u8).collect();
+        let second: Vec<u8> = (50..62u8).collect();
+
+        let mut decoder = Decoder::new();
+
+        let compressed = deflate(&first);
+        let mut bytes = vec![ctrl(BASIC_COPY, 0)];
+        bytes.extend(tight_len(compressed.len()));
+        bytes.extend_from_slice(&compressed);
+        let sink = Sink::default();
+        decoder
+            .decode(&format(), &rect(2, 2), &mut &bytes[..], &sink.collector())
+            .await
+            .unwrap();
+
+        // An independent stream, announced by resetting stream 0.
+        let compressed = deflate(&second);
+        let mut bytes = vec![ctrl(BASIC_COPY, 1)];
+        bytes.extend(tight_len(compressed.len()));
+        bytes.extend_from_slice(&compressed);
+        let sink = Sink::default();
+        decoder
+            .decode(&format(), &rect(2, 2), &mut &bytes[..], &sink.collector())
+            .await
+            .expect("a reset stream should start clean");
+
+        let expected: Vec<u8> = second
+            .chunks(3)
+            .flat_map(|c| bgra(c[0], c[1], c[2]))
+            .collect();
+        assert_eq!(sink.image().1, expected);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rectangle_leaves_the_stream_usable() {
+        // Upstream took the decompressor out of its slot to use it and only put it back
+        // on success, so one corrupt rectangle made the next one unwrap a `None` and
+        // panic. The corrupt rectangle has to fail; the one after it has to not.
+        let mut decoder = Decoder::new();
+
+        let mut bytes = vec![ctrl(BASIC_COPY, 0)];
+        bytes.extend(tight_len(4));
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // not a zlib stream
+        let sink = Sink::default();
+        let result = decoder
+            .decode(&format(), &rect(2, 2), &mut &bytes[..], &sink.collector())
+            .await;
+        assert!(result.is_err(), "corrupt zlib data should fail");
+
+        // Now a good rectangle on the same stream.
+        let rgb: Vec<u8> = (0..12u8).collect();
+        let compressed = deflate(&rgb);
+        let mut bytes = vec![ctrl(BASIC_COPY, 1)];
+        bytes.extend(tight_len(compressed.len()));
+        bytes.extend_from_slice(&compressed);
+        let sink = Sink::default();
+        decoder
+            .decode(&format(), &rect(2, 2), &mut &bytes[..], &sink.collector())
+            .await
+            .expect("the decoder was poisoned by the failed rectangle");
+
+        let expected: Vec<u8> = rgb.chunks(3).flat_map(|c| bgra(c[0], c[1], c[2])).collect();
+        assert_eq!(sink.image().1, expected);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_payload_is_an_error() {
+        // The length prefix promises more than the stream holds, which is what a
+        // rectangle cut short by a dropped connection looks like.
+        let mut bytes = vec![ctrl(JPEG, 0)];
+        bytes.extend(tight_len(100));
+        bytes.extend_from_slice(&[0; 10]);
+
+        let result = decode(&bytes, 4, 4).await;
+        assert!(matches!(result, Err(VncError::IoError(_))), "{result:?}");
+    }
+}
