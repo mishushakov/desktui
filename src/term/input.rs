@@ -150,9 +150,16 @@ impl InputMapper {
     }
 
     pub fn on_key(&mut self, ev: KeyEvent) -> KeyOutcome {
-        // While the prefix is armed, nothing reaches the server: the next press
-        // is a command, and any release in between belongs to the prefix chord.
+        // While the prefix is armed, no press reaches the server: the next one is a
+        // command. Releases are a different matter. The prefix chord's modifier was
+        // pressed as a key in its own right before the prefix key arrived, so
+        // swallowing its release leaves it latched on the remote, and every later
+        // click becomes a Ctrl-click. `release_if_held` only speaks for keys the
+        // server was told about, so the prefix key's own release stays swallowed.
         if self.armed {
+            if ev.kind == KeyEventKind::Release {
+                return self.release_if_held(ev);
+            }
             if ev.kind != KeyEventKind::Press {
                 return KeyOutcome::Ignored;
             }
@@ -174,6 +181,20 @@ impl InputMapper {
         }
 
         self.translate(ev)
+    }
+
+    /// Let go of a key the server was told is down, and say nothing otherwise.
+    fn release_if_held(&mut self, ev: KeyEvent) -> KeyOutcome {
+        let Some(sym) = keysym(ev.code) else {
+            return KeyOutcome::Ignored;
+        };
+        let mut out = Vec::new();
+        self.release(&mut out, sym);
+        if out.is_empty() {
+            KeyOutcome::Ignored
+        } else {
+            KeyOutcome::Keys(out)
+        }
     }
 
     /// Send the prefix chord through to the server, as if it had not been caught.
@@ -630,6 +651,33 @@ mod tests {
             KeyOutcome::Local(Command::Quit)
         );
         assert!(!input.is_armed());
+    }
+
+    #[test]
+    fn the_prefix_does_not_leave_its_modifier_held_on_the_remote() {
+        // The Control press reaches the server as a key of its own, before anything
+        // knows a prefix chord is coming. Swallowing its release would latch Control
+        // down on the remote and turn every later click into a Ctrl-click.
+        let mut input = InputMapper::new('a', true, true);
+        let ctrl_l = KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl);
+        input.on_key(key(ctrl_l, KeyEventKind::Press, KeyModifiers::CONTROL));
+        input.on_key(ctrl('a', KeyEventKind::Press));
+        assert!(input.is_armed());
+
+        // The prefix key's own release is still swallowed: it was never pressed.
+        assert_eq!(
+            input.on_key(ctrl('a', KeyEventKind::Release)),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(
+            input.on_key(key(ctrl_l, KeyEventKind::Release, KeyModifiers::NONE)),
+            KeyOutcome::Keys(vec![ClientKeyEvent {
+                keycode: 0xffe3,
+                down: false
+            }])
+        );
+        assert!(input.is_armed(), "the window is still open for a command");
+        assert!(input.release_all().is_empty(), "nothing left held");
     }
 
     #[test]
