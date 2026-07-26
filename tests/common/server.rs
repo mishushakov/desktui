@@ -32,6 +32,12 @@ pub enum Resize {
 }
 
 /// What the client asked for.
+///
+/// The `Clipboard*` variants are named for the extended clipboard actions they carry,
+/// which is worth the repetition in `ClipboardRequest`: the protocol calls it a
+/// request, and calling it anything else here would only obscure which message a
+/// failing test was waiting for.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     SetPixelFormat,
@@ -49,6 +55,18 @@ pub enum Request {
         buttons: u8,
     },
     CutText(String),
+    /// The client's extended clipboard capabilities, and the size of text it will
+    /// take without asking.
+    ClipboardCaps {
+        flags: u32,
+        text_size: u32,
+    },
+    /// The client holds text and is not sending it yet.
+    ClipboardNotify,
+    /// The client wants the clipboard the server announced.
+    ClipboardRequest,
+    /// The client's clipboard, in UTF-8, out of the zlib stream it arrived in.
+    ClipboardProvide(String),
     SetDesktopSize {
         width: u16,
         height: u16,
@@ -78,6 +96,32 @@ pub struct Extensions {
     /// Send a cursor shape, which a server only does once the client has asked for the
     /// Cursor pseudo-encoding.
     pub cursor: bool,
+    /// Answer `SetEncodings` with an extended clipboard `caps` message, which is how a
+    /// server admits to the extension, and hold [`REMOTE_CLIPBOARD`] for a client that
+    /// asks. Only legal if the client requested the pseudo-encoding, which is asserted.
+    pub extended_clipboard: bool,
+    /// Announce that clipboard with a `notify` as soon as the extension is up, the way
+    /// a server does when a selection is made on the remote desktop.
+    pub announce_clipboard: bool,
+}
+
+/// What the fake server has on its clipboard.
+///
+/// Cyrillic on purpose: none of it exists in Latin-1, so the legacy `ServerCutText`
+/// would deliver a row of question marks and only the extension can carry it.
+pub const REMOTE_CLIPBOARD: &str = "Привет, мир";
+
+/// The `ExtendedClipboard` pseudo-encoding, 0xc0a1e5ce as the signed number the wire
+/// carries.
+pub const EXTENDED_CLIPBOARD_ENCODING: i32 = -1_063_131_698;
+
+/// Flag bits of an extended clipboard message.
+mod clip {
+    pub const TEXT: u32 = 1 << 0;
+    pub const CAPS: u32 = 1 << 24;
+    pub const REQUEST: u32 = 1 << 25;
+    pub const NOTIFY: u32 = 1 << 27;
+    pub const PROVIDE: u32 = 1 << 28;
 }
 
 pub struct FakeServer {
@@ -236,6 +280,30 @@ fn serve(
                     );
                     send_cursor(&mut stream)?;
                 }
+                if extensions.extended_clipboard {
+                    assert!(
+                        encodings_seen.contains(&EXTENDED_CLIPBOARD_ENCODING),
+                        "spoke the extended clipboard to a client that never asked for it"
+                    );
+                    // The spec requires this on every SetEncodings naming the encoding,
+                    // and it is how the client learns the extension is available. Zero
+                    // for the size, so the client has to announce before it sends.
+                    let mut caps =
+                        (clip::CAPS | clip::TEXT | clip::REQUEST | clip::NOTIFY | clip::PROVIDE)
+                            .to_be_bytes()
+                            .to_vec();
+                    caps.extend_from_slice(&0u32.to_be_bytes());
+                    send_extended_clipboard(&mut stream, &caps)?;
+
+                    if extensions.announce_clipboard {
+                        // A selection was made over there. Nothing is sent with it:
+                        // that is the difference the extension makes.
+                        send_extended_clipboard(
+                            &mut stream,
+                            &(clip::NOTIFY | clip::TEXT).to_be_bytes(),
+                        )?;
+                    }
+                }
             }
             3 => {
                 let mut rest = [0u8; 9];
@@ -279,16 +347,24 @@ fn serve(
             6 => {
                 let mut head = [0u8; 7];
                 stream.read_exact(&mut head)?;
-                let len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
-                let mut text = vec![0u8; len];
-                stream.read_exact(&mut text)?;
-                // Latin-1, as the protocol says -- one byte per character. Decoding
-                // this as UTF-8 would accept the client sending UTF-8 too, which is
-                // exactly the bug the paste tests are here to catch.
-                record(
-                    &requests,
-                    Request::CutText(text.iter().map(|&b| b as char).collect()),
-                );
+                // Signed: a negative length is the extended clipboard form, and its
+                // magnitude is the byte count.
+                let len = i32::from_be_bytes([head[3], head[4], head[5], head[6]]);
+                if len < 0 {
+                    let mut body = vec![0u8; len.unsigned_abs() as usize];
+                    stream.read_exact(&mut body)?;
+                    handle_extended_clipboard(&mut stream, &body, &requests)?;
+                } else {
+                    let mut text = vec![0u8; len as usize];
+                    stream.read_exact(&mut text)?;
+                    // Latin-1, as the protocol says -- one byte per character. Decoding
+                    // this as UTF-8 would accept the client sending UTF-8 too, which is
+                    // exactly the bug the paste tests are here to catch.
+                    record(
+                        &requests,
+                        Request::CutText(text.iter().map(|&b| b as char).collect()),
+                    );
+                }
             }
             150 => {
                 let mut rest = [0u8; 9];
@@ -430,6 +506,89 @@ fn send_led_state(stream: &mut TcpStream, caps: bool, num: bool) -> std::io::Res
     msg.push(state);
     stream.write_all(&msg)?;
     stream.flush()
+}
+
+/// Write an extended clipboard message: a `ServerCutText` under a negative length.
+fn send_extended_clipboard(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    let mut msg = vec![3u8, 0, 0, 0];
+    msg.extend_from_slice(&(-(body.len() as i32)).to_be_bytes());
+    msg.extend_from_slice(body);
+    stream.write_all(&msg)?;
+    stream.flush()
+}
+
+/// Read one from the client, and answer it the way a server would.
+fn handle_extended_clipboard(
+    stream: &mut TcpStream,
+    body: &[u8],
+    requests: &Arc<Mutex<Vec<Request>>>,
+) -> std::io::Result<()> {
+    assert!(body.len() >= 4, "an extended message with no flags word");
+    let flags = u32::from_be_bytes(body[0..4].try_into().unwrap());
+
+    if flags & clip::CAPS != 0 {
+        // One size per format bit, and text is the first of them.
+        let text_size = if flags & clip::TEXT != 0 && body.len() >= 8 {
+            u32::from_be_bytes(body[4..8].try_into().unwrap())
+        } else {
+            0
+        };
+        record(requests, Request::ClipboardCaps { flags, text_size });
+    } else if flags & clip::NOTIFY != 0 {
+        record(requests, Request::ClipboardNotify);
+        // A real server asks when something on its side pastes. Asking straight away
+        // is the same exchange with the waiting taken out.
+        send_extended_clipboard(stream, &(clip::REQUEST | clip::TEXT).to_be_bytes())?;
+    } else if flags & clip::REQUEST != 0 {
+        record(requests, Request::ClipboardRequest);
+        send_extended_clipboard(stream, &clipboard_provide(REMOTE_CLIPBOARD))?;
+    } else if flags & clip::PROVIDE != 0 {
+        record(
+            requests,
+            Request::ClipboardProvide(read_provided(&body[4..])),
+        );
+    }
+    Ok(())
+}
+
+/// Pull the text out of a `provide` payload: zlib, then a size and that many bytes.
+fn read_provided(deflated: &[u8]) -> String {
+    use std::io::Read as _;
+    let mut inflated = Vec::new();
+    flate2::read::ZlibDecoder::new(deflated)
+        .read_to_end(&mut inflated)
+        .expect("a provide that was not zlib");
+    assert!(inflated.len() >= 4, "a provide with no size");
+    let size = u32::from_be_bytes(inflated[0..4].try_into().unwrap()) as usize;
+    let text = &inflated[4..][..size];
+    // The size counts a terminating null, and the line endings are CRLF.
+    let text = text
+        .strip_suffix(&[0])
+        .expect("a provide with no terminator");
+    String::from_utf8(text.to_vec())
+        .expect("a provide that was not utf-8")
+        .replace("\r\n", "\n")
+}
+
+/// Build a `provide` body carrying `text`, the way a server does.
+fn clipboard_provide(text: &str) -> Vec<u8> {
+    let mut payload = text.replace('\n', "\r\n").into_bytes();
+    payload.push(0);
+
+    let mut deflated = Vec::new();
+    {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(&mut deflated, flate2::Compression::new(6));
+        encoder
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    let mut body = (clip::PROVIDE | clip::TEXT).to_be_bytes().to_vec();
+    body.extend_from_slice(&deflated);
+    body
 }
 
 fn record(requests: &Arc<Mutex<Vec<Request>>>, request: Request) {

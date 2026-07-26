@@ -1,4 +1,5 @@
 use crate::rfb::PixelFormat;
+use crate::rfb::client::clipboard::Caps as ClipboardCaps;
 
 type ImageData = Vec<u8>;
 
@@ -166,9 +167,27 @@ pub enum VncEvent {
     FramebufferUpdateEnd,
     /// Just ring a bell.
     Bell,
-    /// The server's clipboard changed. Latin-1 only, per
-    /// [RFC6143](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.6.4).
+    /// The server's clipboard, as text.
+    ///
+    /// From a legacy `ServerCutText`, which is Latin-1 only per
+    /// [RFC6143](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.6.4), or from
+    /// an extended clipboard `provide`, which is UTF-8. By the time it is an event the
+    /// difference is spent: either way this is the remote clipboard.
     Text(String),
+    /// What the server will accept on the extended clipboard.
+    ///
+    /// A server must send this in answer to a `SetEncodings` naming the
+    /// `ExtendedClipboard` pseudo-encoding, so it arriving is how the extension is
+    /// discovered -- and nothing extended may be sent before it does.
+    ClipboardCaps(ClipboardCaps),
+    /// The server's clipboard changed, without saying what is on it.
+    ///
+    /// `text` is false when the remote clipboard went empty. Fetching the text takes a
+    /// [`X11Event::ClipboardRequest`], which is what makes a remote selection cost
+    /// nothing until somebody wants it.
+    ClipboardNotify { text: bool },
+    /// The server wants the clipboard we announced, and is asking for it now.
+    ClipboardRequest,
     /// The server's lock-key state changed.
     ///
     /// Worth having because a remote caps lock that disagrees with the local one
@@ -258,8 +277,21 @@ pub enum X11Event {
     KeyEvent(ClientKeyEvent),
     /// Mouse move, button or scroll.
     PointerEvent(ClientMouseEvent),
-    /// Send text to the server's clipboard. Latin-1 only.
+    /// Send text to the server's clipboard, the legacy way. Latin-1 only.
     CopyText(String),
+    /// Ask the server for the clipboard it announced with
+    /// [`VncEvent::ClipboardNotify`].
+    ClipboardRequest,
+    /// Tell the server we hold text, without sending it.
+    ///
+    /// The server asks for it with [`VncEvent::ClipboardRequest`] if and when
+    /// something on the remote side pastes.
+    ClipboardNotify,
+    /// Send text to the server's clipboard over the extended clipboard, in UTF-8.
+    ///
+    /// Only legal once [`VncEvent::ClipboardCaps`] has said the server takes a
+    /// `provide`, and unsolicited only within the size it advertised.
+    ClipboardProvide(String),
     /// Ask the server to start or stop pushing updates without being asked.
     ///
     /// Only legal once the server has sent `EndOfContinuousUpdates`, which is its

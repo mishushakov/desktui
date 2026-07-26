@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 use tracing::*;
 
+use super::clipboard;
 use super::messages::{ClientMsg, ServerMsg};
 use crate::rfb::{
     PixelFormat, Rect, ResizeStatus, ScreenInfo, ScreenLayout, VncEncoding, VncError, VncEvent,
@@ -124,7 +125,18 @@ impl VncInner {
             .await?;
 
         trace!("client encodings: {:?}", encodings);
+        let extended_clipboard = encodings.contains(&VncEncoding::ExtendedClipboardPseudo);
         send_client_encoding(&mut stream, encodings, quality, compression).await?;
+
+        // A server that understands the extension answers the `SetEncodings` above with
+        // a `caps` message. Ours goes the other way now: text is the only format a
+        // terminal can hold, and the size of zero says we would rather be told the
+        // clipboard changed than handed a copy of every remote selection.
+        if extended_clipboard {
+            ClientMsg::ExtendedCutText(clipboard::caps())
+                .write(&mut stream)
+                .await?;
+        }
 
         // Start with a non-incremental request. Besides fetching the first frame,
         // this is the only way to learn the screen layout: a server supporting
@@ -199,6 +211,11 @@ impl VncInner {
                 ClientMsg::PointerEvent(mouse.position_x, mouse.position_y, mouse.buttons)
             }
             X11Event::CopyText(text) => ClientMsg::ClientCutText(text),
+            X11Event::ClipboardRequest => ClientMsg::ExtendedCutText(clipboard::request()),
+            X11Event::ClipboardNotify => ClientMsg::ExtendedCutText(clipboard::notify()),
+            X11Event::ClipboardProvide(text) => {
+                ClientMsg::ExtendedCutText(clipboard::provide(&text))
+            }
             X11Event::SetDesktopSize {
                 width,
                 height,
@@ -539,11 +556,13 @@ where
                             })
                             .await?;
                         }
-                        // Both are negotiated through SetEncodings and answered with
-                        // messages, never with rectangles. A server sending one here
-                        // is out of contract, and guessing at a length would lose the
-                        // stream.
-                        VncEncoding::FencePseudo | VncEncoding::ContinuousUpdatesPseudo => {
+                        // All three are negotiated through SetEncodings and answered
+                        // with messages, never with rectangles. A server sending one
+                        // here is out of contract, and guessing at a length would lose
+                        // the stream.
+                        VncEncoding::FencePseudo
+                        | VncEncoding::ContinuousUpdatesPseudo
+                        | VncEncoding::ExtendedClipboardPseudo => {
                             return Err(VncError::General(format!(
                                 "server sent {:?} as a rectangle",
                                 rect.encoding
@@ -562,6 +581,25 @@ where
             ServerMsg::ServerCutText(text) => {
                 output_func(VncEvent::Text(text)).await?;
             }
+            ServerMsg::ExtendedClipboard(msg) => match msg {
+                clipboard::Message::Caps(caps) => {
+                    debug!("server extended clipboard: {caps:?}");
+                    output_func(VncEvent::ClipboardCaps(caps)).await?;
+                }
+                clipboard::Message::Notify { text } => {
+                    output_func(VncEvent::ClipboardNotify { text }).await?;
+                }
+                clipboard::Message::Request => {
+                    output_func(VncEvent::ClipboardRequest).await?;
+                }
+                clipboard::Message::Provide(text) => {
+                    output_func(VncEvent::Text(text)).await?;
+                }
+                // A peek asks us to re-announce what we hold. We never advertised the
+                // action, so a server sending one has gone past its own contract, and
+                // the notify it wants would say nothing new.
+                clipboard::Message::Peek | clipboard::Message::Ignored => {}
+            },
             ServerMsg::EndOfContinuousUpdates => {
                 output_func(VncEvent::EndOfContinuousUpdates).await?;
             }
@@ -928,15 +966,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_extended_clipboard_message_is_refused_not_misread() {
-        // The length is signed, and negative means the extended clipboard
-        // extension. Read as unsigned it becomes four billion, and the client
-        // spends the rest of the session trying to skip that many bytes.
-        let mut stream: &[u8] = &[
-            3, 0, 0, 0, // ServerCutText
-            0xff, 0xff, 0xff, 0xf8, // length = -8
-            0, 0, 0, 1, // flags
-        ];
+    async fn extended_clipboard_messages_become_events_not_four_billion_bytes() {
+        // The length is signed, and negative means the extended clipboard form. Read
+        // as unsigned it becomes four billion, and the client spends the rest of the
+        // session trying to skip that many bytes.
+        let mut caps = (clipboard::flag::CAPS
+            | clipboard::flag::TEXT
+            | clipboard::flag::PROVIDE
+            | clipboard::flag::REQUEST)
+            .to_be_bytes()
+            .to_vec();
+        caps.extend_from_slice(&1024u32.to_be_bytes());
+
+        let mut bytes = Vec::new();
+        for body in [caps, clipboard::notify()] {
+            bytes.extend_from_slice(&[3, 0, 0, 0]); // ServerCutText
+            bytes.extend_from_slice(&(-(body.len() as i32)).to_be_bytes());
+            bytes.extend_from_slice(&body);
+        }
+
+        let mut stream: &[u8] = &bytes;
         let collected = Rc::new(RefCell::new(Vec::new()));
         let sink = |event: VncEvent| {
             let collected = Rc::clone(&collected);
@@ -946,10 +995,22 @@ mod tests {
             }
         };
         let pf = PixelFormat::bgra();
-        let err = read_loop(&mut stream, &pf, &sink).await.unwrap_err();
+        // Both messages are consumed by their lengths, so the loop runs on until the
+        // stream simply ends.
+        let _ = read_loop(&mut stream, &pf, &sink).await;
+
+        let events = collected.borrow();
         assert!(
-            err.to_string().contains("extended clipboard"),
-            "expected a clear refusal, got {err}"
+            matches!(events.first(), Some(VncEvent::ClipboardCaps(caps))
+                if caps.takes_text() && caps.unsolicited_text() == 1024),
+            "{events:?}"
+        );
+        assert!(
+            matches!(
+                events.get(1),
+                Some(VncEvent::ClipboardNotify { text: true })
+            ),
+            "{events:?}"
         );
     }
 

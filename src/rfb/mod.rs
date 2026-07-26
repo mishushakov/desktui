@@ -46,6 +46,7 @@ mod config;
 mod error;
 mod event;
 
+pub use client::clipboard::Caps as ClipboardCaps;
 pub use client::{VncClient, VncConnector};
 pub use config::{PixelFormat, VncEncoding, VncVersion, hint};
 pub use error::VncError;

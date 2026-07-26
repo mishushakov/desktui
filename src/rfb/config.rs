@@ -28,6 +28,13 @@ pub enum VncEncoding {
     /// The client wants updates pushed rather than requested. Requesting this is how
     /// support is discovered: the server answers with `EndOfContinuousUpdates`.
     ContinuousUpdatesPseudo = -313,
+    /// The client understands the extended `ClientCutText` and `ServerCutText`: UTF-8
+    /// instead of Latin-1, and a notify-then-request handshake instead of a push.
+    /// Requesting this is how support is discovered: the server must answer with a
+    /// `caps` message.
+    ///
+    /// 0xc0a1e5ce, which is negative as an `i32` like every other pseudo-encoding.
+    ExtendedClipboardPseudo = -1_063_131_698,
 }
 
 /// Encoding numbers for the quality and compression hints.
@@ -101,6 +108,7 @@ impl TryFrom<u32> for VncEncoding {
             -261 => Ok(VncEncoding::QemuLedStatePseudo),
             -312 => Ok(VncEncoding::FencePseudo),
             -313 => Ok(VncEncoding::ContinuousUpdatesPseudo),
+            -1_063_131_698 => Ok(VncEncoding::ExtendedClipboardPseudo),
             other => Err(UnknownEncoding(other)),
         }
     }

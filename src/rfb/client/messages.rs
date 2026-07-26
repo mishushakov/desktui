@@ -1,3 +1,4 @@
+use super::clipboard;
 use crate::rfb::{MAX_CUT_TEXT, MAX_PAYLOAD, PixelFormat, Rect, ScreenInfo, VncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -9,6 +10,10 @@ pub(super) enum ClientMsg {
     KeyEvent(u32, bool),
     PointerEvent(u16, u16, u8),
     ClientCutText(String),
+    /// A `ClientCutText` in the extended form: the body from [`clipboard`], sent
+    /// under a negative length. Only legal once the server has answered our
+    /// `SetEncodings` with a `caps` message.
+    ExtendedCutText(Vec<u8>),
     SetDesktopSize {
         width: u16,
         height: u16,
@@ -172,6 +177,23 @@ impl ClientMsg {
                 let mut payload = vec![6_u8, 0, 0, 0];
                 payload.write_u32(latin1.len() as u32).await?;
                 payload.write_all(&latin1).await?;
+                writer.write_all(&payload).await?;
+                Ok(())
+            }
+            ClientMsg::ExtendedCutText(body) => {
+                // The same message, with the length negated to say the payload is the
+                // extended form rather than Latin-1 text. The magnitude is the whole
+                // body including its flags word, so it is just the body's length.
+                // Negating a length that does not fit in an `i32` would send a
+                // *positive* one and hand the server our zlib stream as if it were
+                // Latin-1 text. Nothing we build comes close, so this is a guard, not
+                // a case to handle.
+                let len = i32::try_from(body.len()).map_err(|_| {
+                    VncError::General(format!("extended clipboard body of {} bytes", body.len()))
+                })?;
+                let mut payload = vec![6_u8, 0, 0, 0];
+                payload.write_i32(-len).await?;
+                payload.write_all(&body).await?;
                 writer.write_all(&payload).await?;
                 Ok(())
             }
@@ -415,6 +437,16 @@ mod client_msg_tests {
     }
 
     #[tokio::test]
+    async fn an_extended_cut_text_goes_out_under_a_negative_length() {
+        // Same message type as the Latin-1 form; the sign of the length is the only
+        // thing telling the server which one it is reading.
+        let bytes = encode(ClientMsg::ExtendedCutText(vec![1, 2, 3, 4, 5])).await;
+        assert_eq!(bytes[..4], [6, 0, 0, 0]);
+        assert_eq!(i32::from_be_bytes(bytes[4..8].try_into().unwrap()), -5);
+        assert_eq!(bytes[8..], [1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
     async fn cut_text_outside_latin1_is_substituted_rather_than_truncated() {
         // Callers substitute before they get here so they can report how much they
         // changed; this is the floor under them. Truncating `c as u8` would send the
@@ -430,6 +462,8 @@ pub(super) enum ServerMsg {
     // SetColorMapEntries,
     Bell,
     ServerCutText(String),
+    /// A `ServerCutText` in the extended form, marked by a negative length.
+    ExtendedClipboard(clipboard::Message),
     /// The server has stopped pushing updates. Also its way of saying the extension
     /// exists, the first time it arrives.
     EndOfContinuousUpdates,
@@ -509,18 +543,13 @@ impl ServerMsg {
 
                 // The length is *signed*: a negative one means the extended
                 // clipboard extension, whose payload is a different shape
-                // entirely. Reading it as unsigned -- which is the obvious
-                // mistake, and the one upstream made -- turns -8 into four
-                // billion and then spends the rest of the session trying to skip
-                // that many bytes. We never request that extension, so a server
-                // sending it is out of contract.
+                // entirely, and whose magnitude is the byte count. Reading it as
+                // unsigned -- which is the obvious mistake, and the one upstream
+                // made -- turns -8 into four billion and then spends the rest of
+                // the session trying to skip that many bytes.
                 let len = reader.read_i32().await?;
                 if len < 0 {
-                    return Err(VncError::General(
-                        "server sent an extended clipboard message, which was never \
-                         requested"
-                            .into(),
-                    ));
+                    return read_extended_clipboard(reader, len.unsigned_abs() as usize).await;
                 }
                 let len = len as usize;
                 if len > MAX_PAYLOAD {
@@ -568,6 +597,48 @@ impl ServerMsg {
             _ => Err(VncError::WrongServerMessage),
         }
     }
+}
+
+/// Read the body of an extended `ServerCutText`, whose length arrived negative.
+///
+/// `len` is that length's magnitude: the whole body, flags word included.
+async fn read_extended_clipboard<S>(reader: &mut S, len: usize) -> Result<ServerMsg, VncError>
+where
+    S: AsyncRead + Unpin,
+{
+    if len < 4 {
+        return Err(VncError::General(format!(
+            "server declared a {len}-byte extended clipboard message, which cannot \
+             hold its own flags"
+        )));
+    }
+    if len > MAX_PAYLOAD {
+        // As with the legacy form: skipping this would mean reading tens of megabytes
+        // to find the next message boundary, so refusing is the kinder answer.
+        return Err(VncError::General(format!(
+            "server declared a {len}-byte extended clipboard payload"
+        )));
+    }
+    // Read it whole -- the length is bounded above and the flags cannot be understood
+    // in pieces -- but do not let a length past the cap turn into an allocation.
+    let keep = len.min(MAX_CUT_TEXT);
+    let mut body = vec![0; keep];
+    reader.read_exact(&mut body).await?;
+    let mut discard = len - keep;
+    let mut sink = [0u8; 4096];
+    while discard > 0 {
+        let n = discard.min(sink.len());
+        reader.read_exact(&mut sink[..n]).await?;
+        discard -= n;
+    }
+    if len > keep {
+        // A clipboard this large is not one a terminal can do anything with, and the
+        // truncated remainder would decode as a corrupt zlib stream. The stream is
+        // aligned again, so the session continues.
+        tracing::warn!("dropping a {len}-byte remote clipboard");
+        return Ok(ServerMsg::ExtendedClipboard(clipboard::Message::Ignored));
+    }
+    Ok(ServerMsg::ExtendedClipboard(clipboard::decode(&body)?))
 }
 
 #[cfg(test)]
@@ -665,22 +736,62 @@ mod server_msg_tests {
     }
 
     #[tokio::test]
-    async fn a_negative_cut_text_length_is_refused_rather_than_read_as_four_billion() {
-        // The length is signed and a negative one announces the extended clipboard
-        // extension, which we never request. Read as unsigned, -8 becomes 4294967288 and
-        // the client spends the rest of the session trying to skip that many bytes.
+    async fn a_negative_cut_text_length_is_the_extension_not_four_billion_bytes() {
+        // The length is signed, and a negative one announces the extended clipboard
+        // form with abs(length) bytes to follow. Read as unsigned, -8 becomes
+        // 4294967288 and the client spends the rest of the session trying to skip that
+        // many bytes.
+        let body = crate::rfb::client::clipboard::notify();
         let mut bytes = vec![3, 0, 0, 0];
-        bytes.extend_from_slice(&(-8i32).to_be_bytes());
+        bytes.extend_from_slice(&(-(body.len() as i32)).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        match msg {
+            Ok(ServerMsg::ExtendedClipboard(clipboard::Message::Notify { text })) => assert!(text),
+            other => panic!("{other:?}"),
+        }
+        // And the length is what found the next message, so the stream is still aligned.
+        assert_eq!(rest, NEXT_MESSAGE.to_vec());
+    }
+
+    #[tokio::test]
+    async fn an_extended_message_too_short_for_its_flags_is_refused() {
+        // Four bytes of flags is the minimum any of these can be. Less than that and
+        // there is nothing to dispatch on, so guessing would mean reading into
+        // whatever follows.
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&(-3i32).to_be_bytes());
+        bytes.extend_from_slice(&[0, 0, 0]);
 
         let (msg, _) = read(&bytes).await;
 
         match msg {
-            Err(VncError::General(text)) => assert!(
-                text.contains("extended clipboard"),
-                "should name the extension: {text}"
-            ),
+            Err(VncError::General(text)) => assert!(text.contains("flags"), "{text}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_extended_message_past_the_text_cap_is_dropped_but_still_consumed() {
+        // Too large to be a clipboard a terminal can use, and the part we would keep
+        // is half a zlib stream. Drop it, but read all of it: the session survives a
+        // clipboard it cannot hold.
+        let len = MAX_CUT_TEXT + 32;
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&(-(len as i32)).to_be_bytes());
+        bytes.extend_from_slice(&vec![0x11; len]);
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        assert!(matches!(
+            msg,
+            Ok(ServerMsg::ExtendedClipboard(clipboard::Message::Ignored))
+        ));
+        assert_eq!(rest, NEXT_MESSAGE.to_vec());
     }
 
     #[tokio::test]

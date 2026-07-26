@@ -11,7 +11,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::server::{Extensions, FakeServer, Request, Resize};
+use base64::Engine as _;
+use common::server::{
+    EXTENDED_CLIPBOARD_ENCODING, Extensions, FakeServer, REMOTE_CLIPBOARD, Request, Resize,
+};
 use common::session::*;
 use common::*;
 
@@ -448,6 +451,143 @@ fn a_pasted_selection_goes_to_the_remote_clipboard() {
         Request::CutText(text) => assert_eq!(text, "hello there"),
         other => panic!("unexpected request {other:?}"),
     }
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn the_extended_clipboard_brings_cyrillic_back_from_the_remote() {
+    // The point of the extension. Over legacy cut text this arrives as a row of
+    // question marks, because Latin-1 has nowhere to put a Cyrillic letter.
+    let (server, mut term) = start_with(
+        Extensions {
+            extended_clipboard: true,
+            announce_clipboard: true,
+            ..Default::default()
+        },
+        (800, 600),
+        &["--scale", "fit"],
+    );
+    assert_drew(&term, Duration::from_secs(10));
+
+    // The server announced a clipboard without sending it, so the client has to ask.
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::ClipboardRequest
+            ))
+            .is_some(),
+        "the client never asked for the clipboard it was told about"
+    );
+
+    // And what came back went to the local clipboard through OSC 52, in UTF-8.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(REMOTE_CLIPBOARD);
+    assert!(
+        term.wait_for(
+            format!("\x1b]52;c;{encoded}").as_bytes(),
+            Duration::from_secs(10)
+        ),
+        "the remote clipboard never reached the local one: {}",
+        tail(&term.output())
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_pasted_selection_is_announced_first_and_sent_when_asked() {
+    // With the server advertising a zero unsolicited size -- which is what the spec
+    // recommends and what TigerVNC does -- a paste says "I have text" and the bytes
+    // follow only when something over there asks for them.
+    let (server, mut term) = start_with(
+        Extensions {
+            extended_clipboard: true,
+            ..Default::default()
+        },
+        (800, 600),
+        &["--scale", "fit"],
+    );
+    assert_drew(&term, Duration::from_secs(10));
+
+    // Our own capabilities go out during the handshake, before any of this.
+    let caps = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::ClipboardCaps { .. })
+        })
+        .expect("the client never sent its clipboard capabilities");
+    match caps {
+        Request::ClipboardCaps { text_size, .. } => assert_eq!(
+            text_size, 0,
+            "a nonzero size invites the server to push every remote selection"
+        ),
+        other => panic!("unexpected request {other:?}"),
+    }
+
+    term.send("\x1b[200~Привет, мир\x1b[201~".as_bytes());
+
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::ClipboardNotify
+            ))
+            .is_some(),
+        "the paste was never announced"
+    );
+    // The fake server answers a notify with a request, so the text should follow --
+    // whole, which is the other half of what the extension is for.
+    let provided = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::ClipboardProvide(_))
+        })
+        .expect("the announced text never followed");
+    match provided {
+        Request::ClipboardProvide(text) => assert_eq!(text, "Привет, мир"),
+        other => panic!("unexpected request {other:?}"),
+    }
+    // And none of it went out as Latin-1, which is where the question marks came from.
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::CutText(_))),
+        "the paste also went out as legacy cut text"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn no_clipboard_never_offers_the_extension() {
+    // The pseudo-encoding is a standing offer to exchange clipboards. A session that
+    // wants none should not make it, whatever the server would have done with it.
+    let (server, mut term) = start_with(Extensions::default(), (800, 600), &["--no-clipboard"]);
+    assert_drew(&term, Duration::from_secs(10));
+
+    let encodings = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetEncodings(_))
+        })
+        .expect("no encodings were sent");
+    match encodings {
+        Request::SetEncodings(ids) => assert!(
+            !ids.contains(&EXTENDED_CLIPBOARD_ENCODING),
+            "offered the extended clipboard with --no-clipboard: {ids:?}"
+        ),
+        other => panic!("unexpected request {other:?}"),
+    }
+    // And nothing extended was sent either, capabilities included.
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::ClipboardCaps { .. })),
+        "sent clipboard capabilities for an encoding it never asked for"
+    );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
