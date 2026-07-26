@@ -156,6 +156,28 @@ cells, each with its own image id. Only tiles that changed are retransmitted, an
 re-sending an id replaces the image and its placement atomically, so partial updates
 need no delete traffic and never flicker. A one-pixel change costs about a kilobyte.
 
+What "changed" means is asked of each tile rather than tracked centrally: a tile holds a
+key -- where its pixels come from, at what scale, through which filter, from which
+generation of the framebuffer -- and sending is what happens when the key it holds is not
+the key it wants. One comparison covers damage, resizing, panning, a change of scale mode
+and a change of font size, with no case for each. An id names *where a tile sits*, so a
+window that grew by two cells keeps every tile whose pixels are unchanged and a view that
+merely re-centred is moved rather than re-sent: one placement per tile, about forty bytes,
+no pixels at all.
+
+A frame is one write, wrapped in synchronised output, so the terminal shows the frame before
+it or the frame after it and never a screen mid-change. Everything a relayout has to take
+off the screen travels inside the frame that puts the new one up, which is what makes
+resizing smooth rather than a flicker: dragging a window edge never shows a blank. A resize
+does erase the screen's text -- what a terminal leaves on the alternate screen after the
+window changes shape is not something a client can assume -- and it is the same frame that
+says all of it again.
+
+A frame also waits for the update it would be drawing to be whole. The rectangles of one
+framebuffer update are one picture, and half of them on screen is half a scroll position;
+the wait is capped at 250ms per update, because a screen that stands still is worse than one
+with a seam.
+
 Tiles are placed with `z=-1`, below text and above the cell background, so the
 status line and command menu stay readable on top of the remote screen.
 

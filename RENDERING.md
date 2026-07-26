@@ -73,7 +73,17 @@ picture -- a property of the structure rather than a flag to remember to check.
 
 Waiting has a limit. An update whose rectangles take longer to arrive than a frame can
 wait cannot be drawn both whole and often, and a screen standing still is worse than a
-screen with a seam.
+screen with a seam. The limit is 250ms, measured **from the arrival of that update's first
+rectangle** -- the budget is for its rectangles to turn up in, and time the client spent
+idle before it began is not the server being slow with it. Timed from the last frame
+instead, as it first was, an update was charged for the gap ahead of it: a machine busy
+elsewhere between updates drew the seam on one that had arrived perfectly promptly.
+
+The deadline is what makes this hard to test rather than hard to build. Nothing that reaches
+the terminal distinguishes a seam the client was entitled to draw from the bug of drawing
+one it was not, and a loaded machine crosses any wall-clock deadline eventually -- so
+`DESKTUI_MAX_PARTIAL_WAIT_MS` lets a test put the deadline out of reach, or bring it well
+within, and each half of the rule gets a test that can only fail for one reason.
 
 ### Map
 
@@ -151,9 +161,11 @@ about how far the grid was filled.
    frame is one pass over its pixels rather than a pack followed by a copy. An object per
    tile: the protocol would allow one per frame with an offset per tile, five system calls
    instead of five per tile, but see [the offset finding](#the-o-finding).
-4. **Emit**, in this order, into one buffer: drops, chrome erases, moves, sends, chrome
-   draws. Erases precede placements because a terminal may treat clearing a cell as
-   dropping the placement under it.
+4. **Emit**, in this order, into one buffer: drops, the screen erase if this frame adopts a
+   new geometry, the chrome's diff, the re-placements that erase owes, then moves and sends.
+   Anything that clears cells precedes the placements on them, because a terminal may treat
+   clearing a cell as dropping the placement under it -- which is the whole reason the erase
+   is followed by an `a=p` for every tile the terminal still holds.
 5. **Submit** as one write inside `?2026h` … `?2026l`, and update the plane only if the
    writer took it. A frame the writer was too busy for was composed and thrown away; a
    tile recorded as held that was never sent is a hole that survives every later frame.
@@ -254,7 +266,8 @@ Built:
 - no screen erase *outside a frame*: per-id tile drops, and a resize's erase carried into the
   synchronised block that redraws (`src/render/mod.rs`, `src/ui/chrome.rs`, `src/session.rs`)
 - moves as `a=p` for a picture that only shifted (`src/term/kitty.rs`)
-- damage published at the update boundary (`src/session.rs`)
+- damage published at the update boundary, and the wait for one bounded per update rather
+  than per frame (`src/session.rs`)
 - resize rate limit, leading edge (`src/session.rs`)
 - tiles packed straight into the shared memory object the terminal reads, rather than into
   a buffer for a copy to follow (`src/term/shm.rs`, `src/render/framebuffer.rs`) --
@@ -268,8 +281,9 @@ Built:
 - the plane: per-tile content keys in place of a dirty bitmap, a placed extent and a
   layout comparison (`src/render/mod.rs`)
 - the pointer as its own placement, moved with `a=p` and sub-cell `X`/`Y`, above every tile
-  (`src/term/kitty.rs`, `src/render/mod.rs`) -- verified against Ghostty with
-  `make blend-probe` before a line of it was written
+  (`src/term/kitty.rs`, `src/render/mod.rs`) -- the two things it rests on, that an RGBA
+  placement blends over another placement and that `X`/`Y` shift it inside a cell, were put
+  to a real terminal before a line of it was written, Ghostty answering yes to both
 - the chrome as one diffed plane (`src/ui/chrome.rs`), which deleted `Menu::clear`,
   `status::clear`, `Session::clear_menu`, `clear_chrome_drawn_with` and the popup's
   `drawn`/`stale`/`moved` bookkeeping

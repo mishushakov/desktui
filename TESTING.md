@@ -112,7 +112,7 @@ way, and the platform was no coincidence: macOS splits a frame across several pt
 where Linux hands it over in one.
 
 **A duration that is part of the client's behaviour belongs in the arithmetic, not in the
-test's schedule.** The resize debounce really is a quarter of a second, so
+test's schedule.** The resize rate limit really is a tenth of a second, so
 `resize::a_drag_is_still_coalesced_into_a_few_requests` times its drag and works the
 ceiling out from what the drag turned out to be, rather than asserting a fixed count that
 only holds while the steps keep to schedule.
@@ -125,6 +125,27 @@ that runs out of patience the run says what it did and did not establish — on 
 cargo keeps it until someone runs the test themselves — and holds the client to the ceiling
 anyway: the alternative is a red build that says only that a runner was busy, which is what
 had this test `#[ignore]`d to begin with.
+
+**A deadline the client is *allowed* to cross belongs under the test's control.** A frame
+waits for the update it would be drawing to be whole, and past 250ms it draws the seam
+rather than let the screen stand still. No test can prove the right side of that from the
+outside: what reaches the terminal says which rectangles a frame carried, never how long the
+client had waited for them, and a machine loaded enough -- the whole suite in parallel,
+several servers and ptys at once -- crosses any wall-clock deadline eventually. So
+`DESKTUI_MAX_PARTIAL_WAIT_MS` sets it: `a_frame_is_never_composed_from_half_an_update` puts
+it a minute out of reach, so every seam is the client failing to wait, and
+`a_stalled_update_is_drawn_rather_than_left_standing` sets it far under the stall, so a
+screen that stood still is the client failing to give up. Each can fail for one reason. The
+env var is a test seam and says so where it is defined -- it is not a command-line option.
+
+**And a claim about the steady state opens once the session has reached it.** Both of those
+count frames from the moment the bar reports the negotiated size, not from the first frame
+drawn. Until the server has granted the size and the client has adopted it the picture is
+*meant* to be in pieces -- a relayout re-sends what moved, so a frame carrying a single tile
+of the old letterboxed layout is that and not a torn update. Counting through the
+negotiation read one of those as a tear about one full-suite run in three, and the frame
+that failed said so itself: the assertion prints the offending frames, and the placement in
+it was at the letterboxed origin rather than the settled one.
 
 One input can be lost rather than late, and it is worth knowing which: a bracketed paste
 whose first `\x1b` lands alone in a read is delivered as the *Escape key*, that byte being

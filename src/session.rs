@@ -66,6 +66,20 @@ const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
 /// already too slow to keep up.
 const MAX_PARTIAL_WAIT: Duration = Duration::from_millis(250);
 
+/// Overrides [`MAX_PARTIAL_WAIT`], in milliseconds. A seam for the tests, not an option:
+/// a test that means to prove a frame *waits* has to be able to take the deadline off the
+/// table, because nothing on the wire distinguishes a seam the client was entitled to draw
+/// from the bug of drawing one it was not -- and a shared machine under load will cross any
+/// wall-clock deadline eventually. Read once, at the start of a session.
+const PARTIAL_WAIT_ENV: &str = "DESKTUI_MAX_PARTIAL_WAIT_MS";
+
+fn max_partial_wait() -> Duration {
+    std::env::var(PARTIAL_WAIT_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(MAX_PARTIAL_WAIT, Duration::from_millis)
+}
+
 /// How often to measure the round trip, once frames stop being requested.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -286,6 +300,9 @@ struct Session<B: Backend> {
     /// over. Drawing now would put half of one picture on the screen and half of
     /// another -- which on a page being scrolled is half of it at each scroll position.
     mid_update: bool,
+    /// How long that wait is allowed to last: [`MAX_PARTIAL_WAIT`], or whatever
+    /// [`PARTIAL_WAIT_ENV`] said when the session started.
+    max_partial_wait: Duration,
     /// When the update being received started arriving, and how much of the picture it
     /// has carried so far.
     ///
@@ -361,6 +378,7 @@ impl<B: Backend> Session<B> {
             fps: FpsMeter::new(),
             frame_time: Duration::from_micros(1_000_000 / u64::from(args.fps)),
             mid_update: false,
+            max_partial_wait: max_partial_wait(),
             pointer_px: None,
             update_started: None,
             update_pixels: 0,
@@ -1076,7 +1094,7 @@ impl<B: Backend> Session<B> {
         let waited = self
             .update_started
             .map_or(Duration::ZERO, |at| at.elapsed());
-        if self.mid_update && waited < MAX_PARTIAL_WAIT {
+        if self.mid_update && waited < self.max_partial_wait {
             return Ok(());
         }
         self.draw()

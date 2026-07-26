@@ -67,11 +67,30 @@ pub fn start(resize: Resize, remote: (u16, u16)) -> (FakeServer, FakeTerm) {
 
 /// The same, with extensions enabled on the server and extra arguments to the client.
 pub fn start_with(ext: Extensions, remote: (u16, u16), extra: &[&str]) -> (FakeServer, FakeTerm) {
+    start_with_env(ext, remote, extra, &[])
+}
+
+/// As [`start_with`], with environment for the client.
+///
+/// `DESKTUI_MAX_PARTIAL_WAIT_MS` is the one worth knowing about: it is how long a frame
+/// will wait for the update it would be drawing to finish arriving before drawing the seam
+/// instead, which is a deadline no test can prove the right side of. A machine loaded
+/// enough -- the whole suite in parallel, several servers and ptys at once -- crosses any
+/// wall-clock deadline eventually, and what reaches the terminal says which rectangles a
+/// frame carried, never how long the client had waited for them. So a test about the
+/// *waiting* puts the deadline out of reach, and one about the deadline sets it low on
+/// purpose.
+pub fn start_with_env(
+    ext: Extensions,
+    remote: (u16, u16),
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (FakeServer, FakeTerm) {
     let server = FakeServer::start_with(remote.0, remote.1, Resize::Accept, ext);
     let addr = server.addr.to_string();
     let mut args = vec![addr.as_str(), "--fps", "15"];
     args.extend_from_slice(extra);
-    let mut term = FakeTerm::spawn(COLS, ROWS, PIXELS.0, PIXELS.1, &args);
+    let mut term = FakeTerm::spawn_with_env(COLS, ROWS, PIXELS.0, PIXELS.1, &args, env);
     term.answer_probe(GHOSTTY_REPLIES);
     (server, term)
 }

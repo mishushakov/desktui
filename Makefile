@@ -100,10 +100,6 @@ caps:
 pattern:
 	cargo run --release -- --test-pattern
 
-## blend-probe: does this terminal blend one placement over another? (see RENDERING.md)
-blend-probe:
-	@sh docker/blend-probe.sh
-
 # ------------------------------------------------------------------------- checks
 
 ## test: every suite that needs neither a server nor a real terminal

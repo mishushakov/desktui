@@ -114,22 +114,16 @@ pub struct Extensions {
 
 /// How long [`Extensions::split_updates`] stalls between the two rectangles of an
 /// update -- several frame intervals, so a client pacing its own frames cannot help but
-/// tick in the middle of one.
+/// tick in the middle of one. That is the whole requirement: a stall no tick falls inside
+/// proves nothing about what a client does when one does.
 ///
-/// It has to stay well under the client's `MAX_PARTIAL_WAIT` of 250ms, which is how long
-/// a frame will wait for an update before drawing the seam rather than let the screen
-/// stand still. A stall near that is one the client is entitled to tear on, and a test
-/// cannot tell that seam from the bug: what is on the wire says which rectangles a frame
-/// carried, never how long the client had been waiting.
-///
-/// So it is squeezed from both sides -- long enough that the client's own frame clock
-/// cannot help but strike inside one, short enough that striking is never something it is
-/// allowed to draw on. A hundred milliseconds is several frame intervals and two and a half
-/// times under the cap, which the client measures from the first rectangle of the update
-/// arriving: the same window this stall sits in, so the margin is real rather than a hope
-/// about how busy the machine is. Going much lower stops the test working: at fifty it
-/// passes with the client's boundary check taken out, the frame clock no longer reliably
-/// falling inside a stall at all.
+/// It says nothing about whether the client is *allowed* to draw inside a stall. That is a
+/// deadline, and a test cannot tell a seam the client was entitled to from the bug of
+/// drawing one it was not -- what reaches the terminal says which rectangles a frame
+/// carried, never how long the client had waited. So the deadline is set explicitly by the
+/// tests that care, through `DESKTUI_MAX_PARTIAL_WAIT_MS`: out of reach for the one that
+/// means to prove the waiting, and far under this stall for the one that means to prove the
+/// deadline still fires.
 pub const SPLIT_STALL: Duration = Duration::from_millis(100);
 
 /// The corners the two halves of a split update paint, in pixels from the origin.

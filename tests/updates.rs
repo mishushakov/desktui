@@ -26,15 +26,27 @@ fn a_frame_is_never_composed_from_half_an_update() {
     // screen is one update, that is half of it at the new scroll position and half at the
     // old. Which is what it looks like: blocks all over the screen, misplaced, until the
     // scrolling stops and one whole update lands.
-    let (_server, mut term) = start_with(
+    //
+    // The client's own deadline is put out of reach for the run: it may draw a seam rather
+    // than let the screen stand still, and a machine loaded enough will cross any wall-clock
+    // deadline. With it out of the way every seam below is the client failing to wait, which
+    // is the claim. `a_stalled_update_is_drawn_rather_than_left_standing` is the other half.
+    let (_server, mut term) = start_with_env(
         Extensions {
             split_updates: true,
             ..Default::default()
         },
         (1024, 768),
         &[],
+        &[("DESKTUI_MAX_PARTIAL_WAIT_MS", "60000")],
     );
-    assert_drew(&term, Duration::from_secs(10));
+    // From the settled session on, not from the first frame. Until the server has granted
+    // the size and the client has adopted it, the picture on screen is *meant* to be in
+    // pieces: a relayout re-sends what moved, and a frame carrying one tile of the old
+    // letterboxed layout is that, not a torn update. Measuring through the negotiation read
+    // one of those as a tear about one run in ten.
+    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(10));
+    let settled = term.output().len();
     // A good many stalls' worth, so every tick that wanted to draw inside one has had its
     // chance. The pacing is off the end of each update, so these run back to back.
     std::thread::sleep(SPLIT_STALL * 10);
@@ -46,14 +58,18 @@ fn a_frame_is_never_composed_from_half_an_update() {
     let second = [tile_id(SPLIT_SECOND), tile_id((SPLIT_SECOND.0, 320))];
     let out = term.output();
     let (mut whole, mut half) = (0, 0);
-    for block in blocks(&out) {
+    let mut torn = Vec::new();
+    for block in blocks(&out[settled..]) {
         let drew_first = contains(block, transmit(first).as_bytes());
         let drew_second = second
             .iter()
             .any(|id| contains(block, transmit(*id).as_bytes()));
         match (drew_first, drew_second) {
             (true, true) => whole += 1,
-            (true, false) | (false, true) => half += 1,
+            (true, false) | (false, true) => {
+                half += 1;
+                torn.push(show(&block[..block.len().min(400)]));
+            }
             (false, false) => {}
         }
     }
@@ -67,8 +83,55 @@ fn a_frame_is_never_composed_from_half_an_update() {
         0,
         "{half} frames carried one half of an update without the other, out of \
          {} that carried any of it. A frame has to wait for the update it is drawing \
-         to be over.",
-        whole + half
+         to be over. The frames in question:\n{}",
+        whole + half,
+        torn.join("\n\n")
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn a_stalled_update_is_drawn_rather_than_left_standing() {
+    // The other side of the rule above. Waiting for an update to be whole cannot be
+    // unconditional: a server that takes half a second over one would freeze the screen for
+    // half a second, and a seam is the lesser evil. So the wait has a deadline, and past it
+    // the client draws what it holds.
+    //
+    // Set well under the stall here, where every other test puts it out of reach, so the
+    // deadline is certain to be crossed inside every stall rather than merely likely to be.
+    let (_server, mut term) = start_with_env(
+        Extensions {
+            split_updates: true,
+            ..Default::default()
+        },
+        (1024, 768),
+        &[],
+        &[("DESKTUI_MAX_PARTIAL_WAIT_MS", "20")],
+    );
+    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(10));
+    let settled = term.output().len();
+    std::thread::sleep(SPLIT_STALL * 10);
+
+    let first = tile_id(SPLIT_FIRST);
+    let second = [tile_id(SPLIT_SECOND), tile_id((SPLIT_SECOND.0, 320))];
+    let out = term.output();
+    let half = blocks(&out[settled..])
+        .into_iter()
+        .filter(|block| {
+            let drew_first = contains(block, transmit(first).as_bytes());
+            let drew_second = second
+                .iter()
+                .any(|id| contains(block, transmit(*id).as_bytes()));
+            drew_first != drew_second
+        })
+        .count();
+    assert!(
+        half > 0,
+        "no frame was drawn inside a stall, so the screen stood still for every one of \
+         them instead: {}",
+        tail(&out)
     );
 
     quit(&mut term);
