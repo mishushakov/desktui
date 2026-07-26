@@ -164,6 +164,13 @@ pub enum X11Event {
     PointerEvent(Pointer),
     /// Send text to the server's clipboard, the legacy way. Latin-1 only.
     CopyText(String),
+    /// Tell the server what we accept on the extended clipboard.
+    ///
+    /// The reply to [`VncEvent::ClipboardCaps`], and only ever that: a server which
+    /// never sent its own caps has not agreed to the extension, and an extended
+    /// message carries a negative length that such a server may treat as a protocol
+    /// error. This is also the first extended message we may send.
+    ClipboardCaps,
     /// Ask the server for the clipboard it announced with
     /// [`VncEvent::ClipboardNotify`].
     ClipboardRequest,
