@@ -59,6 +59,14 @@ const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// incremental request instantly cannot spin us at full speed.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
 
+/// How long a frame will wait for the update it would be drawing to finish arriving.
+///
+/// Past this it draws anyway. An update whose rectangles take longer than this to
+/// arrive cannot be drawn whole *and* often, and a screen that stands still is worse
+/// than one that shows a seam: the choice only comes up when the link or the server is
+/// already too slow to keep up.
+const MAX_PARTIAL_WAIT: Duration = Duration::from_millis(250);
+
 /// How often to measure the round trip, once frames stop being requested.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -147,7 +155,7 @@ pub async fn run<C: Connect>(
         };
 
         let mut session = Session::new(args, caps, backend).await?;
-        let result = session.run(args).await;
+        let result = session.run().await;
         // Let go of anything held on the remote before leaving, so a modifier does
         // not stay stuck in whatever had focus over there.
         session.release_input().await;
@@ -270,6 +278,13 @@ struct Session<B: Backend> {
     toast: Toast,
 
     fps: FpsMeter,
+    /// How long a frame is allowed, from `--fps`. What the render tick is paced by, and
+    /// what says whether a frame is owed when an update finishes arriving.
+    frame_time: Duration,
+    /// A rectangle of the update being received has been applied and the update is not
+    /// over. Drawing now would put half of one picture on the screen and half of
+    /// another -- which on a page being scrolled is half of it at each scroll position.
+    mid_update: bool,
     last_stats: FrameStats,
     dropped: u64,
     pending_metrics: Option<Instant>,
@@ -329,6 +344,8 @@ impl<B: Backend> Session<B> {
             show_stats: false,
             toast: Toast::default(),
             fps: FpsMeter::new(),
+            frame_time: Duration::from_micros(1_000_000 / u64::from(args.fps)),
+            mid_update: false,
             last_stats: FrameStats::default(),
             dropped: 0,
             pending_metrics: None,
@@ -337,9 +354,9 @@ impl<B: Backend> Session<B> {
         })
     }
 
-    async fn run(&mut self, args: &Args) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         let mut terminal = EventStream::new();
-        let mut ticker = interval(Duration::from_micros(1_000_000 / u64::from(args.fps)));
+        let mut ticker = interval(self.frame_time);
         // Falling behind should drop frames, not queue them up to be raced
         // through later.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -363,6 +380,14 @@ impl<B: Backend> Session<B> {
     }
 
     async fn on_update(&mut self, update: Update) -> Result<()> {
+        // Anything that changes the picture opens an update, and `FrameEnd` closes it. The
+        // rectangles between the two are one picture and belong on the screen together.
+        if matches!(
+            update,
+            Update::Bgra(..) | Update::Jpeg(..) | Update::Copy { .. }
+        ) {
+            self.mid_update = true;
+        }
         match update {
             Update::Bgra(rect, data) => {
                 if let Some(damage) = self.fb.apply_bgra(convert(rect), &data) {
@@ -413,6 +438,15 @@ impl<B: Backend> Session<B> {
                 // whole frame interval, which roughly halves the rate a moving
                 // picture can reach.
                 self.request_update().await?;
+
+                // And now the picture is whole, so draw it -- rather than leaving it to a
+                // tick, which would add latency for nothing. The render tick's job is to
+                // pace this, not to choose the moment: a frame is owed only if one has not
+                // gone out inside the last frame interval.
+                self.mid_update = false;
+                if self.fps.since_last() >= self.frame_time {
+                    self.draw()?;
+                }
             }
             Update::Clipboard(text) => {
                 if !self.no_clipboard {
@@ -999,6 +1033,13 @@ impl<B: Backend> Session<B> {
             self.send(Input::Refresh { incremental: true }).await?;
         }
 
+        // A frame drawn in the middle of an update is half of one picture and half of
+        // another. The rectangles still arriving are the rest of this one, and the end of
+        // it draws -- so there is nothing to do here but wait, up to the point where
+        // waiting is worse than the seam.
+        if self.mid_update && self.fps.since_last() < MAX_PARTIAL_WAIT {
+            return Ok(());
+        }
         self.draw()
     }
 

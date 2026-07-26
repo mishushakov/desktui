@@ -11,9 +11,95 @@ mod common;
 
 use std::time::Duration;
 
-use common::server::{EXTENDED_CLIPBOARD_ENCODING, Extensions, FakeServer, Request, Resize};
+use common::server::{
+    EXTENDED_CLIPBOARD_ENCODING, Extensions, FakeServer, Request, Resize, SPLIT_FIRST,
+    SPLIT_SECOND, SPLIT_STALL,
+};
 use common::session::*;
 use common::*;
+
+#[test]
+fn a_frame_is_never_composed_from_half_an_update() {
+    // The rectangles of one update are one picture, and they arrive one at a time. A
+    // client that draws whatever it holds when its own clock strikes puts the first
+    // rectangle on screen without the second -- and on a scrolling page, where the whole
+    // screen is one update, that is half of it at the new scroll position and half at the
+    // old. Which is what it looks like: blocks all over the screen, misplaced, until the
+    // scrolling stops and one whole update lands.
+    let (_server, mut term) = start_with(
+        Extensions {
+            split_updates: true,
+            ..Default::default()
+        },
+        (1024, 768),
+        &[],
+    );
+    assert_drew(&term, Duration::from_secs(10));
+    // A good many stalls' worth, so every tick that wanted to draw inside one has had its
+    // chance. The pacing is off the end of each update, so these run back to back.
+    std::thread::sleep(SPLIT_STALL * 10);
+
+    // 1:1 over a desktop resized to the terminal, so a remote pixel is a terminal pixel
+    // and the tiles are 128x136 of them: the first rectangle is tile 0,0 and the second
+    // spans tiles 2,1 and 2,2.
+    let first = tile_id(SPLIT_FIRST);
+    let second = [tile_id(SPLIT_SECOND), tile_id((SPLIT_SECOND.0, 320))];
+    let out = term.output();
+    let (mut whole, mut half) = (0, 0);
+    for block in blocks(&out) {
+        let drew_first = contains(block, transmit(first).as_bytes());
+        let drew_second = second
+            .iter()
+            .any(|id| contains(block, transmit(*id).as_bytes()));
+        match (drew_first, drew_second) {
+            (true, true) => whole += 1,
+            (true, false) | (false, true) => half += 1,
+            (false, false) => {}
+        }
+    }
+    assert!(
+        whole > 0,
+        "no frame ever carried an update whole: {}",
+        tail(&out)
+    );
+    assert_eq!(
+        half,
+        0,
+        "{half} frames carried one half of an update without the other, out of \
+         {} that carried any of it. A frame has to wait for the update it is drawing \
+         to be over.",
+        whole + half
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+/// The image id of the tile covering a pixel, for the 1:1 layout the session harness
+/// negotiates: 8x17 cells make tiles of 128x136, numbered by where they sit.
+fn tile_id((x, y): (u16, u16)) -> u32 {
+    const BASE: u32 = 0x7600;
+    const STRIDE: u32 = 512;
+    BASE + u32::from(y / 136) * STRIDE + u32::from(x / 128)
+}
+
+/// The transmit command for an image id, which is what says a tile reached the screen --
+/// as opposed to the delete that precedes it, which names the same id.
+fn transmit(id: u32) -> String {
+    format!("i={id},p=1,s=")
+}
+
+/// Everything between a begin-sync marker and its end, which is one frame.
+fn blocks(out: &[u8]) -> Vec<&[u8]> {
+    let mut found = Vec::new();
+    for open in offsets(out, BEGIN_SYNC) {
+        let from = open + BEGIN_SYNC.len();
+        if let Some(len) = find(&out[from..], END_SYNC) {
+            found.push(&out[from..from + len]);
+        }
+    }
+    found
+}
 
 #[test]
 fn keeps_at_most_one_update_request_in_flight() {

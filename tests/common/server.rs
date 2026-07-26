@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How a server answers `SetDesktopSize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +103,23 @@ pub struct Extensions {
     /// Announce that clipboard with a `notify` as soon as the extension is up, the way
     /// a server does when a selection is made on the remote desktop.
     pub announce_clipboard: bool,
+    /// Answer every incremental request with one update carrying two rectangles far
+    /// apart, and stall between them.
+    ///
+    /// What a real server does under load, only slower: the rectangles of one update
+    /// are one picture, and they arrive one at a time. A scrolling page sends the whole
+    /// screen this way, and half of it applied is half a scroll position.
+    pub split_updates: bool,
 }
+
+/// How long [`Extensions::split_updates`] stalls between the two rectangles of an
+/// update -- several frame intervals, so a client pacing its own frames cannot help but
+/// tick in the middle of one.
+pub const SPLIT_STALL: Duration = Duration::from_millis(200);
+
+/// The corners the two halves of a split update paint, in pixels from the origin.
+pub const SPLIT_FIRST: (u16, u16) = (0, 0);
+pub const SPLIT_SECOND: (u16, u16) = (256, 256);
 
 /// What the fake server has on its clipboard.
 ///
@@ -224,6 +240,7 @@ fn serve(
     send_server_init(&mut stream, width, height)?;
 
     let mut pending_forward: Option<(u16, u16)> = None;
+    let mut splits: u8 = 0;
 
     while !stop.load(Ordering::SeqCst) {
         let mut kind = [0u8; 1];
@@ -319,6 +336,9 @@ fn serve(
                         send_extended_desktop_size(&mut stream, width, height, 0, 0)?;
                     }
                     send_full_frame(&mut stream, width, height)?;
+                } else if extensions.split_updates {
+                    splits = splits.wrapping_add(1);
+                    send_split_frame(&mut stream, &stop, splits)?;
                 }
             }
             4 => {
@@ -641,6 +661,58 @@ fn send_extended_desktop_size(
     msg.extend_from_slice(&0x8000_0001u32.to_be_bytes()); // flags, incl. an unknown bit
     stream.write_all(&msg)?;
     stream.flush()
+}
+
+/// One update of two rectangles far apart, with a stall between them.
+///
+/// The header says two, so the update is not over until both have arrived. A client that
+/// draws whatever it happens to hold when its own clock strikes will put the first
+/// rectangle on the screen without the second -- which is what half a scroll position
+/// looks like.
+fn send_split_frame(
+    stream: &mut TcpStream,
+    stop: &Arc<AtomicBool>,
+    nth: u8,
+) -> std::io::Result<()> {
+    const SIDE: u16 = 64;
+    let mut head = vec![0, 0];
+    head.extend_from_slice(&2u16.to_be_bytes());
+    stream.write_all(&head)?;
+
+    for (i, (x, y)) in [SPLIT_FIRST, SPLIT_SECOND].into_iter().enumerate() {
+        if i > 0 {
+            // Split across the stall on purpose, and in pieces, so a client cannot
+            // accidentally receive the whole update in one read.
+            let waited = Instant::now();
+            while waited.elapsed() < SPLIT_STALL {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&x.to_be_bytes());
+        msg.extend_from_slice(&y.to_be_bytes());
+        msg.extend_from_slice(&SIDE.to_be_bytes());
+        msg.extend_from_slice(&SIDE.to_be_bytes());
+        msg.extend_from_slice(&0i32.to_be_bytes()); // Raw
+        // A different colour every time, and a different one per half: a client only
+        // draws what changed, so an update that repaints the same pixels is an update
+        // that asks for no frame at all.
+        let shade = nth.wrapping_mul(17).wrapping_add(1);
+        let bgra: [u8; 4] = if i == 0 {
+            [0, shade, 0, 0xff]
+        } else {
+            [shade, 0, 0, 0xff]
+        };
+        for _ in 0..(u32::from(SIDE) * u32::from(SIDE)) {
+            msg.extend_from_slice(&bgra);
+        }
+        stream.write_all(&msg)?;
+        stream.flush()?;
+    }
+    Ok(())
 }
 
 /// A raw rectangle in the top-left corner, enough to give the client something
