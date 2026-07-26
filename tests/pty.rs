@@ -457,12 +457,15 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
     common::assert_a_relayout_never_blanks_the_screen(&term, 0);
 
     // And it stays that way: the rows the bar left do not come back, and the row it is on
-    // keeps saying what it says. Nothing asserts that the bar is *rewritten*, because an
-    // unchanged cell is not written at all any more -- only the figures move, and only those
-    // cells go out.
-    std::thread::sleep(Duration::from_millis(400));
-    let latest = term.output();
-    let settled = Screen::replay(&latest, 200, 50);
+    // keeps saying what it says. Whole frames, so that the rest of one composed at the old
+    // size cannot be read as a repaint at it. Nothing asserts that the bar is *rewritten*,
+    // because an unchanged cell is not written at all any more -- only the figures move, and
+    // only those cells go out, which is why the row is read off the screen rather than
+    // grepped for in the stream.
+    let since = term
+        .drawn_after(out.len(), 3, Duration::from_secs(10))
+        .expect("the client stopped drawing after the last resize");
+    let settled = Screen::replay(&term.output(), 200, 50);
     for old_row in [24, 36] {
         assert!(
             settled.row(old_row - 1).is_empty(),
@@ -475,10 +478,9 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
         "the bar left the last row: {:?}",
         settled.row(49)
     );
-    let tail = &latest[out.len().min(latest.len())..];
     for stale in [&b"\x1b[24;1H"[..], b"\x1b[36;1H"] {
         assert!(
-            !contains(tail, stale),
+            !contains(&since, stale),
             "still writing to an old status row: {}",
             String::from_utf8_lossy(stale)
         );

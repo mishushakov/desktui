@@ -19,6 +19,35 @@ use common::server::{Extensions, FakeServer, Request, Resize};
 use common::session::*;
 use common::*;
 
+/// The client's `RESIZE_INTERVAL`: how long one resize that has been applied holds the
+/// next off, a drag being answered while it happens rather than once it ends. Written down
+/// rather than imported, the client being a binary, so a change there has to be echoed
+/// here -- and `a_single_resize_is_acted_on_at_once` is what would notice if it were not.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// What the tail of a drag adds to the span its requests fall in: a debounce for the
+/// trailing edge, and a frame and a round trip for the granted size to be reported. Only
+/// used to see the ceiling coming while a drag is still going on -- the assertion is made
+/// against the span that actually elapsed.
+const SETTLING: Duration = Duration::from_millis(400);
+
+/// How many `SetDesktopSize` requests a drag whose answers all fall inside `window` is
+/// allowed to have produced.
+///
+/// Applications fall a debounce apart at the closest -- applying one shuts the leading edge
+/// for that long, and the trailing edge waits for the newest resize to be that old -- so no
+/// two of them fit inside one window, and a request takes an application. A request can go
+/// out later than the application that earned it, the reply to the one in flight being
+/// where a skipped ask is picked up, but that moves a request rather than adding one.
+///
+/// Plus one beyond that, and not because the arithmetic needs it: the client really does
+/// use its whole allowance, and the difference worth seeing here is the one between a
+/// handful of requests and one per step, not between three and four. A ceiling with no room
+/// in it fails the day a detail of the rhythm turns out to have been read wrong.
+fn ceiling(window: Duration) -> usize {
+    window.div_duration_f64(RESIZE_DEBOUNCE) as usize + 2
+}
+
 /// Live counterpart: `live::tigervnc_grants_the_terminals_exact_pixel_size`.
 #[test]
 fn negotiates_the_terminals_exact_pixel_size() {
@@ -525,12 +554,17 @@ fn a_single_resize_is_acted_on_at_once() {
 
 /// Live counterpart: `live::a_dragged_resize_settles_without_any_input`.
 #[test]
-// The coalescing it checks for only happens while the resizes arrive faster than
-// the rate limit, so a runner that stretches the 30ms steps defeats the
-// thing under test rather than finding a fault in it. Run it with --ignored.
-#[ignore = "wall-clock sensitive: unreliable on shared CI runners"]
 fn a_drag_is_still_coalesced_into_a_few_requests() {
     // The flip side: acting at once must not turn a drag into one request per frame.
+    //
+    // What the client promises is one resize applied per debounce window and no more:
+    // applying one shuts the leading edge for a debounce, and the trailing edge waits for
+    // the newest resize to be a debounce old, so two applications can never fall inside
+    // one window. That makes the ceiling a function of how long the drag lasted, which is
+    // why the drag is timed and the number worked out from it. A fixed count instead --
+    // twenty steps, at most six requests -- is a claim about the machine as much as the
+    // client: stretch the steps past the debounce and each one settles on its own,
+    // failing a client that did exactly what it promised.
     let (server, mut term) = start(Resize::Accept, (1024, 768));
     assert!(
         server
@@ -547,13 +581,44 @@ fn a_drag_is_still_coalesced_into_a_few_requests() {
         .filter(|r| matches!(r, Request::SetDesktopSize { .. }))
         .count();
 
-    // Twenty size changes in under a second, as dragging an edge produces.
-    for step in 1..=20u16 {
-        let cols = 100 + step;
+    // Resize at about the rate a dragged window edge does, and keep going until the steps
+    // outnumber the ceiling they will be judged against.
+    //
+    // How many fit inside a window is the machine's business, and it varies more than seems
+    // reasonable: a 16ms sleep has been seen to take 125ms on a loaded runner, which is two
+    // steps to a window where a quiet machine manages fifteen. Two per window is still a
+    // drag, but a short drag of them settles nothing -- a client asking once per step would
+    // not have exceeded the ceiling either -- and dragging on until it would is the same
+    // claim without the machine in it. `SETTLING` stands in for the tail the real window
+    // adds while the projection is being made; the assertion below uses what elapsed.
+    let began = std::time::Instant::now();
+    let mut steps = 0u16;
+    let mut conclusive = false;
+    while began.elapsed() < Duration::from_secs(4) {
+        steps += 1;
+        let cols = 100 + steps;
         term.resize(cols, 25, cols * 8, 425);
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(16));
+        let far_enough = began.elapsed() >= 3 * RESIZE_DEBOUNCE;
+        if far_enough && usize::from(steps) > ceiling(began.elapsed() + SETTLING) + 3 {
+            conclusive = true;
+            break;
+        }
     }
-    std::thread::sleep(Duration::from_secs(1));
+    let drag = began.elapsed();
+
+    // The last size is the one it has to settle on, and its arriving is also how we know
+    // the whole drag has been answered. 25 rows of 17 pixels, less the status row, is 408.
+    let settled = format!("{}x408", (100 + steps) * 8);
+    assert_reports_size(&term, &settled, Duration::from_secs(10));
+
+    // Every request the drag could produce went out inside here: the first resize opens
+    // it, and the last one to be applied is the one whose answer has just been reported --
+    // a resize applied after that asks for nothing, the desktop already being the size it
+    // wants. Measured to the answer rather than to the last ioctl, because the client sees
+    // a resize when it gets round to the signal, which on a busy machine is later than the
+    // sending of it; a ceiling worked out from the drag alone would be short by that much.
+    let window = began.elapsed();
 
     let asks = server
         .requests()
@@ -561,14 +626,29 @@ fn a_drag_is_still_coalesced_into_a_few_requests() {
         .filter(|r| matches!(r, Request::SetDesktopSize { .. }))
         .count()
         - before;
-    // Twenty steps over six hundred milliseconds, thinned to one every hundred: seven at
-    // the very most, and one more for the size it settles on.
+
+    let allowed = ceiling(window);
     assert!(
-        asks <= 8,
-        "a drag should coalesce into a handful of requests, not one per step: saw {asks}"
+        asks <= allowed,
+        "a drag of {drag:?} in {steps} steps should coalesce into at most {allowed} \
+         requests, not one per step: saw {asks}"
     );
-    // And the last size still has to be the one it settles on.
-    assert_reports_size(&term, "960x408", Duration::from_secs(10));
+
+    // Whether this run could have caught a client asking once per step at all: with fewer
+    // steps than the ceiling allows, one per step would have stayed under it. The loop
+    // drags on until that is not so, and a machine slow enough to reach its limit anyway
+    // has said everything it can -- the ceiling above still held of it. Reported rather
+    // than asserted, because failing the build over how a shared runner was scheduled is
+    // what had this test out of CI in the first place; a red build there says only that a
+    // runner was busy. Cargo keeps the line for whoever runs the test themselves, `--
+    // --nocapture` or a failure being what brings it out.
+    if !conclusive || usize::from(steps) <= allowed {
+        eprintln!(
+            "note: {steps} resizes in {drag:?}, against a ceiling of {allowed} requests -- \
+             this run held the client to the ceiling without being able to catch one that \
+             asked per step"
+        );
+    }
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));

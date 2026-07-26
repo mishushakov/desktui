@@ -23,11 +23,19 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::{Condvar, LazyLock};
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_desktui");
+
+/// The escape that opens a frame. The client wraps each draw in synchronised output,
+/// so one of these begins everything a single frame has to say.
+///
+/// Only for the terminals that answer for mode 2026, which is every one here bar
+/// [`PLAIN_REPLIES`]: without the answer there is no wrapper to count.
+pub const FRAME: &[u8] = b"\x1b[?2026h";
 
 /// Image id 1893 is 0x765, the id the client probes with.
 pub const GHOSTTY_REPLIES: &[u8] = b"\x1b_Gi=1893;OK\x1b\\\
@@ -100,7 +108,11 @@ pub struct FakeTerm {
     child: Child,
     master: std::fs::File,
     pub seen: Arc<Mutex<Vec<u8>>>,
-    _slave: OwnedFd,
+    /// Set by the drain thread when the pty has run dry, which cannot happen while a
+    /// slave fd is still open. See [`FakeTerm::settle`].
+    drained: Arc<AtomicBool>,
+    /// Our own end of the slave, closed to let the drain thread reach end-of-file.
+    slave: Option<OwnedFd>,
 }
 
 impl FakeTerm {
@@ -187,16 +199,19 @@ impl FakeTerm {
 
         // Drain continuously, the way a terminal does.
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let drained = Arc::new(AtomicBool::new(false));
         let mut reader = std::fs::File::from(master.try_clone().unwrap());
         let sink = Arc::clone(&seen);
+        let done = Arc::clone(&drained);
         std::thread::spawn(move || {
             let mut chunk = [0u8; 16384];
             loop {
                 match reader.read(&mut chunk) {
-                    Ok(0) | Err(_) => break, // child gone; EIO is the usual report
+                    Ok(0) | Err(_) => break, // no slave left; EIO is the usual report
                     Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
                 }
             }
+            done.store(true, Ordering::Release);
         });
 
         Self {
@@ -204,7 +219,8 @@ impl FakeTerm {
             child,
             master: std::fs::File::from(master),
             seen,
-            _slave: slave,
+            drained,
+            slave: Some(slave),
         }
     }
 
@@ -231,6 +247,62 @@ impl FakeTerm {
             std::thread::sleep(Duration::from_millis(10));
         }
         contains(&self.output(), needle)
+    }
+
+    /// Wait for `needle` to appear at or after `from`, and answer with where it ended.
+    ///
+    /// The offset back is what makes these compose: a claim about what the client did
+    /// *next* begins where the evidence for the last one finished.
+    pub fn wait_for_after(&self, from: usize, needle: &[u8], timeout: Duration) -> Option<usize> {
+        let start = Instant::now();
+        loop {
+            let out = self.output();
+            if let Some(at) = find(&out[from.min(out.len())..], needle) {
+                return Some(from + at + needle.len());
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Everything drawn from the first frame to begin at or after `from`, once `frames`
+    /// of them have begun.
+    ///
+    /// This is what a claim about what is *no longer* on the screen needs. Marking the
+    /// output, sleeping and reading the tail looks like the same thing and is not: that
+    /// window opens wherever the last read happened to end, which is usually partway
+    /// through a frame the client had already composed -- before it had seen the
+    /// keystroke, and so evidence about nothing. Opening on a frame boundary instead,
+    /// and waiting for the frames rather than hoping they fit inside a fixed sleep,
+    /// asks what the client drew once it knew.
+    ///
+    /// `None` if the frames never came, which is a failure worth reporting rather than
+    /// passing over: an empty window satisfies an absence assertion for want of
+    /// evidence rather than because of it.
+    pub fn drawn_after(&self, from: usize, frames: usize, timeout: Duration) -> Option<Vec<u8>> {
+        let start = Instant::now();
+        loop {
+            let out = self.output();
+            let mut at = from.min(out.len());
+            let mut first = None;
+            let mut seen = 0;
+            while let Some(next) = find(&out[at..], FRAME) {
+                at += next + FRAME.len();
+                first.get_or_insert(at - FRAME.len());
+                seen += 1;
+            }
+            if let Some(first) = first
+                && seen >= frames
+            {
+                return Some(out[first..].to_vec());
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Answer the capability probe once it arrives.
@@ -263,11 +335,17 @@ impl FakeTerm {
     }
 
     /// Wait for the child to exit, killing it if it overstays.
+    ///
+    /// A status back means the output is complete as well as the process: see
+    /// [`Self::settle`].
     pub fn wait(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
         let start = Instant::now();
         while start.elapsed() < timeout {
             match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status),
+                Ok(Some(status)) => {
+                    self.settle();
+                    return Some(status);
+                }
                 Ok(None) => std::thread::sleep(Duration::from_millis(20)),
                 Err(_) => return None,
             }
@@ -275,6 +353,25 @@ impl FakeTerm {
         let _ = self.child.kill();
         let _ = self.child.wait();
         None
+    }
+
+    /// Wait for the pty to run dry, the child that was filling it having gone.
+    ///
+    /// `try_wait` answers about the process, not about the pty. The last things the
+    /// client says are the teardown and the line explaining why it stopped, and those
+    /// can still be in the buffer when it exits, so a test that reads the output the
+    /// moment it does sometimes misses the end of them. Closing our own end of the
+    /// slave leaves nothing that could add more, so the drain thread reads to
+    /// end-of-file and finishes -- and its finishing is the same statement as
+    /// "everything that was said has arrived".
+    fn settle(&mut self) {
+        drop(self.slave.take());
+        let began = Instant::now();
+        // Capped, because a test hung here would say nothing at all about what it was
+        // checking, where one that goes on asserts against what did arrive.
+        while !self.drained.load(Ordering::Acquire) && began.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
