@@ -225,34 +225,10 @@ make perf           # time the compose pipeline
 ```
 
 The protocol layer is vendored rather than a dependency — [`src/rfb/README.md`](src/rfb/README.md)
-says why, and what was fixed on the way in.
+says why, and what was fixed on the way in. [`TESTING.md`](TESTING.md) describes the test
+suites and which of them needs what.
 
-Every integration suite runs the real binary inside a pty that the test drives,
-answering capability queries the way Ghostty does and then inspecting the escape stream
-it produces. They differ in what else is real.
-
-[`tests/pty.rs`](tests/pty.rs) adds nothing: it is the terminal boundary on its own —
-the probe round trip, geometry from `TIOCGWINSZ`, the setup and teardown sequences,
-shared memory, and whether frames come out at all.
-
-Four suites add a fake VNC server, so a whole session is verified without Docker. They
-are split by subject rather than by machinery: [`resize.rs`](tests/resize.rs) for size
-negotiation and every way a server can answer it, [`input.rs`](tests/input.rs) for
-keyboard, pointer and clipboard, [`updates.rs`](tests/updates.rs) for encodings and how
-the frame stream is paced, [`lifecycle.rs`](tests/lifecycle.rs) for connecting, losing
-the connection and leaving the terminal as it was found.
-
-The decoders are tested where they live, in `src/rfb/codec/`, against rectangles built
-byte by byte — every Tight filter and ZRLE subencoding, and the refusals that keep a
-malformed one from becoming a panic.
-
-[`tests/live.rs`](tests/live.rs) is the one that catches what the others cannot: it runs
-the binary against **TigerVNC serving a real XFCE desktop**, so real Tight encoding,
-real JPEG rectangles, and a real answer to `SetDesktopSize`. Most of its tests name the
-fake-server test they are the counterpart to, and the claims they share are written once
-in `tests/common/session.rs` — a pair is only worth having if both halves check the same
-thing, and the live half is `#[ignore]`d, so nothing else would say when they drifted.
-It needs the container:
+The live suite needs the container:
 
 ```
 make desktop
