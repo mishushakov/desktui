@@ -211,6 +211,8 @@ Built:
 - one shared memory object per frame, `O=`/`S=` offsets, packed straight into the mapping
   (`src/term/shm.rs`, `src/render/framebuffer.rs`) -- 1.5 ms/frame to 0.7 on a full-screen
   update, measured by `make perf`
+- shared memory swept by presence and a byte budget rather than a deadline
+  (`src/term/shm.rs`)
 
 Not built, in the order worth doing:
 
@@ -220,8 +222,5 @@ Not built, in the order worth doing:
 - **the cursor as a placement** with `X`/`Y`, replacing `blend_cursor`.
 - **the chrome as one diffed plane**, replacing `Toast`'s own stale-cell bookkeeping,
   `clear_menu`, and `status::clear`.
-- **shared memory swept by a byte budget**, not a five hundred millisecond timer: an
-  object that still exists is one the terminal has not read yet, so a deadline is the
-  wrong rule.
 - **`Fence` as flow control**, so pushed frames can be bounded instead of declined
   wholesale with `--no-push`.
