@@ -15,7 +15,7 @@ pub mod testpattern;
 
 use crate::cli::ScaleMode;
 use crate::term::Metrics;
-use crate::term::kitty::{IMAGE_ID_BASE, KittyEncoder, Placement};
+use crate::term::kitty::{IMAGE_ID_BASE, KittyEncoder, Placement, delete_image};
 use crate::term::shm::ShmPool;
 use framebuffer::Framebuffer;
 use scale::{Filter, Scaler};
@@ -408,32 +408,37 @@ impl Renderer {
 
     /// Adopt a new layout, redrawing everything.
     ///
-    /// Returns escape bytes to write before the next frame: the screen has to be
-    /// wiped, not merely repainted over. Text does not move when the grid changes, so
-    /// the status line drawn on the old last row stays exactly where it was, and a
-    /// window that grows accumulates one stale line per size it passed through.
-    /// Placements are equally stubborn: they belong to cells, and the tile covering a
-    /// cell stays until something says otherwise.
+    /// Returns escape bytes to write before the next frame: the tiles the new grid has
+    /// no place for. Placements belong to the cells they were made at rather than to
+    /// the tile that made one, so a tile the grid has dropped stays on screen until it
+    /// is deleted by id.
     ///
-    /// Every tile is retransmitted immediately after this, so dropping all of them
-    /// costs only the bytes.
+    /// The tiles the grid *does* have a place for need nothing. Every one of them is
+    /// retransmitted immediately after this, and a transmission replaces the image and
+    /// moves its placement, so none is left where it used to be. Erasing the screen to
+    /// be sure of that is what a resize used to cost: an erase takes the chrome with it
+    /// and every pixel has to travel again to put it back.
+    ///
+    /// The stale *text* is not this layer's to erase -- it has drawn none -- and belongs
+    /// to whoever owns the chrome. `ui::status::clear` and `Menu::clear` are that.
     ///
     /// A layout equal to the one in force is left alone. One resize settles through
     /// several paths -- the debounce, the request that follows it, the server's reply,
     /// the re-check after that -- and all but the first arrive with the geometry they
-    /// are asking for already adopted. Wiping the screen to redraw the same pixels is
-    /// the flicker, so the ones with nothing to say are not allowed to.
+    /// are asking for already adopted. Redrawing the same pixels is the flicker, so the
+    /// ones with nothing to say are not allowed to.
     pub fn relayout(&mut self, layout: Layout) -> Vec<u8> {
         if layout == self.layout {
             return Vec::new();
         }
         let grid = TileGrid::new(&layout);
         let mut cleanup = Vec::new();
-        // Text first, then images, so this does not depend on whether a given
-        // terminal treats an erase as also clearing placements.
-        cleanup.extend_from_slice(b"\x1b[2J");
-        KittyEncoder::delete_all(&mut cleanup);
-        self.placed = 0;
+        for idx in grid.len()..self.placed {
+            delete_image(&mut cleanup, IMAGE_ID_BASE + idx as u32);
+        }
+        // What is left in the terminal's image store: the ids the new grid covers,
+        // whether or not they have been drawn at their new size yet.
+        self.placed = self.placed.min(grid.len());
 
         self.layout = layout;
         self.grid = grid;
@@ -1103,10 +1108,12 @@ mod tests {
     }
 
     #[test]
-    fn a_relayout_wipes_the_screen_before_redrawing() {
-        // Growing the terminal used to leave the old status line behind on the row
-        // that used to be the last one, one stale line per size passed through, plus
-        // whatever placements the old grid had put in cells the new grid does not use.
+    fn a_grid_that_only_grows_has_nothing_to_clean_up() {
+        // A resize used to erase the screen and delete every image, which is a blank
+        // terminal for as long as the frame that fills it back in takes to compose. The
+        // tiles a growing grid keeps need neither: each is retransmitted at its new size
+        // immediately after, and a transmission replaces the image and moves its
+        // placement, so none of them is left where it used to be.
         let m = ghostty();
         let (w, h) = m.image_area();
         let mut r = Renderer::new(
@@ -1123,14 +1130,7 @@ mod tests {
         let (bw, bh) = bigger.image_area();
         let cleanup = r.relayout(Layout::compute(&bigger, ScaleMode::Native, bw, bh, (0, 0)));
         let text = String::from_utf8(cleanup).unwrap();
-        assert!(
-            text.contains("\x1b[2J"),
-            "the screen was not erased: {text:?}"
-        );
-        assert!(
-            text.contains("a=d,d=A"),
-            "the old placements were not dropped: {text:?}"
-        );
+        assert_eq!(text, "", "a bigger grid drops no tiles");
         assert!(r.has_work(), "everything has to be redrawn afterwards");
         assert_eq!(r.dirty_tiles(), r.tile_count());
     }
@@ -1157,7 +1157,10 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_the_grid_drops_every_image() {
+    fn shrinking_the_grid_drops_the_images_it_has_no_place_for() {
+        // The other half: a tile the new grid does not reach is never retransmitted, so
+        // nothing would move its placement off the cells it is on. Those are named one by
+        // one, which is the whole difference between this and erasing the screen.
         let m = ghostty();
         let (w, h) = m.image_area();
         let big = Layout::compute(&m, ScaleMode::Native, w, h, (0, 0));
@@ -1166,15 +1169,30 @@ mod tests {
         let fb = Framebuffer::new(w, h);
         let mut out = Vec::new();
         let stats = r.compose(&fb, &mut out);
-        assert_eq!(stats.tiles, r.tile_count());
+        let before = r.tile_count();
+        assert_eq!(stats.tiles, before);
         r.commit();
 
         let small = Layout::compute(&m, ScaleMode::Fit, 64, 64, (0, 0));
         let cleanup = r.relayout(small);
         let text = String::from_utf8(cleanup).unwrap();
+        let after = r.tile_count();
+        assert!(after < before, "the grid was supposed to shrink");
         assert!(
-            text.contains("a=d,d=A"),
-            "expected a delete-all, got {text:?}"
+            !text.contains("d=A") && !text.contains("\x1b[2J"),
+            "the screen must not be erased wholesale: {text:?}"
+        );
+        for idx in after..before {
+            let id = IMAGE_ID_BASE + idx as u32;
+            assert!(
+                text.contains(&format!("a=d,d=I,i={id},")),
+                "tile {idx} was left on the screen: {text:?}"
+            );
+        }
+        assert_eq!(
+            text.matches("a=d").count(),
+            before - after,
+            "only the dropped tiles are deleted: {text:?}"
         );
         assert!(r.has_work(), "a relayout must redraw everything");
     }

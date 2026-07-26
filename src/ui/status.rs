@@ -1,5 +1,7 @@
 //! The status line.
 
+use std::io::Write as _;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -59,6 +61,23 @@ pub fn draw(
     }
 
     write_cells(out, &buf);
+}
+
+/// Blank the row `metrics` would draw the bar on.
+///
+/// For the row a *previous* set of metrics drew it on: the bar sits on the last row, and
+/// text does not move when the grid does, so a window that grew keeps the old bar on
+/// what is now an interior row -- over the image, glyphs being drawn above placements.
+/// One stale line per size a drag passed through, before this.
+///
+/// The reset comes first because an erase fills with the current background, and the
+/// background in force is the bar's own: without it the row would be blanked in the
+/// colour that makes it look like a bar.
+pub fn clear(out: &mut Vec<u8>, metrics: &Metrics) {
+    if metrics.cols == 0 || metrics.rows == 0 {
+        return;
+    }
+    let _ = write!(out, "\x1b[0m\x1b[{};1H\x1b[2K", metrics.rows);
 }
 
 #[cfg(test)]

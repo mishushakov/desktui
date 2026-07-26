@@ -172,6 +172,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     }
                 }
                 Event::Resize(_, _) => {
+                    let was = metrics;
                     metrics = Metrics::query()?;
                     let (w, h) = metrics.image_area();
                     area_w = w;
@@ -179,14 +180,26 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     pattern.resize(area_w, area_h);
                     fb.resize(area_w, area_h);
                     pattern.paint_all(&mut fb);
+
+                    // The chrome that is text stays on the cells it was written to, so it
+                    // is erased at the geometry it was drawn with. Ahead of the tiles: a
+                    // cell erased here is one a tile is free to be placed under after.
+                    // Only a window that grew: a bar on the row it is already on overwrites
+                    // itself, and one that shrank went with the rows the terminal dropped.
+                    if was.rows < metrics.rows {
+                        status::clear(&mut pending_cleanup, &was);
+                    }
+                    if show_menu || clear_menu {
+                        menu.clear(&mut pending_cleanup, &was);
+                        clear_menu = false;
+                    }
+
                     let layout = Layout::compute(&metrics, args.scale, area_w, area_h, (0, 0));
                     let cleanup = renderer.relayout(layout);
-                    // Held for the next frame rather than written now. The bytes are the
-                    // same full-screen wipe every time, so a second resize before that
-                    // frame goes out has nothing to add.
-                    if !cleanup.is_empty() && pending_cleanup.is_empty() {
-                        pending_cleanup = cleanup;
-                    }
+                    // Held for the next frame rather than written now, and appended: a
+                    // relayout names the tiles it has dropped, and a second one before
+                    // that frame goes out names different ones.
+                    pending_cleanup.extend_from_slice(&cleanup);
                 }
                 _ => {}
             }

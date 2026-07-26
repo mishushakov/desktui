@@ -193,16 +193,6 @@ impl KittyEncoder {
         out.extend_from_slice(self.b64.as_bytes());
         out.extend_from_slice(b"\x1b\\");
     }
-
-    /// Delete every image and free the data behind it.
-    ///
-    /// Used when the layout changes: every tile is about to be retransmitted, so
-    /// the old ones are only in the way. The teardown sequence in `term::mod` spells
-    /// the same command out by hand, because it has to work from a panic handler
-    /// where there is no encoder to call.
-    pub fn delete_all(out: &mut Vec<u8>) {
-        out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\");
-    }
 }
 
 /// Let go of an image's current placement, keeping the image data.

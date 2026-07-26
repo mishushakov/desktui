@@ -317,35 +317,44 @@ pub fn offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
     found
 }
 
-/// The screen erase a layout change begins with.
-pub const ERASE: &[u8] = b"\x1b[2J";
-/// Synchronised output, which the frame carrying an erase has to be wrapped in.
+/// Erasing the whole screen, which a layout change is never allowed to need.
+pub const ERASE_SCREEN: &[u8] = b"\x1b[2J";
+/// The two narrower ways of taking something off the screen: a row of text, and one
+/// image and the data behind it.
+pub const ERASE_ROW: &[u8] = b"\x1b[2K";
+pub const DELETE_IMAGE: &[u8] = b"a=d,d=I";
+/// Synchronised output. Everything a layout change takes off the screen has to be
+/// inside a block that puts the new one there.
 pub const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
 pub const END_SYNC: &[u8] = b"\x1b[?2026l";
 
-/// Nothing said since `before` erased the screen outside a synchronised block, and the
-/// block that erased it redrew it.
+/// A layout change since `before` never left the screen blank.
 ///
-/// A layout change has to erase the screen and drop every placement, because text and
-/// placements alike stay on the cells they were written to. On its own that erase is a
-/// blank screen lasting until the next frame composes -- one flicker per resize, and a
-/// resize settles through several paths. Inside the frame that fills the screen back in,
-/// the terminal shows one layout or the other and never neither.
+/// Text and placements alike stay on the cells they were written to when the grid
+/// changes shape, so a relayout has to take the stale ones off. It used to do that by
+/// erasing the whole screen and deleting every image -- and to write that on its own,
+/// ahead of the frame that fills the screen back in, so the terminal was blank until the
+/// next one composed. Twice or three times over, a resize settling through several paths.
 ///
-/// `before` has to be an offset past the setup sequence, whose own erase is the
-/// alternate screen being entered and has nothing to redraw yet.
+/// Two claims, then. The screen is never erased wholesale: a relayout names the rows and
+/// the images it is actually taking, and everything else is replaced where it stands. And
+/// what it does take, it takes inside the synchronised block that redraws -- so the
+/// terminal shows one layout or the other and never neither.
+///
+/// `before` has to be an offset past the setup sequence, whose own erase is the alternate
+/// screen being entered and has nothing to redraw yet.
 ///
 /// Both loops make this claim -- the session and the test pattern -- so it is written
 /// once here rather than twice.
 #[track_caller]
-pub fn assert_the_wipe_rides_with_the_redraw(term: &FakeTerm, before: usize) {
+pub fn assert_a_relayout_never_blanks_the_screen(term: &FakeTerm, before: usize) {
     // A frame is written in one go, but a snapshot can still catch one mid-write, so
-    // wait for the block that carries the erase to be there in full.
+    // wait for a block carrying tiles to be there in full.
     let mut out = term.output();
     for _ in 0..500 {
         let whole = {
             let seen = &out[before..];
-            find(seen, ERASE).is_some_and(|wipe| find(&seen[wipe..], END_SYNC).is_some())
+            find(seen, session::DREW).is_some_and(|drew| find(&seen[drew..], END_SYNC).is_some())
         };
         if whole {
             break;
@@ -355,36 +364,34 @@ pub fn assert_the_wipe_rides_with_the_redraw(term: &FakeTerm, before: usize) {
     }
 
     let seen = &out[before..];
-    let wipes = offsets(seen, ERASE);
     assert!(
-        !wipes.is_empty(),
-        "the new layout never wiped the old one: {}",
+        contains(seen, session::DREW),
+        "the new layout was never drawn: {}",
         show(seen)
     );
+    assert!(
+        !contains(seen, ERASE_SCREEN),
+        "a layout change erased the whole screen: {}",
+        show(seen)
+    );
+
     let opens = offsets(seen, BEGIN_SYNC);
     let closes = offsets(seen, END_SYNC);
-    for wipe in &wipes {
-        let open = opens.iter().copied().rfind(|o| o < wipe);
-        let close = closes.iter().copied().rfind(|c| c < wipe);
-        // `None < Some(_)`, so an erase with an open marker before it and no close
-        // since is inside the block.
-        assert!(
-            open.is_some() && close < open,
-            "an erase at {wipe} is not inside a synchronised block \
-             (last open {open:?}, last close {close:?}): {}",
-            show(seen)
-        );
+    for taken in [ERASE_SCREEN, ERASE_ROW, DELETE_IMAGE] {
+        for at in offsets(seen, taken) {
+            let open = opens.iter().copied().rfind(|o| *o < at);
+            let close = closes.iter().copied().rfind(|c| *c < at);
+            // `None < Some(_)`, so something with an open marker before it and no close
+            // since is inside the block.
+            assert!(
+                open.is_some() && close < open,
+                "{} at {at} is not inside a synchronised block \
+                 (last open {open:?}, last close {close:?}): {}",
+                show(taken),
+                show(seen)
+            );
+        }
     }
-
-    // And the tiles that fill the screen back in are in there with it: an erase alone,
-    // however atomic, is still a blank screen.
-    let wipe = wipes[0];
-    let end = wipe + find(&seen[wipe..], END_SYNC).expect("the erasing block never closed");
-    assert!(
-        contains(&seen[wipe..end], session::DREW),
-        "the block that erased the screen did not redraw it: {}",
-        show(&seen[wipe..end])
-    );
 }
 
 /// The readable part of the output, for assertion messages: escape-heavy tails are

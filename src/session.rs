@@ -937,6 +937,7 @@ impl<B: Backend> Session<B> {
         {
             self.pending_metrics = None;
             self.metrics_applied_at = Some(Instant::now());
+            let was = self.metrics;
             self.metrics = Metrics::query()?;
             tracing::debug!(
                 "applying resize after {:?}: {}x{} cells, {}x{} px",
@@ -946,6 +947,7 @@ impl<B: Backend> Session<B> {
                 self.metrics.px_w,
                 self.metrics.px_h
             );
+            self.clear_chrome_drawn_with(&was);
             self.relayout();
             if self.mode == ScaleMode::Native
                 || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
@@ -1212,12 +1214,43 @@ impl<B: Backend> Session<B> {
             self.pan,
         );
         let cleanup = self.renderer.relayout(layout);
-        // Held for the next frame rather than written now. The bytes are the same
-        // full-screen wipe every time, so a second relayout before that frame goes out
-        // has nothing to add.
-        if !cleanup.is_empty() && self.pending_cleanup.is_empty() {
-            self.pending_cleanup = cleanup;
+        // Held for the next frame rather than written now, and appended: a relayout
+        // names the tiles it has dropped, and a second one before that frame goes out
+        // names different ones. Each lowers what the renderer believes is placed, so no
+        // id is named twice.
+        self.pending_cleanup.extend_from_slice(&cleanup);
+    }
+
+    /// Erase the chrome that a previous set of metrics put on the screen.
+    ///
+    /// Text stays on the cells it was written to when the grid changes shape, and both
+    /// pieces of chrome that are text -- the bar, and the menu if it is up -- have to be
+    /// erased at the geometry they were drawn with rather than the one just adopted.
+    /// Queued ahead of the tiles, so a cell erased here is one a tile is free to be
+    /// placed under afterwards.
+    ///
+    /// The notification popup takes itself off: it remembers the rectangle it drew in
+    /// absolute cells and blanks that on the next frame, and being told it has moved is
+    /// all it needs to treat the old one as stale.
+    fn clear_chrome_drawn_with(&mut self, was: &Metrics) {
+        let mut cleanup = Vec::new();
+        // Only a window that grew. A bar redrawn on the row it is already on overwrites
+        // itself, every cell of it, and one that shrank took the row the bar was on with
+        // it -- where a cursor move would clamp to the row the new bar is about to be
+        // drawn on and erase that instead.
+        if was.rows < self.metrics.rows {
+            status::clear(&mut cleanup, was);
         }
+        if self.show_menu || self.clear_menu {
+            self.menu.clear(&mut cleanup, was);
+            // Cleared where it was; a menu still up is redrawn where it now belongs in
+            // the same frame, and one on its way out is now off the screen for good.
+            self.clear_menu = false;
+        }
+        self.pending_cleanup.extend_from_slice(&cleanup);
+        // The relayout that follows marks every tile, so the repair it asks for is
+        // already coming.
+        let _ = self.toast.moved();
     }
 
     async fn send(&self, input: Input) -> Result<()> {

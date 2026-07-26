@@ -191,6 +191,24 @@ impl Toast {
         self.showing.is_some()
     }
 
+    /// The geometry the box was drawn with has changed, so the cells it is on are not the
+    /// cells it belongs on: the popup is anchored to the top right, which a window of a
+    /// different width puts somewhere else. Whatever it drew becomes stale and is blanked
+    /// on the next frame, which then draws it where it now belongs.
+    ///
+    /// True with the same meaning as [`Toast::show`]'s: cells were left behind, so the
+    /// remote screen under them has to be drawn again. A relayout marks everything
+    /// anyway, but saying so is not this type's business to assume.
+    pub fn moved(&mut self) -> bool {
+        match self.drawn.take() {
+            Some(area) => {
+                self.stale = Some(area);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn take_down(&mut self) -> bool {
         self.showing = None;
         // Or the next note would arrive with its button already lit, before the pointer
@@ -691,6 +709,40 @@ mod tests {
                 .iter()
                 .all(|(.., text)| text.chars().count() == usize::from(width)),
             "the erase has to cover the box that was drawn, not the one replacing it"
+        );
+    }
+
+    #[test]
+    fn a_note_that_moved_blanks_the_cells_it_was_on() {
+        // The box is anchored to the top right, so a window of another width puts it
+        // somewhere else -- and the note stays up across a resize. Nothing else would take
+        // the old one off: a relayout no longer erases the screen, and the box that is
+        // drawn where it now belongs does not reach where it was.
+        let wide = metrics(80, 24);
+        let (mut toast, _) = shown(&wide, "still up");
+        assert!(toast.moved(), "the box that was drawn was not taken off");
+
+        let mut out = Vec::new();
+        toast.clear(&mut out);
+        let blanked = rows(&out);
+        let was = area(&wide, "still up").expect("the box did not fit");
+        assert_eq!(blanked.len(), usize::from(was.height));
+        assert!(
+            blanked
+                .iter()
+                .all(|(.., text)| text.chars().count() == usize::from(was.width)),
+            "the erase has to cover the box as it was drawn"
+        );
+        assert!(toast.is_live(), "the note itself is still up");
+    }
+
+    #[test]
+    fn a_note_that_never_reached_the_screen_has_not_moved() {
+        let mut toast = Toast::default();
+        toast.show("never drawn".into());
+        assert!(
+            !toast.moved(),
+            "nothing reached the screen, so nothing has to be taken off it"
         );
     }
 

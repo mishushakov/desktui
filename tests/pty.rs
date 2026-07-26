@@ -232,12 +232,18 @@ fn a_resize_relayouts_and_releases_the_old_images() {
         "status line did not move to the new last row: {}",
         show(&term.output())
     );
-    // A layout change drops every placement and redraws, rather than picking out
-    // the orphans: the whole grid is retransmitted anyway, and leaving the rest in
-    // place is what left stale rows on screen when the window grew.
+    // The tiles the smaller grid has no place for are named one by one. Nothing else has
+    // to be: a tile the grid still reaches is retransmitted, and that moves its placement
+    // where it belongs. Deleting every image instead is a blank screen for as long as the
+    // frame that fills it back in takes to compose.
     assert!(
-        term.wait_for(b"a=d,d=A", Duration::from_secs(5)),
-        "a resize should release the old placements: {}",
+        term.wait_for(b"a=d,d=I,i=", Duration::from_secs(5)),
+        "the dropped tiles were never deleted: {}",
+        show(&term.output())
+    );
+    assert!(
+        !contains(&term.output(), b"d=A"),
+        "a resize must not delete every image: {}",
         show(&term.output())
     );
     // And the new geometry has to be what it draws at.
@@ -369,18 +375,25 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
         );
     }
 
-    // Every relayout has to erase the screen and drop the old placements, or the
-    // rows the status line used to occupy keep their text for ever.
+    // Each relayout has to blank the row the bar was on, or that row keeps its text for
+    // ever -- over the image, glyphs being drawn above placements. The row itself, not the
+    // screen: erasing everything to be rid of one line is a blank terminal until the frame
+    // that redraws it composes.
     let out = term.output();
-    assert!(
-        count(&out, b"\x1b[2J") >= 3,
-        "expected an erase per layout change, saw {}",
-        count(&out, b"\x1b[2J")
-    );
-    assert!(
-        count(&out, b"a=d,d=A") >= 2,
-        "expected the old placements to be dropped on each resize, saw {}",
-        count(&out, b"a=d,d=A")
+    for old_row in [24, 36] {
+        let erase = format!("\x1b[{old_row};1H\x1b[2K");
+        assert!(
+            contains(&out, erase.as_bytes()),
+            "row {old_row} was never blanked after the bar left it: {}",
+            show(&out)
+        );
+    }
+    assert_eq!(
+        count(&out, b"\x1b[2J"),
+        1,
+        "the only erase of the whole screen is the setup sequence entering the \
+         alternate screen; a relayout added one: {}",
+        show(&out)
     );
 
     // And after the last resize, the only status row still being written is the new
@@ -406,11 +419,11 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
 }
 
 #[test]
-fn the_wipe_a_resize_needs_travels_with_the_frame_that_redraws() {
-    // The pattern loop erases and redraws exactly as a session does, so it has the same
-    // way to get it wrong: writing that erase on its own is a blank screen that lasts
-    // until the next frame composes. Its session counterpart is
-    // `resize::the_wipe_a_resize_needs_travels_with_the_frame_that_redraws`.
+fn a_resize_never_blanks_the_screen() {
+    // The pattern loop relayouts exactly as a session does, so it has the same ways to
+    // get it wrong: erasing the whole screen for it, and writing that erase on its own
+    // ahead of the frame that redraws. Its session counterpart is
+    // `resize::a_resize_never_blanks_the_screen`.
     let mut term = FakeTerm::spawn(80, 24, 640, 408, &["--test-pattern", "--fps", "20"]);
     term.answer_probe(GHOSTTY_REPLIES);
     // The image area in the status line, 8x17 cells over 23 usable rows. Not a cursor
@@ -431,7 +444,7 @@ fn the_wipe_a_resize_needs_travels_with_the_frame_that_redraws() {
         "the new size never reached the status line: {}",
         show(&term.output())
     );
-    assert_the_wipe_rides_with_the_redraw(&term, before);
+    assert_a_relayout_never_blanks_the_screen(&term, before);
 
     term.send(b"q");
     term.wait(Duration::from_secs(10));

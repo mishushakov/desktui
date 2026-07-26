@@ -101,24 +101,33 @@ fn asks_for_the_new_size_when_the_terminal_is_resized() {
 }
 
 #[test]
-fn the_wipe_a_resize_needs_travels_with_the_frame_that_redraws() {
-    // A layout change erases the screen and drops every placement, because text and
-    // placements both stay on the cells they were written to. Written on its own that
-    // erase is a blank screen that lasts until the next frame composes -- a flicker per
-    // resize, and a resize settles through several paths. Inside the frame that fills
-    // the screen back in, the terminal shows one layout or the other and never neither.
+fn a_resize_never_blanks_the_screen() {
+    // A relayout takes the stale rows and images off the screen, because text and
+    // placements both stay on the cells they were written to. It used to take the whole
+    // screen, in a write of its own ahead of the frame that fills it back in -- so the
+    // terminal was blank until that frame composed, several times over per resize.
     let (_server, mut term) = start(Resize::Accept, (1024, 768));
     assert_drew(&term, Duration::from_secs(10));
 
     // Everything from here on is the resize: the erase in the setup sequence, which is
     // the alternate screen being entered and has nothing to redraw, is behind us.
     let before = term.output().len();
-    term.resize(100, 25, 800, 425);
+    // Grown, which is the direction that leaves the bar behind: the row it was on is an
+    // interior one now, and the glyphs on it are drawn above the image.
+    term.resize(220, 60, 1760, 1020);
     // The new size in the status line, not a cursor move to the new last row: the rows
     // tiles are placed on are cursor moves too, and one of them is the row that used to
     // be a quarter of the way down.
-    assert_reports_size(&term, "800x408", Duration::from_secs(10));
-    assert_the_wipe_rides_with_the_redraw(&term, before);
+    assert_reports_size(&term, "1760x1002", Duration::from_secs(10));
+    assert_a_relayout_never_blanks_the_screen(&term, before);
+
+    let out = term.output();
+    let erase = format!("\x1b[{ROWS};1H\x1b[2K");
+    assert!(
+        contains(&out[before..], erase.as_bytes()),
+        "the row the bar was on was never blanked: {}",
+        show(&out[before..])
+    );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
