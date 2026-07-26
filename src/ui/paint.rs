@@ -8,12 +8,41 @@
 
 use std::io::Write as _;
 
-use ratatui::buffer::{Buffer, CellWidth};
+#[cfg(test)]
+use ratatui::buffer::Buffer;
+use ratatui::buffer::{Cell, CellWidth};
 use ratatui::style::{Color, Modifier, Style};
 
+/// Write out the cells a diff says have changed, and nothing else.
+///
+/// `updates` is what `Buffer::diff` produces: the cells that differ, in reading order,
+/// with the tails of wide glyphs already left out. Positioning follows the same rule as
+/// [`write_cells`] -- one cursor move per run of adjacent cells, a fresh one after any gap
+/// -- because a diff is mostly runs and paying for a move per cell would double it.
+pub(super) fn write_diff(out: &mut Vec<u8>, updates: &[(u16, u16, &Cell)]) {
+    let mut current: Option<Style> = None;
+    let mut after: Option<(u16, u16)> = None;
+    for (x, y, cell) in updates {
+        if after != Some((*x, *y)) {
+            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
+        }
+        if current != Some(cell.style()) {
+            write_style(out, cell.style());
+            current = Some(cell.style());
+        }
+        out.extend_from_slice(cell.symbol().as_bytes());
+        after = Some((x + cell.cell_width().max(1), *y));
+    }
+    if !updates.is_empty() {
+        out.extend_from_slice(b"\x1b[0m");
+    }
+}
+
 /// Write every cell of `buf` out at the position it was laid out for.
+#[cfg(test)]
 pub(super) fn write_cells(out: &mut Vec<u8>, buf: &Buffer) {
     let area = buf.area;
+    let before = out.len();
     let mut current: Option<Style> = None;
     for y in area.top()..area.bottom() {
         // One cursor move per run of cells, and a fresh one after any gap.
@@ -51,7 +80,9 @@ pub(super) fn write_cells(out: &mut Vec<u8>, buf: &Buffer) {
             covered = width - 1;
         }
     }
-    out.extend_from_slice(b"\x1b[0m");
+    if out.len() > before {
+        out.extend_from_slice(b"\x1b[0m");
+    }
 }
 
 /// Emit a style, from a clean slate each time.

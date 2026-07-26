@@ -247,43 +247,45 @@ fn the_statistics_say_what_the_other_end_is_doing() {
     std::thread::sleep(Duration::from_millis(50));
     term.send(b"c");
     assert!(
-        term.wait_for(b"up/s", Duration::from_secs(10)),
+        wait_for_text(&term, "up/s", Duration::from_secs(10)),
         "the bar never reported an update rate: {}",
-        tail(&term.output())
+        Screen::of(&term.output()).row(49)
     );
     // Long enough for the rolling window to hold several stalls.
     std::thread::sleep(SPLIT_STALL * 6);
 
-    let out = term.output();
-    let (rate, delivery) = last_delivery(&out).expect("no delivery figures in the bar");
+    let bar = Screen::of(&term.output()).row(49);
+    let (rate, delivery) = delivery_figures(&bar).expect("no delivery figures in the bar");
     assert!(
         (2.0..8.0).contains(&rate),
         "expected about five updates a second from a {SPLIT_STALL:?} stall, bar said \
-         {rate}: {}",
-        tail(&out)
+         {rate}: {bar:?}"
     );
     // Measured from the first rectangle *arriving*, where the server's stall starts before
     // it writes one, so this reads a few milliseconds under the stall rather than over it.
     assert!(
         delivery + 20 >= SPLIT_STALL.as_millis() as u32,
         "an update split across a {SPLIT_STALL:?} stall cannot have been delivered in \
-         {delivery}ms: {}",
-        tail(&out)
+         {delivery}ms: {bar:?}"
     );
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
 }
 
-/// The update rate and per-update delivery time from the last time the bar was drawn.
-fn last_delivery(out: &[u8]) -> Option<(f64, u32)> {
-    let text = String::from_utf8_lossy(out);
-    let at = text.rfind("up/s")?;
-    let before = &text[..at];
-    // "  4.9 up/s   215ms /up" -- the rate runs back to the space before it, and the
-    // delivery is the next figure along.
-    let rate: f64 = before.rsplit(' ').find(|s| !s.is_empty())?.parse().ok()?;
-    let after = &text[at + "up/s".len()..];
+/// The update rate and per-update delivery time, read off the bar.
+///
+/// From the screen rather than the stream: every figure in the bar changes every frame, so
+/// what reaches the terminal is the digits that differ and a cursor move between them.
+fn delivery_figures(bar: &str) -> Option<(f64, u32)> {
+    // "  4.9 up/s   215ms /up"
+    let at = bar.find("up/s")?;
+    let rate: f64 = bar[..at]
+        .rsplit(' ')
+        .find(|s| !s.is_empty())?
+        .parse()
+        .ok()?;
+    let after = &bar[at + "up/s".len()..];
     let ms: u32 = after
         .split("ms")
         .next()?

@@ -18,6 +18,12 @@ use common::server::{
 use common::session::*;
 use common::*;
 
+/// The menu's backdrop image. It is deleted when the box goes and not otherwise, which is
+/// how a test asks whether the menu is still up: an idle menu writes nothing at all now,
+/// its cells being unchanged from the frame before, so a tail that still mentions it is no
+/// longer evidence of anything.
+const MENU_GONE: &[u8] = b"a=d,d=I,i=292352";
+
 #[test]
 fn input_reaches_the_server_with_pixel_exact_coordinates() {
     let (server, mut term) = start(Resize::Accept, (1024, 768));
@@ -104,13 +110,12 @@ fn the_command_menu_holds_the_focus_until_escape() {
         "the menu never appeared"
     );
 
-    // An ordinary key changes nothing. It is redrawn every frame while it is up, so
-    // a tail that still mentions it is the box still being there.
+    // An ordinary key changes nothing, so the box is neither redrawn nor taken down.
     let mark = term.output().len();
     term.send(b"\x1b[120u");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
-        contains(&term.output()[mark..], b"Renegotiate the remote size"),
+        !contains(&term.output()[mark..], MENU_GONE),
         "an ordinary key put the menu away"
     );
 
@@ -199,10 +204,21 @@ fn clicking_a_scaling_option_selects_that_one() {
     term.send(b"\x1b[<0;717;485M");
     term.send(b"\x1b[<0;717;485m");
 
+    // Read the screen rather than the stream: the chrome is diffed, so a note replacing
+    // another reaches the terminal as the cells that differ and a cursor move, and the
+    // phrase is nowhere in the bytes even though it is on screen.
+    let mut selected = false;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        if Screen::replay(&term.output(), 200, 50).contains("scaling: scaled") {
+            selected = true;
+            break;
+        }
+    }
     assert!(
-        term.wait_for(b"scaling: scaled", Duration::from_secs(10)),
+        selected,
         "the click did not select fit: {}",
-        tail(&term.output())
+        Screen::replay(&term.output(), 200, 50).row(1)
     );
 
     // The menu stays up, and shows the choice it just made: the brackets mark the mode
@@ -212,7 +228,7 @@ fn clicking_a_scaling_option_selects_that_one() {
     std::thread::sleep(Duration::from_millis(500));
     let since = term.output()[mark..].to_vec();
     assert!(
-        contains(&since, b"Renegotiate the remote size"),
+        !contains(&since, MENU_GONE),
         "the menu went away on a click that was not the dismissal"
     );
     assert!(
@@ -353,7 +369,7 @@ fn the_close_button_answers_while_the_menu_is_up() {
     );
     // And the menu is still up: the cross closes the note, not the box behind it.
     assert!(
-        contains(&since, b"Renegotiate the remote size"),
+        !contains(&since, MENU_GONE),
         "closing the notification put the menu away too: {}",
         tail(&since)
     );

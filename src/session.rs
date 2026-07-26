@@ -16,9 +16,6 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
-// A rectangle of cells, which is what the chrome measures itself in. Named apart from
-// the renderer's `Rect`, which is pixels.
-use ratatui::layout::Rect as Cells;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::app::{FpsMeter, describe, human_bytes};
@@ -33,6 +30,7 @@ use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
+use crate::ui::chrome::Chrome;
 use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
 use crate::ui::theme::Theme;
@@ -262,12 +260,12 @@ struct Session<B: Backend> {
     /// Which palette the chrome wears. Dark to start, the bar having been that colour
     /// before there was a choice.
     theme: Theme,
+    /// The cells the client owns, diffed frame to frame so taking chrome off the screen is
+    /// the same operation as putting it on.
+    chrome: Chrome,
     /// The command menu, and where the pointer is on it.
     menu: Menu,
     show_menu: bool,
-    /// The menu was dismissed and its cells still have to be blanked. Drawing
-    /// the image over them does not do it: the image sits below the text.
-    clear_menu: bool,
     /// The wipe a relayout asks for, waiting for the frame that fills the screen
     /// back in. Written on its own it is a blank screen that lasts until the next
     /// frame composes, which is what a resize looked like; carried into that frame's
@@ -353,9 +351,9 @@ impl<B: Backend> Session<B> {
             no_clipboard: args.no_clipboard,
             clipboard_lossy: true,
             theme: Theme::Dark,
+            chrome: Chrome::new(),
             menu: Menu::new(args.prefix_char()),
             show_menu: false,
-            clear_menu: false,
             pending_cleanup: Vec::new(),
             show_stats: false,
             toast: Toast::default(),
@@ -817,9 +815,7 @@ impl<B: Backend> Session<B> {
                     tracing::debug!("click at cell {col},{row}; the cross wants {target:?}");
                 }
                 if on_close && pressed {
-                    if self.toast.dismiss() {
-                        self.renderer.mark_all();
-                    }
+                    self.toast.dismiss();
                     return Ok(());
                 }
 
@@ -996,20 +992,16 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Hide the menu and arrange for the cells it used to be blanked.
+    /// Hide the menu.
     ///
-    /// Clearing the flag is not enough on its own, and neither is damaging the
-    /// image: the menu is text, and tiles are placed below the text, so the box
-    /// outlives any repaint until the cells themselves are erased. The tiles are
-    /// marked too, for a terminal that treats an erase as dropping the placements
-    /// underneath it.
+    /// Nothing else to do: a menu absent from the next frame's plane is a menu whose cells
+    /// the diff blanks and whose images the chrome drops, and the cells it gives up come
+    /// back as damage so the picture under them is drawn again.
     fn dismiss_menu(&mut self) {
         self.show_menu = false;
-        self.clear_menu = true;
         // Or the row the pointer happened to be on would be lit the next time the
         // menu opens, before the pointer has moved to say so.
         self.menu.clear_hover();
-        self.renderer.mark_all();
     }
 
     async fn on_tick(&mut self) -> Result<()> {
@@ -1028,7 +1020,6 @@ impl<B: Backend> Session<B> {
         {
             self.pending_metrics = None;
             self.metrics_applied_at = Some(Instant::now());
-            let was = self.metrics;
             self.metrics = Metrics::query()?;
             tracing::debug!(
                 "applying resize after {:?}: {}x{} cells, {}x{} px",
@@ -1038,15 +1029,7 @@ impl<B: Backend> Session<B> {
                 self.metrics.px_w,
                 self.metrics.px_h
             );
-            let erased = self.clear_chrome_drawn_with(&was);
             self.relayout();
-            // After the relayout, which is what decides which tiles it is keeping: a
-            // terminal that dropped the placements under those cells has to be given them
-            // again, and the relayout was not going to.
-            for cells in erased {
-                self.renderer
-                    .mark_cells(cells.x, cells.y, cells.width, cells.height);
-            }
             if self.mode == ScaleMode::Native
                 || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
             {
@@ -1177,18 +1160,10 @@ impl<B: Backend> Session<B> {
     }
 
     fn draw(&mut self) -> Result<()> {
-        // A note that has run out has to come off the screen, and the screen it was
-        // over has to be drawn back: work of its own, whether or not a frame arrived.
-        if self.toast.expire() {
-            self.renderer.mark_all();
-        }
-        let has_work = self.renderer.has_work();
-        if !has_work
-            && self.pending_cleanup.is_empty()
-            && !self.toast.is_live()
-            && !self.show_menu
-            && !self.clear_menu
-        {
+        // A note that has run out has to come off the screen: work of its own, whether or
+        // not a frame arrived.
+        let expired = self.toast.expire();
+        if !self.renderer.has_work() && !expired && self.pending_cleanup.is_empty() {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1205,25 +1180,24 @@ impl<B: Backend> Session<B> {
         // one of the two layouts and never the gap between them.
         let cleanup = std::mem::take(&mut self.pending_cleanup);
         buf.extend_from_slice(&cleanup);
-        // Text first, then images, exactly as a relayout does it: erasing cells may
-        // take the placements under them with it, so the tiles have to go out after.
-        if self.clear_menu {
-            self.menu.clear(&mut buf, &self.metrics);
-            self.clear_menu = false;
+
+        // The chrome, all of it, before the tiles. Its own cells are diffed against what
+        // is on screen, so a menu that closed or a bar whose row moved is blanked by being
+        // absent rather than by anyone remembering to erase it -- and the cells it gives up
+        // come back as damage, which is what the tiles under them need. Before the tiles
+        // because a terminal may treat clearing a cell as dropping the placement under it;
+        // the text still lands above them, z-index deciding that rather than write order.
+        self.chrome.begin(&self.metrics);
+        self.render_chrome(&mut buf);
+        for cells in self.chrome.flush(&mut buf) {
+            self.renderer
+                .mark_cells(cells.x, cells.y, cells.width, cells.height);
         }
-        self.toast.clear(&mut buf);
+
         let stats = self.renderer.compose(&self.fb, &mut buf);
         if stats.tiles > 0 {
             self.last_stats = stats;
         }
-        self.draw_status(&mut buf);
-        if self.show_menu {
-            self.menu.draw(&mut buf, &self.metrics, self.menu_state());
-        }
-        // Last of the chrome, so a note that arrives with the menu open lands on top
-        // of it rather than under it.
-        self.toast
-            .draw(&mut buf, &self.metrics, self.theme.palette());
         if self.caps.sync_output {
             kitty::end_sync(&mut buf);
         }
@@ -1231,7 +1205,7 @@ impl<B: Backend> Session<B> {
         match self.writer.submit(buf) {
             Ok(()) => {
                 self.renderer.commit();
-                self.toast.commit();
+                self.chrome.commit();
                 self.fps.tick();
             }
             Err(Busy::Full(buf)) => {
@@ -1249,7 +1223,22 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    fn draw_status(&mut self, buf: &mut Vec<u8>) {
+    /// Render every piece of chrome into the plane, and place the images they sit on.
+    ///
+    /// In the order they stack: the bar, then the menu over the picture, then a note over
+    /// the menu -- a note that arrives while the menu is open belongs on top of it.
+    fn render_chrome(&mut self, out: &mut Vec<u8>) {
+        self.render_status();
+        if self.show_menu {
+            let state = self.menu_state();
+            self.menu
+                .render(&mut self.chrome, out, &self.metrics, state);
+        }
+        self.toast
+            .render(&mut self.chrome, out, &self.metrics, self.theme.palette());
+    }
+
+    fn render_status(&mut self) {
         let layout = *self.renderer.layout();
         // What this is connected to, which is the one thing on the left worth reading
         // without looking for it.
@@ -1307,8 +1296,8 @@ impl<B: Backend> Session<B> {
             left.push(ink.accent("  ● CMD"));
         }
 
-        status::draw(
-            buf,
+        status::render(
+            self.chrome.buffer(),
             &self.metrics,
             ink,
             left,
@@ -1336,47 +1325,6 @@ impl<B: Backend> Session<B> {
         // names different ones. Each lowers what the renderer believes is placed, so no
         // id is named twice.
         self.pending_cleanup.extend_from_slice(&cleanup);
-    }
-
-    /// Erase the chrome that a previous set of metrics put on the screen.
-    ///
-    /// Text stays on the cells it was written to when the grid changes shape, and both
-    /// pieces of chrome that are text -- the bar, and the menu if it is up -- have to be
-    /// erased at the geometry they were drawn with rather than the one just adopted.
-    /// Queued ahead of the tiles, so a cell erased here is one a tile is free to be
-    /// placed under afterwards.
-    ///
-    /// The notification popup takes itself off: it remembers the rectangle it drew in
-    /// absolute cells and blanks that on the next frame, and being told it has moved is
-    /// all it needs to treat the old one as stale.
-    ///
-    /// Returns the cells it blanked, for the caller to have redrawn once the new layout
-    /// has decided which tiles it is keeping.
-    fn clear_chrome_drawn_with(&mut self, was: &Metrics) -> Vec<Cells> {
-        let mut cleanup = Vec::new();
-        let mut erased = Vec::new();
-        // Only a window that grew. A bar redrawn on the row it is already on overwrites
-        // itself, every cell of it, and one that shrank took the row the bar was on with
-        // it -- where a cursor move would clamp to the row the new bar is about to be
-        // drawn on and erase that instead.
-        if was.rows < self.metrics.rows {
-            erased.extend(status::clear(&mut cleanup, was));
-        }
-        if self.show_menu || self.clear_menu {
-            erased.extend(self.menu.clear(&mut cleanup, was));
-            // Cleared where it was; a menu still up is redrawn where it now belongs in
-            // the same frame, and one on its way out is now off the screen for good.
-            self.clear_menu = false;
-        }
-        self.pending_cleanup.extend_from_slice(&cleanup);
-        // A note that was up has its own blanking to do on the next frame, and where it
-        // used to be is not a rectangle it hands out. Rare enough during a resize -- a
-        // plain drag on a server that resizes says nothing -- to be worth a whole redraw
-        // rather than a seam between this and the popup's own bookkeeping.
-        if self.toast.moved() {
-            self.renderer.mark_all();
-        }
-        erased
     }
 
     async fn send(&self, input: Input) -> Result<()> {
@@ -1436,9 +1384,7 @@ impl<B: Backend> Session<B> {
         // A note landing on top of one already up takes the old box off the screen with
         // it, and the remote screen under the cells it no longer covers has to come
         // back -- the same repair the menu asks for when it is dismissed.
-        if self.toast.show(note) {
-            self.renderer.mark_all();
-        }
+        self.toast.show(note);
     }
 }
 

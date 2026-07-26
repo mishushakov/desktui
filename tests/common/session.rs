@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use super::server::{Extensions, FakeServer, Resize};
-use super::{FakeTerm, GHOSTTY_REPLIES, contains, count, tail};
+use super::{FakeTerm, GHOSTTY_REPLIES, Screen, contains, count, tail};
 
 /// A 200x50 terminal of 8x17 cells: 1600x850 pixels, of which 49 rows are usable.
 ///
@@ -70,22 +70,39 @@ pub fn quit(term: &mut FakeTerm) {
 // suite flaky.
 
 /// The status line reports `size` as the desktop it is showing.
+///
+/// Read off the screen rather than the stream. The chrome is diffed frame to frame, so a
+/// size that replaces another reaches the terminal as the digits that differ and a cursor
+/// move -- "1600x832" over "1024x768" shares its fifth character, and the phrase is nowhere
+/// in the bytes even though it is on screen.
 #[track_caller]
 pub fn assert_reports_size(term: &FakeTerm, size: &str, timeout: Duration) {
     assert!(
-        term.wait_for(size.as_bytes(), timeout),
+        wait_for_text(term, size, timeout),
         "the status line never reported {size}: {}",
-        tail(&term.output())
+        Screen::of(&term.output()).row(49)
     );
+}
+
+/// Wait for `text` to be on screen, wherever it is.
+pub fn wait_for_text(term: &FakeTerm, text: &str, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if Screen::of(&term.output()).contains(text) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Screen::of(&term.output()).contains(text)
 }
 
 /// Every remote pixel lands on exactly one terminal pixel.
 #[track_caller]
 pub fn assert_pixel_exact(term: &FakeTerm, timeout: Duration) {
     assert!(
-        term.wait_for(b"native 1:1", timeout),
+        wait_for_text(term, "native 1:1", timeout),
         "the mapping never became pixel-exact: {}",
-        tail(&term.output())
+        Screen::of(&term.output()).row(49)
     );
 }
 

@@ -1,14 +1,11 @@
 //! The status line.
 
-use std::io::Write as _;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use super::paint::write_cells;
 use super::theme::{Palette, colour};
 use crate::term::Metrics;
 
@@ -23,8 +20,8 @@ use crate::term::Metrics;
 ///
 /// `left` is truncated before `right` is dropped: the right-hand side carries the
 /// frame statistics, which are the first thing to go when space runs out.
-pub fn draw(
-    out: &mut Vec<u8>,
+pub fn render(
+    buf: &mut Buffer,
     metrics: &Metrics,
     ink: &Palette,
     left: Vec<Span>,
@@ -41,9 +38,7 @@ pub fn draw(
     };
 
     // Coloured before anything is written on it, so the whole row carries the bar
-    // whether or not the text reaches the end. Every cell is written every time,
-    // which is what a `CSI K` used to be there for.
-    let mut buf = Buffer::empty(area);
+    // whether or not the text reaches the end.
     buf.set_style(area, Style::new().bg(colour(ink.bar)).fg(colour(ink.text)));
 
     let left = Line::from(left);
@@ -55,39 +50,10 @@ pub fn draw(
 
     // Rendered into the same row, one aligned each way. Whatever does not fit is
     // clipped at the edge, so the row is exactly its own width however long the text.
-    left.render(area, &mut buf);
+    left.render(area, buf);
     if both {
-        right.render(area, &mut buf);
+        right.render(area, buf);
     }
-
-    write_cells(out, &buf);
-}
-
-/// Blank the row `metrics` would draw the bar on.
-///
-/// For the row a *previous* set of metrics drew it on: the bar sits on the last row, and
-/// text does not move when the grid does, so a window that grew keeps the old bar on
-/// what is now an interior row -- over the image, glyphs being drawn above placements.
-/// One stale line per size a drag passed through, before this.
-///
-/// The reset comes first because an erase fills with the current background, and the
-/// background in force is the bar's own: without it the row would be blanked in the
-/// colour that makes it look like a bar.
-///
-/// Returns the cells it blanked, which the caller owes a redraw: a terminal may treat
-/// clearing a cell as dropping the placement under it, and this row is an interior one
-/// now, with tiles of its own.
-pub fn clear(out: &mut Vec<u8>, metrics: &Metrics) -> Option<Rect> {
-    if metrics.cols == 0 || metrics.rows == 0 {
-        return None;
-    }
-    let _ = write!(out, "\x1b[0m\x1b[{};1H\x1b[2K", metrics.rows);
-    Some(Rect {
-        x: 0,
-        y: metrics.rows - 1,
-        width: metrics.cols,
-        height: 1,
-    })
 }
 
 #[cfg(test)]
@@ -110,6 +76,14 @@ mod tests {
             cell_w: 8,
             cell_h: 16,
         }
+    }
+
+    /// Render the bar and write it out, which is what the chrome's diff does with it. The
+    /// buffer is just the bar's row, so what lands in `out` is the row and nothing else.
+    fn draw(out: &mut Vec<u8>, m: &Metrics, ink: &Palette, left: Vec<Span>, right: Vec<Span>) {
+        let mut buf = Buffer::empty(Rect::new(0, m.rows.saturating_sub(1), m.cols, 1));
+        render(&mut buf, m, ink, left, right);
+        super::super::paint::write_cells(out, &buf);
     }
 
     /// Draw a plain two-sided bar, for the tests that reason about layout not ink.

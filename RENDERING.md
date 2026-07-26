@@ -160,6 +160,12 @@ about how far the grid was filled.
 
 ### Chrome
 
+**A note for anyone writing a test.** Because the chrome is diffed, text that is on screen
+is not necessarily contiguous in the escape stream: a bar reading `1600x832` where it read
+`1024x768` reaches the terminal as the digits that differ and a cursor move between them, so
+grepping the stream for the phrase finds nothing. `Screen::replay` in the test harness
+reconstructs the cells, and every assertion about what the chrome says goes through it.
+
 A private plane of the cells we own -- status line, menu, notifications -- double buffered
 and diffed each frame. The diff produces the minimal cursor-positioned writes *and* the
 cells the chrome has vacated, which the plane takes as damage so the picture beneath is
@@ -229,7 +235,7 @@ the protocol seam; getting at it wants a counting reader in the vendored client.
 time is not separable from wire time yet: `rtt` is measured from the request to `FrameEnd`,
 so it contains the server's encoding. Splitting them wants a fence sent behind the update
 request, whose reply says the server reached that point in its stream -- worth doing
-alongside [pushing turned off and on again](#1-pushing-turned-off-and-on-again-rather-than-declined),
+alongside [pushing turned off and on again](#pushing-turned-off-and-on-again-rather-than-declined),
 which needs the same fence bookkeeping.
 
 ## Where this stands
@@ -256,16 +262,16 @@ Built:
 - the pointer as its own placement, moved with `a=p` and sub-cell `X`/`Y`, above every tile
   (`src/term/kitty.rs`, `src/render/mod.rs`) -- verified against Ghostty with
   `make blend-probe` before a line of it was written
+- the chrome as one diffed plane (`src/ui/chrome.rs`), which deleted `Menu::clear`,
+  `status::clear`, `Session::clear_menu`, `clear_chrome_drawn_with` and the popup's
+  `drawn`/`stale`/`moved` bookkeeping
 
 ## Not built yet
 
-Two things. What each one *is* is above; what follows is what it costs to build and the
-parts that are not obvious from the design.
+One thing left. What it *is* is above; what follows is what it costs to build and the parts
+that are not obvious from the design -- including why it is worth being careful with.
 
-The first is felt immediately and is the one to be careful with; the second is structural,
-worth building for the bugs it makes impossible rather than for anything measurable.
-
-### 1. Pushing turned off and on again, rather than declined
+### Pushing turned off and on again, rather than declined
 
 This item said "Fence as flow control", on the reasoning that a client could hold a frame's
 worth of credit and let the server run exactly as far ahead as it can draw. That is the
@@ -297,25 +303,6 @@ wrong oscillates, and one that disables without re-enabling leaves a frozen scre
 worse failure than the flat-out pushing it replaces. It wants sustained load to tune
 against, which `make desktop` plus a scrolling browser gives and a test does not. Build the
 policy behind a flag, default off, until it has been watched for a while.
-
-### 2. The chrome as one diffed plane
-
-Replaces `Toast::drawn`/`stale`/`moved`, `Session::clear_menu`, `status::clear` and
-`Menu::clear` with a private cell buffer, double buffered and diffed per frame.
-
-The rule that makes it correct is the one `src/ui/mod.rs` already states: never touch a
-cell we did not write. A renderer that owns the whole screen is wrong here because it would
-repaint the cells our placements live in; owning one plane and diffing that is the same
-idea with the boundary in the right place. `ui::paint::write_cells` is most of the emit
-side already, including the wide-glyph handling that a naive diff gets wrong.
-
-Two things fall out rather than being added: the diff yields the cells the chrome has
-vacated, which is exactly the damage `mark_cells` wants, so the "erased chrome is damage"
-rule stops being a thing to remember; and erases precede placements because that is the
-order the emit does it in, rather than because three call sites each remember to.
-
-The overlay backdrops stay as images. A cell background cannot serve -- it is painted below
-the picture, so a colour set there is never seen.
 
 ### The `O=` finding
 

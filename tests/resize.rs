@@ -121,12 +121,14 @@ fn a_resize_never_blanks_the_screen() {
     assert_reports_size(&term, "1760x1002", Duration::from_secs(10));
     assert_a_relayout_never_blanks_the_screen(&term, before);
 
-    let out = term.output();
-    let erase = format!("\x1b[{ROWS};1H\x1b[2K");
+    // The row the bar left has to come out blank. On the screen rather than in the stream:
+    // the chrome is diffed, so blanking a row is whatever cells differ from what was on it,
+    // not an erase sequence to grep for.
+    let screen = Screen::of(&term.output());
     assert!(
-        contains(&out[before..], erase.as_bytes()),
-        "the row the bar was on was never blanked: {}",
-        show(&out[before..])
+        screen.row(usize::from(ROWS) - 1).is_empty(),
+        "the row the bar was on still reads {:?}",
+        screen.row(usize::from(ROWS) - 1)
     );
 
     quit(&mut term);

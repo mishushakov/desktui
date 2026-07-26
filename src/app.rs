@@ -18,6 +18,7 @@ use crate::term::caps::Caps;
 use crate::term::kitty;
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard};
+use crate::ui::chrome::Chrome;
 use crate::ui::menu::{self, Menu};
 use crate::ui::status;
 use crate::ui::theme::Theme;
@@ -99,7 +100,8 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     };
     let ink = state.theme.palette();
     let mut show_menu = false;
-    let mut clear_menu = false;
+    let mut menu_shown = false;
+    let mut chrome = Chrome::new();
     // The wipe a relayout asks for, waiting for the frame that fills the screen back
     // in. Written on its own it is a blank screen that lasts until the next frame
     // composes; carried into that frame's synchronised block, the old picture stands
@@ -121,7 +123,6 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             }
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    let was_showing = show_menu;
                     match key.code {
                         // Escape belongs to the menu while it is up, which is what the
                         // menu's own title offers. Leaving it as the way out of the
@@ -136,12 +137,6 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                         KeyCode::Char('h') | KeyCode::Char('?') => show_menu = !show_menu,
                         // Nothing else dismisses it, here as in a session.
                         _ => {}
-                    }
-                    // The menu leaves text and a backdrop image behind it, and
-                    // neither is undone by drawing the pattern again.
-                    if was_showing && !show_menu {
-                        clear_menu = true;
-                        renderer.mark_all();
                     }
                 }
                 Event::Mouse(m) => {
@@ -172,7 +167,6 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     }
                 }
                 Event::Resize(_, _) => {
-                    let was = metrics;
                     metrics = Metrics::query()?;
                     let (w, h) = metrics.image_area();
                     area_w = w;
@@ -181,32 +175,12 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     fb.resize(area_w, area_h);
                     pattern.paint_all(&mut fb);
 
-                    // The chrome that is text stays on the cells it was written to, so it
-                    // is erased at the geometry it was drawn with. Ahead of the tiles: a
-                    // cell erased here is one a tile is free to be placed under after.
-                    // Only a window that grew: a bar on the row it is already on overwrites
-                    // itself, and one that shrank went with the rows the terminal dropped.
-                    let mut erased = Vec::new();
-                    if was.rows < metrics.rows {
-                        erased.extend(status::clear(&mut pending_cleanup, &was));
-                    }
-                    if show_menu || clear_menu {
-                        erased.extend(menu.clear(&mut pending_cleanup, &was));
-                        clear_menu = false;
-                    }
-
                     let layout = Layout::compute(&metrics, args.scale, area_w, area_h, (0, 0));
                     let cleanup = renderer.relayout(layout);
                     // Held for the next frame rather than written now, and appended: a
                     // relayout names the tiles it has dropped, and a second one before
                     // that frame goes out names different ones.
                     pending_cleanup.extend_from_slice(&cleanup);
-                    // After the relayout, which is what decides which tiles it keeps: a
-                    // terminal that dropped the placements under the erased cells has to be
-                    // given them again, and the relayout was not going to.
-                    for cells in erased {
-                        renderer.mark_cells(cells.x, cells.y, cells.width, cells.height);
-                    }
                 }
                 _ => {}
             }
@@ -227,7 +201,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         for r in &damage {
             renderer.mark(*r);
         }
-        if !renderer.has_work() && pending_cleanup.is_empty() && !show_menu && !clear_menu {
+        if !renderer.has_work() && pending_cleanup.is_empty() && !show_menu && !menu_shown {
             continue;
         }
 
@@ -240,22 +214,15 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         // one of the two layouts and never the gap between them.
         let cleanup = std::mem::take(&mut pending_cleanup);
         buf.extend_from_slice(&cleanup);
-        if clear_menu {
-            menu.clear(&mut buf, &metrics);
-            clear_menu = false;
-        }
-        let stats = renderer.compose(&fb, &mut buf);
-        if stats.tiles > 0 {
-            last_stats = stats;
-        }
 
-        let layout = renderer.layout();
-        // What is on screen, in the same place a session names its server.
+        // The chrome, diffed against what is on screen, before the tiles: see `session`.
+        chrome.begin(&metrics);
+        let layout = *renderer.layout();
         let rest = format!(
             "  {}x{} {}  {} tiles",
             layout.dst_w,
             layout.dst_h,
-            describe(layout),
+            describe(&layout),
             renderer.tile_count(),
         );
         let figures = format!(
@@ -265,16 +232,26 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             human_bytes(last_stats.bytes),
             dropped,
         );
-        status::draw(
-            &mut buf,
+        status::render(
+            chrome.buffer(),
             &metrics,
             ink,
             vec![ink.bright(" test-pattern"), ink.text(&rest)],
             vec![ink.text(&figures), ink.bright("h"), ink.text(" menu ")],
         );
         if show_menu {
-            menu.draw(&mut buf, &metrics, state);
+            menu.render(&mut chrome, &mut buf, &metrics, state);
         }
+        menu_shown = show_menu;
+        for cells in chrome.flush(&mut buf) {
+            renderer.mark_cells(cells.x, cells.y, cells.width, cells.height);
+        }
+
+        let stats = renderer.compose(&fb, &mut buf);
+        if stats.tiles > 0 {
+            last_stats = stats;
+        }
+
         if caps.sync_output {
             kitty::end_sync(&mut buf);
         }
@@ -282,6 +259,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         match writer.submit(buf) {
             Ok(()) => {
                 renderer.commit();
+                chrome.commit();
                 fps.tick();
             }
             // Terminal is still busy: keep the damage and try again next tick.

@@ -189,7 +189,7 @@ fn one_client_adopts_a_resize_another_client_asked_for() {
 
     let mut resizer = start(&["--scale", "native"]);
     assert!(
-        resizer.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(30)),
+        wait_for_text(&resizer, EXPECTED_SIZE, Duration::from_secs(30)),
         "the second client never got its size: {}",
         tail(&resizer.output())
     );
@@ -233,7 +233,11 @@ fn a_real_server_negotiates_the_extended_clipboard() {
     let mark = term.output().len();
     term.send("\x1b[200~Привет, мир\x1b[201~".as_bytes());
     assert!(
-        term.wait_for(b"pasted to the remote clipboard", Duration::from_secs(10)),
+        wait_for_text(
+            &term,
+            "pasted to the remote clipboard",
+            Duration::from_secs(10)
+        ),
         "the paste was never acted on: {}",
         tail(&term.output())
     );
@@ -266,9 +270,9 @@ fn the_desktop_is_redrawn_in_full_after_a_resize() {
     // non-incremental request is forbidden, so the overlap has to be kept instead.
     let mut term = start(&["--scale", "native"]);
     assert!(
-        term.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(30)),
+        wait_for_text(&term, EXPECTED_SIZE, Duration::from_secs(30)),
         "never reached the first size: {}",
-        tail(&term.output())
+        Screen::of(&term.output()).row(49)
     );
     // Let the first screenful settle.
     std::thread::sleep(Duration::from_millis(1500));
@@ -276,7 +280,7 @@ fn the_desktop_is_redrawn_in_full_after_a_resize() {
     let before = count(&term.output(), b"\x1b_Ga=T");
     term.resize(100, 25, 800, 425);
     assert!(
-        term.wait_for(b"800x408", Duration::from_secs(30)),
+        wait_for_text(&term, "800x408", Duration::from_secs(30)),
         "the desktop did not follow: {}",
         tail(&term.output())
     );
@@ -304,7 +308,7 @@ fn a_real_server_negotiates_continuous_updates() {
     // negotiation works against something that was not written to agree with us.
     let mut term = start(&["--scale", "native", "--log-file", "/tmp/desktui-live.log"]);
     assert!(
-        term.wait_for(b"pushing frames", Duration::from_secs(30)),
+        wait_for_text(&term, "pushing frames", Duration::from_secs(30)),
         "the server never enabled continuous updates: {}",
         tail(&term.output())
     );
@@ -459,14 +463,14 @@ fn growing_the_window_fills_the_new_area_on_a_real_server() {
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(
-        term.wait_for(b"800x408", Duration::from_secs(30)),
+        wait_for_text(&term, "800x408", Duration::from_secs(30)),
         "never reached the first size: {}",
         tail(&term.output())
     );
 
     term.resize(200, 50, 1600, 850);
     assert!(
-        term.wait_for(b"1600x832", Duration::from_secs(30)),
+        wait_for_text(&term, "1600x832", Duration::from_secs(30)),
         "the desktop did not grow: {}",
         tail(&term.output())
     );
@@ -534,7 +538,7 @@ fn a_real_server_answers_the_latency_probe() {
     let mut seen = false;
     while start.elapsed() < Duration::from_secs(20) {
         let out = term.output();
-        if contains(&out, b"ms  ") {
+        if Screen::of(&out).row(49).contains("ms") {
             seen = true;
             break;
         }
@@ -603,7 +607,7 @@ fn an_idle_resize_completes_without_any_input() {
     );
     term.answer_probe(GHOSTTY_REPLIES);
     assert!(
-        term.wait_for(b"800x408", Duration::from_secs(30)),
+        wait_for_text(&term, "800x408", Duration::from_secs(30)),
         "never reached the first size: {}",
         tail(&term.output())
     );
@@ -612,7 +616,7 @@ fn an_idle_resize_completes_without_any_input() {
 
     let at = std::time::Instant::now();
     term.resize(200, 50, 1600, 850);
-    let arrived = term.wait_for(b"1600x832", Duration::from_secs(20));
+    let arrived = wait_for_text(&term, "1600x832", Duration::from_secs(20));
     let took = at.elapsed();
 
     let logged = std::fs::read_to_string(&log).unwrap_or_default();
@@ -659,7 +663,7 @@ fn a_dragged_resize_settles_without_any_input() {
         &[("VNC_PASSWORD", &password()), ("DESKTUI_LOG", "debug")],
     );
     term.answer_probe(GHOSTTY_REPLIES);
-    assert!(term.wait_for(b"800x408", Duration::from_secs(30)));
+    assert!(wait_for_text(&term, "800x408", Duration::from_secs(30)));
     std::thread::sleep(Duration::from_secs(2));
 
     // Drag: grow a few cells at a time, as a window manager would report it.
@@ -674,7 +678,7 @@ fn a_dragged_resize_settles_without_any_input() {
     let at = std::time::Instant::now();
     let (cols, rows) = (200u16, 45u16);
     let expected = format!("{}x{}", cols as u32 * 8, (rows as u32 - 1) * 17);
-    let arrived = term.wait_for(expected.as_bytes(), Duration::from_secs(20));
+    let arrived = wait_for_text(&term, &expected, Duration::from_secs(20));
     let took = at.elapsed();
 
     let logged = std::fs::read_to_string(&log).unwrap_or_default();

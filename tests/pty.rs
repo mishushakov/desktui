@@ -433,18 +433,23 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
     }
 
     // Each relayout has to blank the row the bar was on, or that row keeps its text for
-    // ever -- over the image, glyphs being drawn above placements. The row itself, not the
-    // screen: erasing everything to be rid of one line is a blank terminal until the frame
-    // that redraws it composes.
+    // ever -- over the image, glyphs being drawn above placements. Asserted on the screen
+    // rather than on the stream: the chrome is diffed, so the blanking is whatever cells
+    // differ from the row that was there, not a `CSI 2 K` to grep for.
     let out = term.output();
+    let screen = Screen::replay(&out, 200, 50);
     for old_row in [24, 36] {
-        let erase = format!("\x1b[{old_row};1H\x1b[2K");
         assert!(
-            contains(&out, erase.as_bytes()),
-            "row {old_row} was never blanked after the bar left it: {}",
-            show(&out)
+            screen.row(old_row - 1).is_empty(),
+            "row {old_row} still reads {:?} after the bar left it",
+            screen.row(old_row - 1)
         );
     }
+    assert!(
+        screen.row(49).contains("test-pattern"),
+        "the bar should be on the last row: {:?}",
+        screen.row(49)
+    );
     assert_eq!(
         count(&out, b"\x1b[2J"),
         1,
@@ -453,16 +458,26 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
         show(&out)
     );
 
-    // And after the last resize, the only status row still being written is the new
-    // one: nothing should be repainting rows 24 or 36 any more.
-    let after = out.len();
+    // And it stays that way: the rows the bar left do not come back, and the row it is on
+    // keeps saying what it says. Nothing asserts that the bar is *rewritten*, because an
+    // unchanged cell is not written at all any more -- only the figures move, and only those
+    // cells go out.
     std::thread::sleep(Duration::from_millis(400));
     let latest = term.output();
-    let tail = &latest[after.min(latest.len())..];
+    let settled = Screen::replay(&latest, 200, 50);
+    for old_row in [24, 36] {
+        assert!(
+            settled.row(old_row - 1).is_empty(),
+            "row {old_row} came back: {:?}",
+            settled.row(old_row - 1)
+        );
+    }
     assert!(
-        contains(tail, b"\x1b[50;1H"),
-        "the status line stopped being drawn on the new last row"
+        settled.row(49).contains("test-pattern"),
+        "the bar left the last row: {:?}",
+        settled.row(49)
     );
+    let tail = &latest[out.len().min(latest.len())..];
     for stale in [&b"\x1b[24;1H"[..], b"\x1b[36;1H"] {
         assert!(
             !contains(tail, stale),

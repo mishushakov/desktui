@@ -11,15 +11,13 @@
 //! alignment, styled spans, and a hit test that comes out of the same geometry the
 //! drawing used, so a click cannot land on a row the box is not showing.
 
-use std::io::Write as _;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Widget};
 
-use super::paint::write_cells;
+use super::chrome::Chrome;
 use super::theme::{Palette, Theme, colour};
 use crate::cli::ScaleMode;
 use crate::term::input::Command;
@@ -412,7 +410,7 @@ impl Menu {
     ///
     /// No border: the box is held off the remote screen by its padding and its own
     /// backdrop, which is a good deal quieter than a rule around the outside.
-    pub fn draw(&self, out: &mut Vec<u8>, metrics: &Metrics, state: State) {
+    pub fn render(&self, chrome: &mut Chrome, out: &mut Vec<u8>, metrics: &Metrics, state: State) {
         let Some(area) = self.area(metrics) else {
             return;
         };
@@ -433,8 +431,12 @@ impl Menu {
         // replaces (see `term::kitty`), so a row the pointer has left keeps nothing.
         // Only the case with no bar at all needs saying here: nothing is placed, so
         // nothing releases the last one, and it would sit there until the menu closed.
-        match self.hover_bar(area) {
-            Some(bar) => kitty::place_solid(
+        chrome.keep(kitty::OVERLAY_IMAGE_ID);
+        // A row the pointer has left keeps nothing: every placement releases the one it
+        // replaces. The case with no bar at all is the chrome's to clean up, which is what
+        // declaring it only when there is one comes to.
+        if let Some(bar) = self.hover_bar(area) {
+            kitty::place_solid(
                 out,
                 kitty::MENU_HIGHLIGHT_IMAGE_ID,
                 usize::from(bar.x) + 1,
@@ -442,38 +444,11 @@ impl Menu {
                 usize::from(bar.width),
                 usize::from(bar.height),
                 state.theme.palette().hover,
-            ),
-            None => kitty::delete_image(out, kitty::MENU_HIGHLIGHT_IMAGE_ID),
+            );
+            chrome.keep(kitty::MENU_HIGHLIGHT_IMAGE_ID);
         }
 
-        let mut buf = Buffer::empty(area);
-        MenuView { menu: self, state }.render(area, &mut buf);
-        write_cells(out, &buf);
-    }
-
-    /// Take the menu off the screen: blank its cells and drop its images.
-    ///
-    /// Both halves are needed, and redrawing the remote screen is neither of them.
-    /// The glyphs are text, which no repaint of an image below them can erase, and
-    /// the backdrop is an image of ours that outranks every tile and would otherwise
-    /// stay on top of them for ever. The cells go back to default attributes, which
-    /// is what makes them transparent to the tiles again.
-    ///
-    /// Returns the cells it blanked, which the caller owes a redraw: a terminal may treat
-    /// clearing a cell as dropping the placement under it.
-    pub fn clear(&self, out: &mut Vec<u8>, metrics: &Metrics) -> Option<Rect> {
-        let area = self.area(metrics)?;
-
-        // Text first, then images, as a relayout does it: an erase may take the
-        // placements under it along too.
-        out.extend_from_slice(b"\x1b[0m");
-        for y in area.top()..area.bottom() {
-            let _ = write!(out, "\x1b[{};{}H", y + 1, area.x + 1);
-            out.extend(std::iter::repeat_n(b' ', usize::from(area.width)));
-        }
-        kitty::delete_image(out, kitty::OVERLAY_IMAGE_ID);
-        kitty::delete_image(out, kitty::MENU_HIGHLIGHT_IMAGE_ID);
-        Some(area)
+        MenuView { menu: self, state }.render(area, chrome.buffer());
     }
 }
 
@@ -613,6 +588,15 @@ fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, style: Style, ink
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the menu the way a frame does -- into the chrome's plane -- and serialise
+    /// what came out, so the assertions below can go on reading escapes.
+    fn draw_menu(menu: &Menu, out: &mut Vec<u8>, m: &Metrics, state: State) {
+        let mut chrome = Chrome::new();
+        chrome.begin(m);
+        menu.render(&mut chrome, out, m, state);
+        chrome.flush(out);
+    }
     use crate::cli::ScaleMode;
     use crate::ui::CLOSE;
     use crate::ui::theme::probe::{bg, fg};
@@ -699,11 +683,11 @@ mod tests {
     fn menu_fits_or_is_skipped() {
         let menu = Menu::new('a');
         let mut out = Vec::new();
-        menu.draw(&mut out, &metrics(100, 40), state());
+        draw_menu(&menu, &mut out, &metrics(100, 40), state());
         assert!(!out.is_empty());
 
         out.clear();
-        menu.draw(&mut out, &metrics(20, 6), state());
+        draw_menu(&menu, &mut out, &metrics(20, 6), state());
         assert!(out.is_empty(), "must not draw a menu that does not fit");
     }
 
@@ -714,7 +698,7 @@ mod tests {
         // of our own, outranking every tile id so it is composited over them.
         let menu = Menu::new('a');
         let mut out = Vec::new();
-        menu.draw(&mut out, &metrics(100, 40), state());
+        draw_menu(&menu, &mut out, &metrics(100, 40), state());
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains(&format!("i={},", kitty::OVERLAY_IMAGE_ID)),
@@ -741,7 +725,7 @@ mod tests {
     fn menu_is_padded_and_right_aligns_its_shortcuts() {
         let menu = Menu::new('a');
         let mut out = Vec::new();
-        menu.draw(&mut out, &metrics(100, 40), state());
+        draw_menu(&menu, &mut out, &metrics(100, 40), state());
         let lines = rendered(&out);
 
         assert!(!lines.is_empty(), "nothing was drawn");
@@ -780,16 +764,29 @@ mod tests {
     }
 
     #[test]
-    fn clearing_the_menu_blanks_every_cell_it_drew() {
-        // Repainting the image cannot undraw the menu, because the image is
-        // composited below the text. The cells have to be erased, and the erase has
-        // to cover exactly the rectangle that was drawn or a frame of it survives.
-        let menu = Menu::new('a');
+    fn a_menu_absent_from_the_next_frame_blanks_every_cell_it_drew() {
+        // Repainting the image cannot undraw the menu, because the image is composited
+        // below the text: the cells have to be blanked, over exactly the rectangle that was
+        // drawn, or a frame of it survives. Nothing asks for that any more -- the menu is
+        // simply not rendered, and the plane's diff works out the rest.
+        let mut menu = Menu::new('a');
         let m = metrics(100, 40);
+        // Pointed at, so the hover bar is placed too and both images have to go.
+        let area = menu.area(&m).expect("the menu did not fit");
+        menu.set_hover(menu.hit(&m, area.x + PAD_X, area.y + PAD_Y + 3));
+        let mut chrome = Chrome::new();
+
+        chrome.begin(&m);
         let mut drawn = Vec::new();
-        menu.draw(&mut drawn, &m, state());
+        menu.render(&mut chrome, &mut drawn, &m, state());
+        chrome.flush(&mut drawn);
+        chrome.commit();
+
+        // The next frame has no menu in it.
+        chrome.begin(&m);
         let mut cleared = Vec::new();
-        menu.clear(&mut cleared, &m);
+        let vacated = chrome.flush(&mut cleared);
+        chrome.commit();
 
         assert!(!cleared.is_empty(), "nothing was erased");
         let cells = |buf: &[u8]| {
@@ -803,36 +800,45 @@ mod tests {
             cells(&cleared),
             "the erase must cover the same cells the menu drew"
         );
-        let text = String::from_utf8(cleared).unwrap();
         assert!(
-            text.starts_with("\x1b[0m"),
-            "the cells must go back to default attributes to be transparent again"
+            !vacated.is_empty(),
+            "and hand them back as damage, so the picture under them is drawn again"
         );
+        let text = String::from_utf8(cleared).unwrap();
         for id in [kitty::OVERLAY_IMAGE_ID, kitty::MENU_HIGHLIGHT_IMAGE_ID] {
             assert!(
                 text.contains(&format!("a=d,d=I,i={id}")),
                 "image {id} outranks every tile and has to be deleted too"
             );
         }
-        // Nothing but blanks between the cursor moves: a leftover border would
-        // still be on screen.
-        for chunk in text.split("\x1b[").skip(2) {
-            let body = chunk.split_once('H').map(|(_, b)| b).unwrap_or("");
-            // The image deletes ride along after the last row's blanks.
-            let body = body.split('\x1b').next().unwrap_or("");
-            assert!(
-                body.chars().all(|c| c == ' '),
-                "the erase wrote something other than blanks: {body:?}"
-            );
-        }
+        // Nothing but blanks and the image deletes: a leftover border would still be there.
+        let written: String = text
+            .split("\x1b[")
+            .skip(1)
+            .filter_map(|chunk| chunk.split_once('H').map(|(_, body)| body.to_string()))
+            .map(|body| body.split('\x1b').next().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            written.chars().all(|c| c == ' '),
+            "the erase wrote something other than blanks: {written:?}"
+        );
     }
 
     #[test]
-    fn a_menu_that_does_not_fit_is_not_cleared_either() {
-        // Otherwise the erase would blank a rectangle that was never drawn.
+    fn a_menu_that_does_not_fit_leaves_nothing_to_blank() {
+        // Otherwise the frame after it would blank a rectangle that was never drawn.
+        let m = metrics(20, 6);
+        let mut chrome = Chrome::new();
+        chrome.begin(&m);
         let mut out = Vec::new();
-        Menu::new('a').clear(&mut out, &metrics(20, 6));
-        assert!(out.is_empty());
+        Menu::new('a').render(&mut chrome, &mut out, &m, state());
+        chrome.flush(&mut out);
+        chrome.commit();
+
+        chrome.begin(&m);
+        let mut after = Vec::new();
+        assert!(chrome.flush(&mut after).is_empty());
+        assert!(after.is_empty(), "nothing was drawn, so nothing is erased");
     }
 
     #[test]
@@ -841,7 +847,7 @@ mod tests {
         // the check below would pass by having nothing to look at.
         let m = metrics(100, 40);
         let mut out = Vec::new();
-        Menu::new('a').draw(&mut out, &m, state());
+        draw_menu(&Menu::new('a'), &mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
         // Every cursor move must stay above the last row. Only sequences that
         // actually terminate in `H` are positions: the colour set-up ends in `m`,
@@ -950,7 +956,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        menu.draw(&mut out, &m, state());
+        draw_menu(&menu, &mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
         let ink = state().theme.palette();
         assert!(
@@ -1030,7 +1036,7 @@ mod tests {
         menu.set_hover(menu.hit(&m, m.cols / 2, row));
 
         let mut out = Vec::new();
-        menu.draw(&mut out, &m, state());
+        draw_menu(&menu, &mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
         // A bar the pointer's row wide, drawn as an image with an id above the
         // backdrop's: a cell background would be buried, and a lower id would put
@@ -1066,11 +1072,23 @@ mod tests {
             "the bar must release its last placement before making another"
         );
 
-        // Pointing at nothing takes it away and puts nothing back. Nothing is placed,
-        // so nothing releases the last placement either, and only this delete does.
+        // Pointing at nothing takes it away and puts nothing back. Nothing is placed, so
+        // nothing releases the last placement either, and only a delete can do it -- which
+        // is the chrome's, at the end of a frame that did not ask for the bar. So this needs
+        // the same plane across both frames, as a session has.
+        let mut chrome = Chrome::new();
+        chrome.begin(&m);
+        let mut out = Vec::new();
+        menu.render(&mut chrome, &mut out, &m, state());
+        chrome.flush(&mut out);
+        chrome.commit();
+
+        chrome.begin(&m);
         let mut out = Vec::new();
         menu.set_hover(Hit::Outside);
-        menu.draw(&mut out, &m, state());
+        menu.render(&mut chrome, &mut out, &m, state());
+        chrome.flush(&mut out);
+        chrome.commit();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains(&bg(state().theme.palette().hover)));
         assert!(
@@ -1114,7 +1132,7 @@ mod tests {
             let row = row_of(&menu, &m, label);
             menu.set_hover(menu.hit(&m, col, row));
             let mut out = Vec::new();
-            menu.draw(&mut out, &m, state());
+            draw_menu(&menu, &mut out, &m, state());
             let text = String::from_utf8(out).unwrap();
             assert!(
                 bar_command(&text, "a=d").is_some_and(|release| release < placement(&text)),
@@ -1203,7 +1221,7 @@ mod tests {
             (ScaleMode::OneToOne, "1:1"),
         ] {
             let mut out = Vec::new();
-            menu.draw(&mut out, &m, State { mode, ..state() });
+            draw_menu(&menu, &mut out, &m, State { mode, ..state() });
             let lines = rendered(&out);
             let drawn = &lines[usize::from(row - menu.area(&m).unwrap().y)];
             assert!(drawn.contains(&format!("[{name}]")), "{mode:?}: {drawn:?}");
@@ -1250,7 +1268,7 @@ mod tests {
         // choosing a theme shows you the theme.
         for (theme, name) in [(Theme::Dark, "Dark"), (Theme::Light, "Light")] {
             let mut out = Vec::new();
-            menu.draw(&mut out, &m, State { theme, ..state() });
+            draw_menu(&menu, &mut out, &m, State { theme, ..state() });
             let text = String::from_utf8(out).unwrap();
             let drawn = &rendered(text.as_bytes())[usize::from(row - area.y)];
             assert!(drawn.contains(&format!("[{name}]")), "{theme:?}: {drawn:?}");
@@ -1274,7 +1292,7 @@ mod tests {
 
         menu.set_hover(menu.hit(&m, start, row));
         let mut out = Vec::new();
-        menu.draw(&mut out, &m, state());
+        draw_menu(&menu, &mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
 
         let bar = menu.hover_bar(area).expect("nothing highlighted");
@@ -1295,7 +1313,7 @@ mod tests {
         assert!(text.contains("\x1b[4m"), "the option is not underlined");
         let mut plain = Vec::new();
         menu.clear_hover();
-        menu.draw(&mut plain, &m, state());
+        draw_menu(&menu, &mut plain, &m, state());
         assert!(!String::from_utf8(plain).unwrap().contains("\x1b[4m"));
     }
 

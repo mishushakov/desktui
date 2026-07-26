@@ -439,3 +439,110 @@ pub fn show(buf: &[u8]) -> String {
     }
     s
 }
+
+/// The cells a stream of escapes would leave on screen.
+///
+/// The chrome is diffed frame to frame, so a message that replaces another is written only
+/// where the two differ: "scaling: scaled" over "scaling: scaled up" reaches the terminal as
+/// a few cells and a cursor move, and searching the stream for the whole phrase finds
+/// nothing. What is on screen is the claim worth making, so this reconstructs it.
+///
+/// Only what the chrome uses: absolute cursor positioning, printable text, and erase-to-end
+/// of line. Everything else -- graphics commands, SGR, mode changes -- is skipped, which is
+/// exactly right: none of it puts a glyph in a cell.
+pub struct Screen {
+    rows: Vec<Vec<char>>,
+}
+
+impl Screen {
+    /// Replay `out` onto a grid large enough for any terminal a test opens, so a resize
+    /// mid-stream does not need to be tracked to read what is on screen.
+    pub fn of(out: &[u8]) -> Self {
+        Self::replay(out, 512, 256)
+    }
+
+    /// Replay `out` and return what it left on a `cols` by `rows` screen.
+    pub fn replay(out: &[u8], cols: usize, rows: usize) -> Self {
+        let mut screen = Self {
+            rows: vec![vec![' '; cols]; rows],
+        };
+        let (mut row, mut col) = (0usize, 0usize);
+        let text = String::from_utf8_lossy(out).into_owned();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                if c.is_control() {
+                    continue;
+                }
+                if let Some(line) = screen.rows.get_mut(row)
+                    && let Some(cell) = line.get_mut(col)
+                {
+                    *cell = c;
+                }
+                col += 1;
+                continue;
+            }
+            // An escape: collect it, then act on the ones that move or blank cells.
+            let Some(kind) = chars.next() else { break };
+            if kind == '_' || kind == 'P' || kind == ']' {
+                // A device-control or graphics string, terminated by ST.
+                let mut last = '\0';
+                for c in chars.by_ref() {
+                    if last == '\x1b' && c == '\\' {
+                        break;
+                    }
+                    last = c;
+                }
+                continue;
+            }
+            if kind != '[' {
+                continue;
+            }
+            let mut params = String::new();
+            let mut final_byte = '\0';
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    final_byte = c;
+                    break;
+                }
+                params.push(c);
+            }
+            let numbers: Vec<usize> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
+            match final_byte {
+                'H' => {
+                    row = numbers.first().copied().unwrap_or(1).saturating_sub(1);
+                    col = numbers.get(1).copied().unwrap_or(1).saturating_sub(1);
+                }
+                'K' => {
+                    // 2 blanks the whole line, 0 or absent from the cursor on.
+                    let from = if numbers.first() == Some(&2) { 0 } else { col };
+                    if let Some(line) = screen.rows.get_mut(row) {
+                        for cell in &mut line[from.min(cols)..] {
+                            *cell = ' ';
+                        }
+                    }
+                }
+                'J' => {
+                    for line in &mut screen.rows {
+                        line.fill(' ');
+                    }
+                }
+                _ => {}
+            }
+        }
+        screen
+    }
+
+    /// One row, trailing blanks trimmed.
+    pub fn row(&self, row: usize) -> String {
+        self.rows
+            .get(row)
+            .map(|line| line.iter().collect::<String>().trim_end().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Is `text` on any row?
+    pub fn contains(&self, text: &str) -> bool {
+        (0..self.rows.len()).any(|row| self.row(row).contains(text))
+    }
+}
