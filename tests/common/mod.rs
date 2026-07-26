@@ -500,7 +500,11 @@ pub fn assert_a_relayout_never_blanks_the_screen(term: &FakeTerm, before: usize)
              (last open {open}, last close {since:?}): {}",
             show(seen)
         );
-        let close = closes.iter().copied().find(|c| *c > at).unwrap_or(seen.len());
+        let close = closes
+            .iter()
+            .copied()
+            .find(|c| *c > at)
+            .unwrap_or(seen.len());
         assert!(
             contains(&seen[open..close], session::DREW),
             "the screen was erased at {at} in a block that drew nothing back: {}",

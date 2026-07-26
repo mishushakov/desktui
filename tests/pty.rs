@@ -612,7 +612,8 @@ fn resizing_with_the_menu_up_leaves_nothing_of_the_old_one() {
         .filter(|row| screen.row(*row).contains("Command menu"))
         .count();
     assert_eq!(
-        titles, 1,
+        titles,
+        1,
         "expected exactly one menu on screen, rows read:\n{}",
         (0..50)
             .map(|row| format!("{row:>3}|{}", screen.row(row)))
