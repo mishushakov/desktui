@@ -491,8 +491,9 @@ fn a_drag_is_still_coalesced_into_a_few_requests() {
     // drags on until that is not so, and a machine slow enough to reach its limit anyway
     // has said everything it can -- the ceiling above still held of it. Reported rather
     // than asserted, because failing the build over how a shared runner was scheduled is
-    // what had this test out of CI in the first place; a red build there teaches nobody
-    // anything, where a line in the log is there when someone asks what the run proved.
+    // what had this test out of CI in the first place; a red build there says only that a
+    // runner was busy. Cargo keeps the line for whoever runs the test themselves, `--
+    // --nocapture` or a failure being what brings it out.
     if !conclusive || usize::from(steps) <= allowed {
         eprintln!(
             "note: {steps} resizes in {drag:?}, against a ceiling of {allowed} requests -- \

@@ -121,9 +121,10 @@ How many steps fit inside a drag is the machine's business, though, and a shared
 been seen to stretch a 16ms sleep to 125ms — two steps to a window where a quiet machine
 manages fifteen. A short drag of those proves nothing, one request per step not having
 exceeded the ceiling either, so the drag goes on until the steps outnumber it. Where even
-that runs out of patience the run says what it did and did not establish, in a line on
-stderr, and holds the client to the ceiling anyway: the alternative is a red build that
-says only that a runner was busy, which is what had this test `#[ignore]`d to begin with.
+that runs out of patience the run says what it did and did not establish — on stderr, so
+cargo keeps it until someone runs the test themselves — and holds the client to the ceiling
+anyway: the alternative is a red build that says only that a runner was busy, which is what
+had this test `#[ignore]`d to begin with.
 
 One input can be lost rather than late, and it is worth knowing which: a bracketed paste
 whose first `\x1b` lands alone in a read is delivered as the *Escape key*, that byte being
