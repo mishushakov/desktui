@@ -25,7 +25,7 @@ Every design decision below follows from one of these.
 | `z=-1` is below text and above the cell background | the status line and the menu stay legible over the picture, and a blank cell does not hide it |
 | `t=s` takes `O=` and `S=`, an offset and a length | one object could hold a whole frame -- except that Ghostty draws nothing for a placement carrying them, so it is an object per tile |
 | DEC 2026 brackets an atomic update | a frame is one write, and the screen never shows half of one |
-| `Fence` synchronises | in-flight work can be bounded without giving up pushed frames |
+| `Fence` synchronises, and `EnableContinuousUpdates` takes a flag | the server's pushing can be turned off and on rather than only declined, and encode time can be told from wire time |
 
 ## The three things a resize changes
 
@@ -212,8 +212,8 @@ the protocol seam; getting at it wants a counting reader in the vendored client.
 time is not separable from wire time yet: `rtt` is measured from the request to `FrameEnd`,
 so it contains the server's encoding. Splitting them wants a fence sent behind the update
 request, whose reply says the server reached that point in its stream -- worth doing
-alongside [Fence as flow control](#2-fence-as-flow-control), which has to solve the same
-probe-versus-flow-control problem anyway.
+alongside [pushing turned off and on again](#2-pushing-turned-off-and-on-again-rather-than-declined),
+which needs the same fence bookkeeping.
 
 ## Where this stands
 
@@ -287,28 +287,38 @@ resize changes what a given screen position maps to, but nothing re-derives it -
 a resize the pointer is drawn at a stale spot until it next moves. A placement is
 re-placed from the new map as a matter of course.
 
-### 2. Fence as flow control
+### 2. Pushing turned off and on again, rather than declined
 
-`--no-push` declines continuous updates wholesale, at a round trip per frame. Fence exists
-to bound in-flight work without giving that up: the server answers one when it reaches that
-point in its stream, so a client can hold a frame's worth of credit and let the server run
-exactly as far ahead as it can draw.
+This item said "Fence as flow control", on the reasoning that a client could hold a frame's
+worth of credit and let the server run exactly as far ahead as it can draw. That is the
+right *shape*, but Fence is not what does it, and it is worth correcting before anyone
+builds against the wrong lever.
 
-This is the principled version of a problem already met and worked around. `--quality`
-reduces how expensive a frame is to *encode*; this bounds how many the server *attempts*.
-Today the choice is binary -- pushed frames with no back-pressure at all, or `--no-push` at
-a round trip each, which the README puts at the difference between twenty frames a second
-and forty on a 25 ms link. With credit, a server that can only encode ten full screens a
-second is asked for ten, instead of encoding flat out while this end decodes frames it will
-never have time to draw.
+The throttle is already in the ContinuousUpdates extension. `EnableContinuousUpdates` takes
+a flag, and the spec has the server stop pushing and answer with `EndOfContinuousUpdates`
+when a client sets it to zero. So the credit protocol is: pushing on while we keep up, off
+when we fall behind, on again when we catch up -- and the handshake for "it has actually
+stopped" is a message that already exists. No fence required.
 
-Needs a real server to tune against, and one trap: fences are already used for the latency
-probe, marked by `RTT_PROBE_MARKER` in `src/remote/vnc.rs`. A flow-control fence has to be
-distinguishable from a probe, or the round-trip figure becomes a measurement of the frame
-queue.
+What Fence *is* for here is the measurement the statistics cannot make: `rtt` runs from an
+update request to `FrameEnd` and so contains the server's encoding time, and a fence sent
+behind the request separates the two. Worth having, but it is an instrument, not a control.
 
-`--no-push` stays regardless -- it is the fallback for a server without Fence, and the
-thing to reach for when the question is "is the server the problem?".
+So the work is:
+
+- `Input::Push(bool)` at the seam, and `VncBackend` distinguishing "we asked it to stop"
+  from "it stopped of its own accord" -- today *every* `EndOfContinuousUpdates` re-arms
+  pushing (`src/remote/vnc.rs`), which would fight a deliberate disable.
+- A policy in the session. The numbers to drive it are now on screen: frames dropped, and
+  the update rate against the frame rate.
+- `--no-push` stays as the floor: the flag for a server whose pushing you want nothing to
+  do with, and the first thing to try when the question is "is the server the problem?".
+
+**The hazard, and why this is last of the four in practice.** A control loop that gets it
+wrong oscillates, and one that disables without re-enabling leaves a frozen screen -- a
+worse failure than the flat-out pushing it replaces. It wants sustained load to tune
+against, which `make desktop` plus a scrolling browser gives and a test does not. Build the
+policy behind a flag, default off, until it has been watched for a while.
 
 ### 3. The plane
 
