@@ -57,7 +57,8 @@ const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// incremental request instantly cannot spin us at full speed.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(2);
 
-/// How long a frame will wait for the update it would be drawing to finish arriving.
+/// How long a frame will wait for the update it would be drawing to finish arriving,
+/// measured from the arrival of that update's first rectangle.
 ///
 /// Past this it draws anyway. An update whose rectangles take longer than this to
 /// arrive cannot be drawn whole *and* often, and a screen that stands still is worse
@@ -1066,7 +1067,16 @@ impl<B: Backend> Session<B> {
         // another. The rectangles still arriving are the rest of this one, and the end of
         // it draws -- so there is nothing to do here but wait, up to the point where
         // waiting is worse than the seam.
-        if self.mid_update && self.fps.since_last() < MAX_PARTIAL_WAIT {
+        //
+        // Measured from when this update started arriving, not from the last frame: the
+        // budget is for *this update's* rectangles to turn up in, and time spent idle
+        // before it began is not the server being slow with it. Timing it from the last
+        // frame charged the update for the gap ahead of it, so a machine that had been
+        // busy elsewhere drew the seam on an update that arrived perfectly promptly.
+        let waited = self
+            .update_started
+            .map_or(Duration::ZERO, |at| at.elapsed());
+        if self.mid_update && waited < MAX_PARTIAL_WAIT {
             return Ok(());
         }
         self.draw()

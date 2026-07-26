@@ -256,10 +256,15 @@ fn the_statistics_say_what_the_other_end_is_doing() {
 
     let bar = Screen::of(&term.output()).row(49);
     let (rate, delivery) = delivery_figures(&bar).expect("no delivery figures in the bar");
+    // One update per stall, near enough: worked out from the stall rather than written
+    // down, so the figure follows the constant instead of being pinned to one value of it.
+    // Wide, because what the server adds around a stall is the machine's business and the
+    // claim is only that the bar reports the order of magnitude it is seeing.
+    let expected = 1000.0 / SPLIT_STALL.as_millis() as f64;
     assert!(
-        (2.0..8.0).contains(&rate),
-        "expected about five updates a second from a {SPLIT_STALL:?} stall, bar said \
-         {rate}: {bar:?}"
+        (expected * 0.4..expected * 1.6).contains(&rate),
+        "expected about {expected:.0} updates a second from a {SPLIT_STALL:?} stall, bar \
+         said {rate}: {bar:?}"
     );
     // Measured from the first rectangle *arriving*, where the server's stall starts before
     // it writes one, so this reads a few milliseconds under the stall rather than over it.
