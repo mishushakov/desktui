@@ -215,6 +215,25 @@ fn release_placement(out: &mut Vec<u8>, id: u32) {
     let _ = write!(out, "\x1b_Ga=d,d=i,i={id},p={PLACEMENT_ID},q=2\x1b\\");
 }
 
+/// Put an image the terminal already holds on different cells, without sending a pixel.
+///
+/// A layout can move the picture without changing it: centring an image in a window of
+/// another width shifts every tile by a cell and leaves every pixel where it was. `a=p`
+/// is the protocol's word for that -- display image `i` at the cursor, no payload -- and
+/// the docs name replacing a placement as the way to "resize or move placements around
+/// the screen without flicker".
+///
+/// No dimensions: the image has its own, from the transmission that created it, and the
+/// natural size is the size it was drawn at before.
+///
+/// The release beforehand is the discipline every placement here follows, for the reason
+/// [`release_placement`] gives.
+pub fn place_existing(out: &mut Vec<u8>, id: u32, col: u16, row: u16) {
+    release_placement(out, id);
+    let _ = write!(out, "\x1b[{};{}H", row as u32 + 1, col as u32 + 1);
+    let _ = write!(out, "\x1b_Ga=p,q=2,C=1,z=-1,i={id},p={PLACEMENT_ID}\x1b\\");
+}
+
 /// Fill a block of cells with one colour, as an image at the tiles' own z-index.
 ///
 /// An overlay cannot be given a background with SGR: the remote screen is

@@ -15,7 +15,7 @@ pub mod testpattern;
 
 use crate::cli::ScaleMode;
 use crate::term::Metrics;
-use crate::term::kitty::{IMAGE_ID_BASE, KittyEncoder, Placement, delete_image};
+use crate::term::kitty::{IMAGE_ID_BASE, KittyEncoder, Placement, delete_image, place_existing};
 use crate::term::shm::ShmPool;
 use framebuffer::Framebuffer;
 use scale::{Filter, Scaler};
@@ -178,21 +178,23 @@ impl Layout {
         }
     }
 
-    /// Do two layouts put the same source pixels on the same cells?
+    /// Do two layouts fill a given tile with the same source pixels?
     ///
-    /// Not whether they are equal -- the grid either side may be wider or taller. This is
-    /// the question a tile the terminal already holds turns on: whether the pixels under
-    /// its id are still the pixels it would be sent. Cells of another size, a crop that
-    /// starts somewhere else, or an image that begins on another cell all mean no.
+    /// Not whether they are equal -- the grid either side may be wider or taller, and the
+    /// picture may sit on different cells. This is the question a tile the terminal
+    /// already holds turns on: whether the pixels under its id are still the pixels it
+    /// would be sent. Cells of another size or a crop that starts somewhere else mean no.
     ///
     /// So does scaling, either side. The resampled copy is made from the whole visible
     /// source to the whole destination, so a destination of another size changes every
     /// pixel in it, including the pixels of tiles that did not move.
+    ///
+    /// Where the tile then *goes* is a separate question, and a cheaper one: a picture
+    /// that only moved needs its placements put on other cells, not its pixels sent
+    /// again.
     pub fn maps_alike(&self, other: &Self) -> bool {
         self.cell_w == other.cell_w
             && self.cell_h == other.cell_h
-            && self.origin_col == other.origin_col
-            && self.origin_row == other.origin_row
             && self.src.x == other.src.x
             && self.src.y == other.src.y
             && !self.needs_scaling()
@@ -520,7 +522,12 @@ impl Renderer {
         // it from before. Anything else -- a tile that was clipped at the edge and is not
         // any more, one the grid has only just reached, one still waiting on damage that
         // arrived before the resize -- is drawn again.
+        //
+        // Where a kept tile goes is a separate question. Centring an image in a window of
+        // another width shifts every tile by a cell without changing a pixel of it, and
+        // that costs a placement rather than a transmission.
         let alike = was.maps_alike(&layout);
+        let moved = (was.origin_col, was.origin_row) != (layout.origin_col, layout.origin_row);
         self.dirty = Vec::with_capacity(grid.len());
         self.dirty_count = 0;
         for ty in 0..grid.ny {
@@ -532,6 +539,14 @@ impl Renderer {
                     && !was_dirty[usize::from(ty) * usize::from(was_grid.nx) + usize::from(tx)];
                 self.dirty.push(!clean);
                 self.dirty_count += usize::from(!clean);
+                if clean && moved {
+                    place_existing(
+                        &mut cleanup,
+                        grid.id(tx, ty),
+                        layout.origin_col + tx * grid.tile_cols,
+                        layout.origin_row + ty * grid.tile_rows,
+                    );
+                }
             }
         }
 
@@ -1280,6 +1295,53 @@ mod tests {
             "most of the grid should have been kept: {} of {}",
             r.dirty_tiles(),
             r.tile_count()
+        );
+    }
+
+    #[test]
+    fn a_picture_that_only_moved_is_re_placed_rather_than_re_sent() {
+        // A desktop smaller than the window is centred in it, so a window of another width
+        // puts every tile on another cell without changing a pixel of any of them. That is
+        // a placement each and no payload at all -- where it used to be the whole picture,
+        // because the tiles had moved and nothing could tell that from their having
+        // changed.
+        let m = metrics(200, 50, 8, 17);
+        let mut r = Renderer::new(
+            Layout::compute(&m, ScaleMode::OneToOne, 640, 480, (0, 0)),
+            true,
+            Transfer::Direct,
+        );
+        let fb = Framebuffer::new(640, 480);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        r.commit();
+        let tiles = r.tile_count();
+
+        // Two columns wider: the centred image starts one cell further along.
+        let wider = metrics(202, 50, 8, 17);
+        let moved = Layout::compute(&wider, ScaleMode::OneToOne, 640, 480, (0, 0));
+        assert_ne!(
+            moved.origin_col, r.layout.origin_col,
+            "the image was supposed to move"
+        );
+        let cleanup = r.relayout(moved);
+        let text = String::from_utf8(cleanup).unwrap();
+
+        assert_eq!(r.dirty_tiles(), 0, "not a pixel of it has changed");
+        assert_eq!(
+            text.matches("a=p,").count(),
+            tiles,
+            "every tile should have been put on its new cells: {text:?}"
+        );
+        assert!(
+            !text.contains("a=T"),
+            "a move must not transmit anything: {text:?}"
+        );
+        // At the cells the new layout puts the first tile on, one-based.
+        let at = format!("\x1b[{};{}H", moved.origin_row + 1, moved.origin_col + 1);
+        assert!(
+            text.contains(&at),
+            "the first tile was not put at {at:?}: {text:?}"
         );
     }
 

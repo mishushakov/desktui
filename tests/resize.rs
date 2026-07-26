@@ -179,6 +179,81 @@ fn growing_the_window_sends_the_new_tiles_and_not_the_rest() {
 }
 
 #[test]
+fn moving_the_picture_costs_placements_and_not_pixels() {
+    // A desktop smaller than the window is centred in it, so a window of another width
+    // puts every tile on another cell without changing a pixel of any of them. The
+    // terminal is holding all of it already and the protocol can say so: `a=p` puts an
+    // image it has on other cells, with no payload.
+    let (_server, mut term) = start_with(Extensions::default(), (640, 480), &["--scale", "1:1"]);
+    assert_drew(&term, Duration::from_secs(10));
+    // Wait for the screen to stop changing. The note the client puts up at startup marks
+    // everything when it goes, and a redraw arriving in the middle of this would be read
+    // as the resize having sent pixels.
+    settle(&term);
+
+    let before = tiles_drawn(&term);
+    term.resize(202, 50, 1616, 850);
+    assert!(
+        term.wait_for(b"a=p,", Duration::from_secs(10)),
+        "the picture was never put on its new cells: {}",
+        tail(&term.output())
+    );
+
+    // In the frame that moved it, and that frame alone: the placements go out ahead of
+    // whatever the compose has to say, so a move with nothing to send is a frame with no
+    // transmission in it at all.
+    let out = term.output();
+    let moved = before_at(&out, b"a=p,").expect("no frame carried the move");
+    assert!(
+        !contains(moved, DREW),
+        "moving the picture sent pixels too: {}",
+        show(moved)
+    );
+    assert!(
+        count(moved, b"a=p,") > 1,
+        "only one tile was moved, so this is not the whole picture: {}",
+        show(moved)
+    );
+    assert_eq!(
+        tiles_drawn(&term),
+        before,
+        "the move should not have drawn a tile anywhere"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+/// Wait for the screen to stop changing, so a later count means what happened next.
+///
+/// Several quiet samples rather than one: a frame the writer was too busy to take keeps
+/// its damage and goes out on a later tick, so a single quiet moment is not the same as
+/// nothing being owed. That frame arriving in the middle of the resize would be read as
+/// the move having sent pixels.
+fn settle(term: &FakeTerm) {
+    let mut quiet = 0;
+    let mut last = tiles_drawn(term);
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = tiles_drawn(term);
+        quiet = if now == last { quiet + 1 } else { 0 };
+        if quiet >= 3 {
+            return;
+        }
+        last = now;
+    }
+}
+
+/// The synchronised block containing the first occurrence of `needle`, which is one frame.
+fn before_at<'a>(out: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    let at = find(out, needle)?;
+    let open = offsets(out, BEGIN_SYNC).into_iter().rfind(|o| *o < at)?;
+    let from = open + BEGIN_SYNC.len();
+    let len = find(&out[from..], END_SYNC)?;
+    Some(&out[from..from + len])
+}
+
+#[test]
 fn a_refused_resize_falls_back_and_says_why() {
     let (server, mut term) = start(Resize::Refuse, (1024, 768));
 
