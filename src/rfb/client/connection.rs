@@ -123,18 +123,14 @@ impl VncInner {
             .await?;
 
         trace!("client encodings: {:?}", encodings);
-        let extended_clipboard = encodings.contains(&VncEncoding::ExtendedClipboardPseudo);
         send_client_encoding(&mut stream, encodings, quality, compression).await?;
 
-        // A server that understands the extension answers the `SetEncodings` above with
-        // a `caps` message. Ours goes the other way now: text is the only format a
-        // terminal can hold, and the size of zero says we would rather be told the
-        // clipboard changed than handed a copy of every remote selection.
-        if extended_clipboard {
-            ClientMsg::ExtendedCutText(clipboard::caps())
-                .write(&mut stream)
-                .await?;
-        }
+        // Nothing extended goes out here. A server that understands the extension
+        // answers the `SetEncodings` above with a `caps` message, and ours is the reply
+        // to that -- see [`X11Event::ClipboardCaps`]. Sending it unasked costs a server
+        // that does not understand the extension the whole session: the length of an
+        // extended `ClientCutText` is negative, and macOS's Screen Sharing reads that as
+        // a protocol error and hangs up.
 
         // Start with a non-incremental request. Besides fetching the first frame,
         // this is the only way to learn the screen layout: a server supporting
@@ -209,6 +205,7 @@ impl VncInner {
                 ClientMsg::PointerEvent(mouse.x, mouse.y, mouse.buttons)
             }
             X11Event::CopyText(text) => ClientMsg::ClientCutText(text),
+            X11Event::ClipboardCaps => ClientMsg::ExtendedCutText(clipboard::caps()),
             X11Event::ClipboardRequest => ClientMsg::ExtendedCutText(clipboard::request()),
             X11Event::ClipboardNotify => ClientMsg::ExtendedCutText(clipboard::notify()),
             X11Event::ClipboardProvide(text) => {
@@ -1010,6 +1007,110 @@ mod tests {
             ),
             "{events:?}"
         );
+    }
+
+    /// A stream that reads a canned `ServerInit` and remembers what was written back.
+    ///
+    /// Cloneable and `'static` because `VncInner::new` takes the stream by value and
+    /// hands it to spawned tasks; the recording half stays reachable from the test.
+    #[derive(Clone, Default)]
+    struct Duplex {
+        inbound: Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+        outbound: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for Duplex {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut inbound = self.inbound.lock().unwrap();
+            while buf.remaining() > 0 {
+                match inbound.pop_front() {
+                    Some(byte) => buf.put_slice(&[byte]),
+                    // Running dry is end of stream, so the decode task stops rather
+                    // than parking forever on a script that said all it had to say.
+                    None => break,
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Duplex {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.outbound.lock().unwrap().extend_from_slice(data);
+            std::task::Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A `ServerInit` for an 800x600 desktop called "test".
+    fn server_init() -> Vec<u8> {
+        let mut bytes = 800u16.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&600u16.to_be_bytes());
+        bytes.extend_from_slice(&[32, 24, 0, 1]); // bpp, depth, big endian, true colour
+        bytes.extend_from_slice(&[0, 255, 0, 255, 0, 255]); // the three maxima
+        bytes.extend_from_slice(&[16, 8, 0, 0, 0, 0]); // the three shifts, then padding
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        bytes.extend_from_slice(b"test");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn setting_up_sends_nothing_the_server_has_not_agreed_to() {
+        // The extended clipboard is offered by naming its pseudo-encoding and agreed to
+        // by the server answering with `caps`. Sending our own caps as part of setup
+        // jumped that second step, and it is not a harmless extra: the length of an
+        // extended `ClientCutText` is negative, and macOS's Screen Sharing reads one it
+        // never agreed to as a protocol error and closes the connection -- so the
+        // session died moments after the password was accepted.
+        let stream = Duplex::default();
+        stream
+            .inbound
+            .lock()
+            .unwrap()
+            .extend(server_init().into_iter());
+
+        let inner = VncInner::new(
+            stream.clone(),
+            true,
+            Some(PixelFormat::bgra()),
+            vec![VncEncoding::Raw, VncEncoding::ExtendedClipboardPseudo],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let written = stream.outbound.lock().unwrap().clone();
+        assert_eq!(written[0], 1, "ClientInit's shared flag comes first");
+        assert_eq!(written[1], 0, "then SetPixelFormat");
+        assert_eq!(written[21], 2, "then SetEncodings, and nothing else");
+        assert!(
+            !written[21..].contains(&6),
+            "a ClientCutText went out before the server offered a clipboard: {written:?}"
+        );
+
+        drop(inner);
     }
 
     #[tokio::test]

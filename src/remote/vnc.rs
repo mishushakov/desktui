@@ -288,6 +288,13 @@ impl State {
                 // leaves us on the lossy path regardless.
                 tracing::debug!("extended clipboard negotiated: {caps:?}");
                 self.clipboard = Some(caps);
+                // Our own caps, which the server is owed and which nothing above
+                // decides: text is the only format a terminal can hold, and the
+                // unsolicited size of zero says we would rather be told the clipboard
+                // changed than handed a copy of every remote selection. This is the
+                // first extended message we are allowed to send, and it has to go
+                // before any notify or provide.
+                self.outbox.push_back(X11Event::ClipboardCaps);
                 Some(Update::ClipboardLossy(!self.clipboard_is_usable()))
             }
             VncEvent::ClipboardNotify { text } => {
@@ -696,6 +703,30 @@ mod tests {
             1024,
         )));
         assert!(matches!(update, Some(Update::ClipboardLossy(false))));
+    }
+
+    #[test]
+    fn our_caps_answer_the_servers_and_are_not_offered_before_them() {
+        // The extension's handshake runs one way only: the pseudo-encoding in
+        // `SetEncodings` is the offer, the server's caps are the acceptance, and ours
+        // are the reply. Sending ours unasked cost the whole session against macOS
+        // Screen Sharing, which reads the negative length of an extended
+        // `ClientCutText` as a protocol error and hangs up mid-handshake.
+        let mut state = State {
+            clipboard_wanted: true,
+            ..State::default()
+        };
+        assert!(
+            state.outbox.is_empty(),
+            "nothing extended may go out before the server's caps"
+        );
+
+        state.translate(VncEvent::ClipboardCaps(caps_taking(1024)));
+
+        assert!(
+            matches!(state.outbox.pop_front(), Some(X11Event::ClipboardCaps)),
+            "the server's caps are owed a reply, and it comes first"
+        );
     }
 
     #[test]
