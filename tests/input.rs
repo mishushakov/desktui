@@ -139,6 +139,89 @@ fn the_help_overlay_goes_away_on_the_next_key() {
 }
 
 #[test]
+fn clicking_a_scaling_option_selects_that_one() {
+    // The menu is the only way to reach a scaling mode by name. The key cannot: one
+    // binding for four modes can only step to the next.
+    //
+    // The server refuses to resize, so the modes are told apart by what they do to a
+    // 1024x768 desktop in a 1600x833 area. Native falls back, integer scales by one
+    // and 1:1 is itself -- all three pixel-exact. Only fit resamples, so "scaled" is
+    // proof that the click landed on fit itself: one step on from the mode native fell
+    // back to would have been native again.
+    let (server, mut term) = start(Resize::Refuse, (1024, 768));
+    assert!(
+        term.wait_for(b"1:1", Duration::from_secs(10)),
+        "never fell back from native: {}",
+        tail(&term.output())
+    );
+
+    // Ctrl+A then ? raises the menu.
+    term.send(&[0x01]);
+    std::thread::sleep(Duration::from_millis(50));
+    term.send(b"?");
+    assert!(
+        term.wait_for(b"Scaling", Duration::from_secs(10)),
+        "the menu never appeared: {}",
+        tail(&term.output())
+    );
+
+    // Where fit is. Nineteen entries and their padding make a box 53 by 21, centred
+    // across 200 columns and the 49 rows above the status line, so its top left is
+    // cell 73,14. The options are the fifteenth entry, three columns in past the
+    // padding, and fit is the second of them -- ten cells along, native taking eight
+    // and the gap two. Cell 89,29, which in 8x17 cells is pixel 716,501, and mouse
+    // reports are one-based.
+    //
+    // Checked rather than assumed, because a click aimed at a row that has moved
+    // would fail somewhere far less obvious than here.
+    let out = term.output();
+    let at = find(&out, b"\x1b[30;74H").unwrap_or_else(|| {
+        panic!(
+            "the menu does not reach cell 74,30 any more: {}",
+            tail(&out)
+        )
+    });
+    assert!(
+        contains(&out[at..(at + 160).min(out.len())], b"Native"),
+        "cell 74,30 is no longer the row of scaling options, so the click would miss"
+    );
+    let mark = out.len();
+    term.send(b"\x1b[<0;717;502M");
+    term.send(b"\x1b[<0;717;502m");
+
+    assert!(
+        term.wait_for(b"scaling: scaled", Duration::from_secs(10)),
+        "the click did not select fit: {}",
+        tail(&term.output())
+    );
+
+    // Acting on a click also puts the menu away, as the chord that reached it would
+    // have. It is redrawn every frame while it is up, so a tail that no longer
+    // mentions it is the box being gone rather than merely not resent.
+    std::thread::sleep(Duration::from_millis(500));
+    let since = term.output()[mark..].to_vec();
+    assert!(
+        !contains(&since, b"Renegotiate the remote size"),
+        "the menu was still being drawn after a click on one of its items"
+    );
+
+    // And the click went to the menu alone. A button that reached the remote as well
+    // would have pressed whatever the box was covering.
+    assert!(
+        server
+            .wait_for(Duration::from_secs(1), |r| matches!(
+                r,
+                Request::Pointer { buttons: 1, .. }
+            ))
+            .is_none(),
+        "the click was forwarded to the server as well"
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
 fn a_terminal_without_key_releases_gets_them_synthesised() {
     // Otherwise the remote would hold every key down for ever.
     let server = FakeServer::start(1024, 768, Resize::Accept);

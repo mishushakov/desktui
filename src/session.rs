@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval};
@@ -24,6 +24,7 @@ use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
+use crate::ui::menu::{Hit, Menu};
 use crate::ui::status;
 
 /// How long to wait for the TCP connection.
@@ -317,8 +318,10 @@ struct Session {
 
     view_only: bool,
     no_clipboard: bool,
+    /// The command menu, and where the pointer is on it.
+    menu: Menu,
     show_help: bool,
-    /// The overlay was dismissed and its cells still have to be blanked. Drawing
+    /// The menu was dismissed and its cells still have to be blanked. Drawing
     /// the image over them does not do it: the image sits below the text.
     clear_help: bool,
     show_stats: bool,
@@ -376,6 +379,7 @@ impl Session {
             remote_num_lock: None,
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
+            menu: Menu::new(args.prefix_char()),
             show_help: false,
             clear_help: false,
             show_stats: false,
@@ -768,6 +772,14 @@ impl Session {
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
 
+                // The menu takes the pointer while it is up. Nothing goes through to
+                // the remote: a click meant for a menu item must not also land on
+                // whatever is behind it.
+                if self.show_help {
+                    self.on_menu_mouse(mouse).await?;
+                    return Ok(());
+                }
+
                 if !self.view_only {
                     let events = {
                         let layout = *self.renderer.layout();
@@ -835,18 +847,8 @@ impl Session {
                 self.request_native_size(true).await?;
                 self.set_note("renegotiating the remote size".into());
             }
-            Command::CycleMode => {
-                let mode = self.mode.next();
-                self.mode = mode;
-                self.pan = (0, 0);
-                if mode == ScaleMode::Native {
-                    self.requested_size = None;
-                    self.request_native_size(true).await?;
-                } else {
-                    self.relayout();
-                }
-                self.set_note(format!("scaling: {}", describe(self.renderer.layout())));
-            }
+            Command::CycleMode => self.set_mode(self.mode.next()).await?,
+            Command::Mode(mode) => self.set_mode(mode).await?,
             Command::Pan(dx, dy) => {
                 let layout = *self.renderer.layout();
                 let (max_x, max_y) = layout.pan_limits();
@@ -890,16 +892,60 @@ impl Session {
         Ok(())
     }
 
-    /// Hide the help overlay and arrange for the cells it used to be blanked.
+    /// Adopt a scaling mode, however it was asked for: the key cycles, the menu
+    /// names one outright.
+    async fn set_mode(&mut self, mode: ScaleMode) -> Result<()> {
+        self.mode = mode;
+        self.pan = (0, 0);
+        if mode == ScaleMode::Native {
+            self.requested_size = None;
+            self.request_native_size(true).await?;
+        } else {
+            self.relayout();
+        }
+        self.set_note(format!("scaling: {}", describe(self.renderer.layout())));
+        Ok(())
+    }
+
+    /// Point at the menu, and run whatever is clicked on.
+    ///
+    /// A click on a command runs it and puts the menu away, as the chord that
+    /// reached it would have; a click anywhere off the box puts it away without
+    /// running anything, which is what a menu is expected to do.
+    async fn on_menu_mouse(&mut self, ev: MouseEvent) -> Result<()> {
+        let (col, row) = self.input.terminal_cell(&ev, &self.metrics);
+        let hit = self.menu.hit(&self.metrics, col, row);
+        match ev.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => self.menu.set_hover(hit),
+            MouseEventKind::Down(MouseButton::Left) => match hit {
+                Hit::Item { command, .. } => {
+                    // Run it, then put the box away, in that order: a command that
+                    // toggles the menu would otherwise be handed a menu that is
+                    // already down and turn it back on.
+                    self.on_command(command).await?;
+                    self.dismiss_help();
+                }
+                Hit::Outside => self.dismiss_help(),
+                Hit::Inside => {}
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Hide the menu and arrange for the cells it used to be blanked.
     ///
     /// Clearing the flag is not enough on its own, and neither is damaging the
-    /// image: the overlay is text, and tiles are placed below the text, so the box
+    /// image: the menu is text, and tiles are placed below the text, so the box
     /// outlives any repaint until the cells themselves are erased. The tiles are
     /// marked too, for a terminal that treats an erase as dropping the placements
     /// underneath it.
     fn dismiss_help(&mut self) {
         self.show_help = false;
         self.clear_help = true;
+        // Or the row the pointer happened to be on would be lit the next time the
+        // menu opens, before the pointer has moved to say so.
+        self.menu.clear_hover();
         self.renderer.mark_all();
     }
 
@@ -1101,7 +1147,7 @@ impl Session {
         // Text first, then images, exactly as a relayout does it: erasing cells may
         // take the placements under them with it, so the tiles have to go out after.
         if self.clear_help {
-            status::clear_help(&mut buf, &self.metrics, self.input.prefix());
+            self.menu.clear(&mut buf, &self.metrics);
             self.clear_help = false;
         }
         let stats = self.renderer.compose(&self.fb, &mut buf);
@@ -1110,7 +1156,7 @@ impl Session {
         }
         self.draw_status(&mut buf);
         if self.show_help {
-            status::draw_help(&mut buf, &self.metrics, self.input.prefix());
+            self.menu.draw(&mut buf, &self.metrics, self.mode);
         }
         if self.caps.sync_output {
             kitty::end_sync(&mut buf);

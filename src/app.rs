@@ -18,6 +18,7 @@ use crate::term::caps::Caps;
 use crate::term::kitty;
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard};
+use crate::ui::menu::Menu;
 use crate::ui::status;
 
 /// Rolling frame-rate estimate over a short window.
@@ -88,6 +89,9 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     );
     let mut damage: Vec<Rect> = Vec::new();
     let mut fps = FpsMeter::new();
+    // Listed, not clickable: none of the prefix commands mean anything to a loop
+    // with no server behind it.
+    let menu = Menu::new(args.prefix_char());
     let mut show_help = false;
     let mut clear_help = false;
     let mut last_stats = crate::render::FrameStats::default();
@@ -193,7 +197,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             kitty::begin_sync(&mut buf);
         }
         if clear_help {
-            status::clear_help(&mut buf, &metrics, args.prefix_char());
+            menu.clear(&mut buf, &metrics);
             clear_help = false;
         }
         let stats = renderer.compose(&fb, &mut buf);
@@ -218,7 +222,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
         );
         status::draw(&mut buf, &metrics, &left, &right);
         if show_help {
-            status::draw_help(&mut buf, &metrics, args.prefix_char());
+            menu.draw(&mut buf, &metrics, args.scale);
         }
         if caps.sync_output {
             kitty::end_sync(&mut buf);

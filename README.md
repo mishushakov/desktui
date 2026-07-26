@@ -127,6 +127,12 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | `h` `?` | help |
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
+The help overlay is a menu: the row under the pointer lights up and a click runs it.
+The scaling row is a select — the mode in force is bracketed, and clicking another goes
+straight to it, where the key can only step to the next one. `Esc` closes the menu, as
+does any other key or a click off the box. While it is open the pointer belongs to the
+menu, so nothing you click on reaches the remote desktop.
+
 Clipboard works in both directions: paste into the terminal and it reaches the
 remote clipboard; the remote clipboard arrives locally through OSC 52.
 

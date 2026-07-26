@@ -23,6 +23,7 @@ use crossterm::event::{
 
 use super::Metrics;
 use super::keysym::{bitmask, keysym};
+use crate::cli::ScaleMode;
 use crate::render::Layout;
 use crate::rfb::{ClientKeyEvent, ClientMouseEvent};
 
@@ -45,7 +46,7 @@ mod button {
     pub const WHEEL_RIGHT: u8 = 1 << 6;
 }
 
-/// A local command, reached through the prefix key.
+/// A local command, reached through the prefix key or by pointing at the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Quit,
@@ -53,6 +54,10 @@ pub enum Command {
     Renegotiate,
     /// Step to the next scaling mode.
     CycleMode,
+    /// Go straight to one scaling mode. No key reaches this: one binding cannot
+    /// name four modes, which is why the key cycles instead. A pointer can name
+    /// one, so the menu offers them as a row to choose from.
+    Mode(ScaleMode),
     Pan(i32, i32),
     ToggleViewOnly,
     ToggleStats,
@@ -312,6 +317,20 @@ impl InputMapper {
         }
     }
 
+    /// The zero-based cell this event happened on.
+    ///
+    /// Through the pixel position rather than straight from the event, because with
+    /// mode 1016 in force the event carries pixels, and the chrome is addressed in
+    /// cells. The round trip is exact for a terminal without it: the middle of a
+    /// cell divides back to the cell it came from.
+    pub fn terminal_cell(&self, ev: &MouseEvent, metrics: &Metrics) -> (u16, u16) {
+        let (x, y) = self.terminal_pixel(ev, metrics);
+        (
+            (x / metrics.cell_w.max(1)).min(u32::from(u16::MAX)) as u16,
+            (y / metrics.cell_h.max(1)).min(u32::from(u16::MAX)) as u16,
+        )
+    }
+
     /// Translate a mouse event, returning the pointer events to send.
     ///
     /// Returns nothing when the pointer is outside the drawn image, so a click on
@@ -470,7 +489,6 @@ fn command_for(code: KeyCode) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ScaleMode;
     use crate::render::Layout;
 
     fn key(code: KeyCode, kind: KeyEventKind, mods: KeyModifiers) -> KeyEvent {
@@ -775,6 +793,32 @@ mod tests {
             (events[0].position_x, events[0].position_y),
             (4 * 8 + 4, 5 * 17 + 8)
         );
+    }
+
+    #[test]
+    fn the_cell_under_the_pointer_is_found_either_way_round() {
+        // What the menu is hit-tested against. With mode 1016 the event carries
+        // pixels and has to be divided back down; without it the event is already
+        // cells, and going out to the middle of one and back has to land on the cell
+        // it started from.
+        let m = metrics();
+        let at = |column, row| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let pixels = InputMapper::new('a', true, true);
+        assert_eq!(pixels.terminal_cell(&at(0, 0), &m), (0, 0));
+        assert_eq!(
+            pixels.terminal_cell(&at(8 * 12 + 3, 17 * 7 + 9), &m),
+            (12, 7)
+        );
+
+        let cells = InputMapper::new('a', true, false);
+        for (col, row) in [(0, 0), (12, 7), (m.cols - 1, m.rows - 1)] {
+            assert_eq!(cells.terminal_cell(&at(col, row), &m), (col, row));
+        }
     }
 
     #[test]

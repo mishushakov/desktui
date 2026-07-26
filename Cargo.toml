@@ -21,6 +21,10 @@ fast_image_resize = "6.1"
 flate2 = "1.1"
 futures = "0.3"
 libc = "0.2"
+# Widgets and layout only. No backend: the menu renders into a buffer of its own
+# size and is written out by hand, so a backend would only bring a second copy of
+# crossterm along and a Terminal that wants to own the screen.
+ratatui = { version = "0.30", default-features = false, features = ["std"] }
 thiserror = "2.0"
 tokio = { version = "1.53", features = [
     "rt-multi-thread",
