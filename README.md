@@ -219,23 +219,13 @@ on — what you want on a link too slow for lossless, and not otherwise.
 ```
 make test           # no server or terminal needed
 make check          # fmt, clippy, tests
+make test-timing    # the wall-clock sensitive tests
 make test-live      # against the real desktop container
 make perf           # time the compose pipeline
 ```
 
 The protocol layer is vendored rather than a dependency — [`src/rfb/README.md`](src/rfb/README.md)
 says why, and what was fixed on the way in.
-
-There are three integration suites and they cover different ground.
-
-`tests/pty.rs` runs the real binary inside a pty that the test drives, answering
-capability queries the way Ghostty does and then inspecting the escape stream it
-produces. `tests/vnc.rs` adds a fake VNC server, so the whole session — including
-every way a server can answer a resize request — is verified without Docker.
-
-`tests/live.rs` is the one that catches what the others cannot: it runs the binary
-against **TigerVNC serving a real XFCE desktop**, so real Tight encoding, real JPEG
-rectangles, and a real answer to `SetDesktopSize`. It needs the container:
 
 ```
 make desktop

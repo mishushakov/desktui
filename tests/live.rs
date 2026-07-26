@@ -19,14 +19,11 @@ mod common;
 
 use std::time::Duration;
 
+// The geometry and the shared claims live in `common::session`, because each of the
+// tests below has a counterpart in one of the fake-server suites and the two are only
+// worth having if they check the same thing.
+use common::session::*;
 use common::*;
-
-/// A 200x50 terminal of 8x17 cells: 1600x850 pixels, 49 rows usable, so the client
-/// should ask TigerVNC for 1600x832 and be given it.
-const COLS: u16 = 200;
-const ROWS: u16 = 50;
-const PIXELS: (u16, u16) = (1600, 850);
-const EXPECTED_SIZE: &str = "1600x832";
 
 fn server() -> String {
     std::env::var("DESKTUI_TEST_SERVER").unwrap_or_else(|_| "localhost::5901".to_string())
@@ -52,65 +49,43 @@ fn start(extra: &[&str]) -> FakeTerm {
     term
 }
 
-fn quit(term: &mut FakeTerm) {
-    term.send(&[0x01]);
-    std::thread::sleep(Duration::from_millis(50));
-    term.send(b"q");
-}
-
+/// Fake-server counterpart: `resize::negotiates_the_terminals_exact_pixel_size`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn tigervnc_grants_the_terminals_exact_pixel_size() {
     // The headline claim, against a server that really implements it.
     let mut term = start(&["--scale", "native"]);
 
-    assert!(
-        term.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(30)),
-        "the server never reported {EXPECTED_SIZE}: {}",
-        tail(&term.output())
-    );
-    assert!(
-        term.wait_for(b"native 1:1", Duration::from_secs(10)),
-        "the mapping never became pixel-exact: {}",
-        tail(&term.output())
-    );
-    assert!(
-        contains(&term.output(), b"\x1b_Ga=T"),
-        "nothing was drawn: {}",
-        tail(&term.output())
-    );
+    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(30));
+    assert_pixel_exact(&term, Duration::from_secs(10));
+    assert_drew(&term, Duration::from_secs(5));
 
     quit(&mut term);
     let status = term.wait(Duration::from_secs(15)).expect("did not exit");
     assert!(status.success(), "exited with {status:?}");
 }
 
+/// No fake-server counterpart, and that is the point: nothing in the fake suites
+/// exercises a real Tight encoder, so this is the only test that runs the JPEG decoder
+/// and the palette filters against bytes we did not produce ourselves.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_real_desktop_decodes_and_keeps_drawing() {
     // Tight is first in the encoding list, so this is the path that exercises the
     // JPEG decoder and the palette filters against a real encoder.
     let mut term = start(&[]);
-    assert!(
-        term.wait_for(b"\x1b_Ga=T", Duration::from_secs(30)),
-        "nothing was drawn: {}",
-        tail(&term.output())
-    );
+    assert_drew(&term, Duration::from_secs(30));
 
     // Move the pointer across the desktop: the server has to send us the cursor
     // moving, which is the simplest reliable source of continuing damage.
-    let before = count(&term.output(), b"\x1b_Ga=T");
+    let before = tiles_drawn(&term);
     for x in (100..900).step_by(40) {
         term.send(format!("\x1b[<35;{x};300M").as_bytes());
         std::thread::sleep(Duration::from_millis(40));
     }
     std::thread::sleep(Duration::from_millis(500));
-    let after = count(&term.output(), b"\x1b_Ga=T");
+    assert_kept_drawing(&term, before, "moving the pointer");
 
-    assert!(
-        after > before,
-        "the screen never changed after moving the pointer ({before} -> {after} tiles)"
-    );
     // And no decoder gave up along the way.
     let out = term.output();
     for bad in [
@@ -130,33 +105,25 @@ fn a_real_desktop_decodes_and_keeps_drawing() {
     term.wait(Duration::from_secs(15));
 }
 
+/// Fake-server counterpart: `resize::asks_for_the_new_size_when_the_terminal_is_resized`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn resizing_the_terminal_reshapes_the_real_desktop() {
     let mut term = start(&["--scale", "native"]);
-    assert!(
-        term.wait_for(EXPECTED_SIZE.as_bytes(), Duration::from_secs(30)),
-        "never reached the first size: {}",
-        tail(&term.output())
-    );
+    assert_reports_size(&term, EXPECTED_SIZE, Duration::from_secs(30));
 
     // Half the window. 100x25 cells of 8x17 leaves 24 usable rows: 800x408.
     term.resize(100, 25, 800, 425);
-    assert!(
-        term.wait_for(b"800x408", Duration::from_secs(30)),
-        "the desktop did not follow the terminal: {}",
-        tail(&term.output())
-    );
-    assert!(
-        term.wait_for(b"native 1:1", Duration::from_secs(10)),
-        "still not pixel-exact at the new size: {}",
-        tail(&term.output())
-    );
+    assert_reports_size(&term, "800x408", Duration::from_secs(30));
+    assert_pixel_exact(&term, Duration::from_secs(10));
 
     quit(&mut term);
     term.wait(Duration::from_secs(15));
 }
 
+/// Fake-server counterpart: `lifecycle::a_wrong_address_fails_before_touching_the_screen`
+/// -- the same claim about a failure one step later, during authentication rather than
+/// during connect.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_wrong_password_fails_clearly() {
@@ -193,6 +160,9 @@ fn a_wrong_password_fails_clearly() {
     );
 }
 
+/// Related: `resize::a_forwarded_resize_is_picked_up_when_it_lands` covers the other way
+/// a size change arrives without this client having caused it. That one is the deferred
+/// answer to our own request; this is another client's, which no fake server produces.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn one_client_adopts_a_resize_another_client_asked_for() {
@@ -245,6 +215,8 @@ fn one_client_adopts_a_resize_another_client_asked_for() {
     watcher.wait(Duration::from_secs(15));
 }
 
+/// No fake-server counterpart: the fake server does not model "only send what changed",
+/// so the black-after-resize bug this covers cannot be reproduced against it.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn the_desktop_is_redrawn_in_full_after_a_resize() {
@@ -283,6 +255,8 @@ fn the_desktop_is_redrawn_in_full_after_a_resize() {
     term.wait(Duration::from_secs(15));
 }
 
+/// Fake-server counterpart:
+/// `updates::continuous_updates_are_enabled_and_stop_the_request_traffic`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_real_server_negotiates_continuous_updates() {
@@ -311,6 +285,9 @@ fn a_real_server_negotiates_continuous_updates() {
     term.wait(Duration::from_secs(15));
 }
 
+/// Fake-server counterpart: `input::a_disagreeing_caps_lock_is_corrected_before_the_keystroke`
+/// asserts the correction. This asserts its precondition -- that a real server sends the
+/// LED state at all -- which the fake one is simply configured to do.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_real_server_reports_its_lock_key_state() {
@@ -358,6 +335,7 @@ fn a_real_server_reports_its_lock_key_state() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// Fake-server counterpart: `updates::the_cursor_shape_is_requested_and_drawn_locally`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_real_server_sends_a_cursor_shape() {
@@ -410,6 +388,8 @@ fn a_real_server_sends_a_cursor_shape() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// Fake-server counterpart:
+/// `updates::growing_the_desktop_re_enables_continuous_updates_for_the_new_area`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn growing_the_window_fills_the_new_area_on_a_real_server() {
@@ -472,6 +452,8 @@ fn growing_the_window_fills_the_new_area_on_a_real_server() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// Fake-server counterpart:
+/// `updates::the_round_trip_is_measured_with_a_fence_once_frames_are_pushed`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_real_server_answers_the_latency_probe() {
@@ -547,6 +529,7 @@ fn a_real_server_answers_the_latency_probe() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// Fake-server counterpart: `resize::a_resize_goes_out_while_the_server_is_idle`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn an_idle_resize_completes_without_any_input() {
@@ -604,6 +587,7 @@ fn an_idle_resize_completes_without_any_input() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// Fake-server counterpart: `resize::a_drag_is_still_coalesced_into_a_few_requests`.
 #[test]
 #[ignore = "needs the desktop container: make desktop"]
 fn a_dragged_resize_settles_without_any_input() {
@@ -664,18 +648,4 @@ fn a_dragged_resize_settles_without_any_input() {
     quit(&mut term);
     term.wait(Duration::from_secs(15));
     let _ = std::fs::remove_file(&log);
-}
-
-/// The readable part of the output, for assertion messages: escape-heavy tails are
-/// unreadable, and the status line is what actually says what happened.
-fn tail(buf: &[u8]) -> String {
-    let text = String::from_utf8_lossy(buf);
-    let mut lines: Vec<&str> = text
-        .split('\x1b')
-        .filter(|s| s.contains("desktui") || s.contains("1:1") || s.contains("error"))
-        .collect();
-    lines.dedup();
-    let n = lines.len();
-    lines.drain(..n.saturating_sub(4));
-    lines.join(" | ")
 }

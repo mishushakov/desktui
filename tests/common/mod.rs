@@ -16,6 +16,7 @@
 //! measurement of this harness instead of the client.
 
 pub mod server;
+pub mod session;
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -303,6 +304,24 @@ pub fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .windows(needle.len())
         .filter(|w| *w == needle)
         .count()
+}
+
+/// The readable part of the output, for assertion messages: escape-heavy tails are
+/// unreadable, and the status line is what actually says what happened.
+///
+/// Where `show` dumps the head of the stream with its escapes spelled out, this keeps
+/// only the last few status lines. That is the right end to look at when a claim about
+/// what the client ended up reporting fails.
+pub fn tail(buf: &[u8]) -> String {
+    let text = String::from_utf8_lossy(buf);
+    let mut lines: Vec<&str> = text
+        .split('\x1b')
+        .filter(|s| s.contains("desktui") || s.contains("1:1") || s.contains("error"))
+        .collect();
+    lines.dedup();
+    let n = lines.len();
+    lines.drain(..n.saturating_sub(4));
+    lines.join(" | ")
 }
 
 /// Escapes made readable, for assertion messages.
