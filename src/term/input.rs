@@ -23,7 +23,6 @@ use crossterm::event::{
 
 use super::Metrics;
 use super::keysym::{bitmask, keysym};
-use crate::cli::ScaleMode;
 use crate::render::Layout;
 use crate::rfb::{ClientKeyEvent, ClientMouseEvent};
 
@@ -52,7 +51,8 @@ pub enum Command {
     Quit,
     FullRefresh,
     Renegotiate,
-    Mode(ScaleMode),
+    /// Step to the next scaling mode.
+    CycleMode,
     Pan(i32, i32),
     ToggleViewOnly,
     ToggleStats,
@@ -455,10 +455,7 @@ fn command_for(code: KeyCode) -> Option<Command> {
         KeyCode::Char('q') => Command::Quit,
         KeyCode::Char('f') => Command::FullRefresh,
         KeyCode::Char('r') => Command::Renegotiate,
-        KeyCode::Char('n') => Command::Mode(ScaleMode::Native),
-        KeyCode::Char('s') => Command::Mode(ScaleMode::Fit),
-        KeyCode::Char('i') => Command::Mode(ScaleMode::Integer),
-        KeyCode::Char('1') => Command::Mode(ScaleMode::OneToOne),
+        KeyCode::Char('m') => Command::CycleMode,
         KeyCode::Char('v') => Command::ToggleViewOnly,
         KeyCode::Char('c') => Command::ToggleStats,
         KeyCode::Char('h') | KeyCode::Char('?') => Command::Help,
@@ -473,6 +470,7 @@ fn command_for(code: KeyCode) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ScaleMode;
     use crate::render::Layout;
 
     fn key(code: KeyCode, kind: KeyEventKind, mods: KeyModifiers) -> KeyEvent {
@@ -716,14 +714,7 @@ mod tests {
         assert_eq!(command_for(KeyCode::Char('q')), Some(Command::Quit));
         assert_eq!(command_for(KeyCode::Char('f')), Some(Command::FullRefresh));
         assert_eq!(command_for(KeyCode::Char('r')), Some(Command::Renegotiate));
-        assert_eq!(
-            command_for(KeyCode::Char('n')),
-            Some(Command::Mode(ScaleMode::Native))
-        );
-        assert_eq!(
-            command_for(KeyCode::Char('1')),
-            Some(Command::Mode(ScaleMode::OneToOne))
-        );
+        assert_eq!(command_for(KeyCode::Char('m')), Some(Command::CycleMode));
         assert_eq!(command_for(KeyCode::Left), Some(Command::Pan(-1, 0)));
         assert_eq!(
             command_for(KeyCode::Char('v')),

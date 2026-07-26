@@ -835,7 +835,8 @@ impl Session {
                 self.request_native_size(true).await?;
                 self.set_note("renegotiating the remote size".into());
             }
-            Command::Mode(mode) => {
+            Command::CycleMode => {
+                let mode = self.mode.next();
                 self.mode = mode;
                 self.pan = (0, 0);
                 if mode == ScaleMode::Native {
@@ -844,7 +845,7 @@ impl Session {
                 } else {
                     self.relayout();
                 }
-                self.set_note(format!("mapping: {}", describe(self.renderer.layout())));
+                self.set_note(format!("scaling: {}", describe(self.renderer.layout())));
             }
             Command::Pan(dx, dy) => {
                 let layout = *self.renderer.layout();
