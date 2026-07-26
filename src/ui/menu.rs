@@ -19,6 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Widget};
 
+use super::paint::write_cells;
 use crate::cli::ScaleMode;
 use crate::term::input::Command;
 use crate::term::{Metrics, kitty};
@@ -527,104 +528,6 @@ fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, ink: Style) {
         Line::from(Span::styled(right, Style::new().fg(MUTED)))
             .right_aligned()
             .render(row, buf);
-    }
-}
-
-/// Write a laid-out buffer out as positioned text.
-///
-/// This is the part a ratatui backend would otherwise do, minus the diffing: there
-/// is no previous screen to diff against, because everything else on these cells is
-/// an image that the text is composited over rather than cells we wrote.
-fn write_cells(out: &mut Vec<u8>, buf: &Buffer) {
-    let area = buf.area;
-    let mut current: Option<Style> = None;
-    for y in area.top()..area.bottom() {
-        // One cursor move per run of cells, and a fresh one after any gap.
-        let mut position = true;
-        for x in area.left()..area.right() {
-            let Some(cell) = buf.cell((x, y)) else {
-                position = true;
-                continue;
-            };
-            // The tail of a wide glyph: the glyph before it already covers this
-            // cell, so nothing is written and the next one has to be positioned.
-            if cell.symbol().is_empty() {
-                position = true;
-                continue;
-            }
-            if position {
-                let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
-                position = false;
-            }
-            if current != Some(cell.style()) {
-                write_style(out, cell.style());
-                current = Some(cell.style());
-            }
-            out.extend_from_slice(cell.symbol().as_bytes());
-        }
-    }
-    out.extend_from_slice(b"\x1b[0m");
-}
-
-/// Emit a style, from a clean slate each time.
-///
-/// A reset rather than a diff attribute by attribute: the box is a few hundred
-/// cells and the runs are long, so the bytes are free, and a reset cannot leave an
-/// attribute behind that the next run never asked for.
-fn write_style(out: &mut Vec<u8>, style: Style) {
-    out.extend_from_slice(b"\x1b[0m");
-    if let Some(fg) = style.fg {
-        write_colour(out, fg, 38);
-    }
-    if let Some(bg) = style.bg {
-        write_colour(out, bg, 48);
-    }
-    for (modifier, code) in [
-        (Modifier::BOLD, 1),
-        (Modifier::DIM, 2),
-        (Modifier::ITALIC, 3),
-        (Modifier::UNDERLINED, 4),
-        (Modifier::REVERSED, 7),
-    ] {
-        if style.add_modifier.contains(modifier) {
-            let _ = write!(out, "\x1b[{code}m");
-        }
-    }
-}
-
-/// One SGR colour. `base` is 38 for a foreground, 48 for a background.
-fn write_colour(out: &mut Vec<u8>, colour: Color, base: u8) {
-    let _ = match colour {
-        Color::Reset => write!(out, "\x1b[{}m", base + 1),
-        Color::Rgb(r, g, b) => write!(out, "\x1b[{base};2;{r};{g};{b}m"),
-        // Named colours included: they are the first sixteen palette entries, and
-        // `5;n` reaches them exactly as the 30-37 codes do.
-        other => write!(out, "\x1b[{base};5;{}m", palette_index(other)),
-    };
-}
-
-/// A named or indexed colour's place in the 256-colour palette.
-fn palette_index(colour: Color) -> u8 {
-    match colour {
-        Color::Black => 0,
-        Color::Red => 1,
-        Color::Green => 2,
-        Color::Yellow => 3,
-        Color::Blue => 4,
-        Color::Magenta => 5,
-        Color::Cyan => 6,
-        Color::Gray => 7,
-        Color::DarkGray => 8,
-        Color::LightRed => 9,
-        Color::LightGreen => 10,
-        Color::LightYellow => 11,
-        Color::LightBlue => 12,
-        Color::LightMagenta => 13,
-        Color::LightCyan => 14,
-        Color::White => 15,
-        Color::Indexed(index) => index,
-        // Both handled by the caller.
-        Color::Reset | Color::Rgb(..) => 0,
     }
 }
 
