@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::server::{Extensions, FakeServer, Request, Resize};
+use common::server::{EXTENDED_CLIPBOARD_ENCODING, Extensions, FakeServer, Request, Resize};
 use common::session::*;
 use common::*;
 
@@ -87,13 +87,19 @@ fn requests_the_encodings_it_can_actually_decode() {
                 "the cursor shape is what makes a local pointer possible: {encodings:?}"
             );
 
+            assert!(
+                encodings.contains(&EXTENDED_CLIPBOARD_ENCODING),
+                "the extended clipboard is what carries anything outside Latin-1: \
+                 {encodings:?}"
+            );
+
             // Anything advertised has to be something we can consume. For a data
             // encoding that means a decoder, because rectangles carry no length and a
-            // surprise would leave the stream unrecoverable. Fence and
-            // ContinuousUpdates are different in kind: they are answered with
-            // messages, never rectangles.
+            // surprise would leave the stream unrecoverable. Fence,
+            // ContinuousUpdates and ExtendedClipboard are different in kind: they are
+            // answered with messages, never rectangles.
             const DECODABLE_RECTS: [i32; 9] = [0, 1, 7, 16, -223, -224, -239, -261, -308];
-            const NEGOTIATION_ONLY: [i32; 2] = [-312, -313];
+            const NEGOTIATION_ONLY: [i32; 3] = [-312, -313, EXTENDED_CLIPBOARD_ENCODING];
             for encoding in &encodings {
                 assert!(
                     DECODABLE_RECTS.contains(encoding) || NEGOTIATION_ONLY.contains(encoding),

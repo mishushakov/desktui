@@ -215,6 +215,46 @@ fn one_client_adopts_a_resize_another_client_asked_for() {
     watcher.wait(Duration::from_secs(15));
 }
 
+/// Fake-server counterpart: `input::a_pasted_selection_is_announced_first_and_sent_when_asked`,
+/// which follows the same exchange through to the data against a server that answers
+/// exactly as written. What only a real server can settle is the part below: that
+/// TigerVNC recognises the pseudo-encoding, answers with capabilities, and accepts what
+/// we send it under a negative length.
+#[test]
+#[ignore = "needs the desktop container: make desktop"]
+fn a_real_server_negotiates_the_extended_clipboard() {
+    // Cyrillic, which does not exist in Latin-1. Without the extension the client would
+    // have had to substitute it and would say so; the plain note means the negotiation
+    // succeeded, since the UTF-8 path is only taken once the server's `caps` message has
+    // arrived.
+    let mut term = start(&["--scale", "fit"]);
+    assert_drew(&term, Duration::from_secs(30));
+
+    let mark = term.output().len();
+    term.send("\x1b[200~Привет, мир\x1b[201~".as_bytes());
+    assert!(
+        term.wait_for(b"pasted to the remote clipboard", Duration::from_secs(10)),
+        "the paste was never acted on: {}",
+        tail(&term.output())
+    );
+    assert!(
+        !contains(&term.output()[mark..], b"not Latin-1"),
+        "fell back to Latin-1, so the extension was not negotiated: {}",
+        tail(&term.output())
+    );
+
+    // And the server was happy with it. A malformed extended message is a protocol
+    // error to TigerVNC, which drops the connection -- so still drawing a second later
+    // is the assertion that our message was well formed.
+    let before = tiles_drawn(&term);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_kept_drawing(&term, before, "announcing the clipboard");
+
+    quit(&mut term);
+    let status = term.wait(Duration::from_secs(15)).expect("did not exit");
+    assert!(status.success(), "exited with {status:?}");
+}
+
 /// No fake-server counterpart: the fake server does not model "only send what changed",
 /// so the black-after-resize bug this covers cannot be reproduced against it.
 #[test]

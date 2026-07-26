@@ -23,9 +23,12 @@ switchable live with `Ctrl+A` then `n s i 1`. Native asks the server to resize i
 to the terminal so nothing is resampled; the other three cover servers that refuse.
 Arrows pan when the view is cropped.
 
-**A shared clipboard, both directions.** Copy on the remote desktop and paste locally;
-copy locally and paste there. On by default, and `--no-clipboard` leaves your clipboard
-alone in both directions.
+**A shared clipboard, both directions, in UTF-8.** Copy on the remote desktop and paste
+locally; copy locally and paste there. Servers that support the `ExtendedClipboard`
+extension — TigerVNC, RealVNC, noVNC — get the text as UTF-8, so Cyrillic, CJK and emoji
+survive; older servers fall back to the Latin-1 messages RFB started with, which cannot
+carry them. On by default, and `--no-clipboard` leaves your clipboard alone in both
+directions.
 
 **Look without touching.** `--view-only` for the session, `Ctrl+A v` to toggle. It
 stops input reaching the remote and leaves the pointer for the server to draw.
@@ -128,7 +131,10 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
 Clipboard works in both directions: paste into the terminal and it reaches the
-remote clipboard; the remote clipboard arrives locally through OSC 52.
+remote clipboard; the remote clipboard arrives locally through OSC 52. With the
+`ExtendedClipboard` extension the text is UTF-8 rather than Latin-1, and each side
+announces a change rather than pushing it — so a local paste crosses the wire when
+something on the remote actually pastes.
 
 ## Authentication
 

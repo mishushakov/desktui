@@ -19,8 +19,8 @@ use crate::cli::{Args, ScaleMode};
 use crate::render::framebuffer::Framebuffer;
 use crate::render::{FrameStats, Layout, Rect, Renderer};
 use crate::rfb::{
-    PixelFormat, ResizeStatus, Screen, ScreenInfo, ScreenLayout, VncClient, VncConnector,
-    VncEncoding, VncError, VncEvent, X11Event,
+    ClipboardCaps, PixelFormat, ResizeStatus, Screen, ScreenInfo, ScreenLayout, VncClient,
+    VncConnector, VncEncoding, VncError, VncEvent, X11Event,
 };
 use crate::term::caps::Caps;
 use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
@@ -121,15 +121,7 @@ pub async fn run(
                 backoff = RECONNECT_BACKOFF;
                 client
             }
-            None => match try_connect(
-                addr,
-                password.clone(),
-                args.quality,
-                args.compression,
-                !args.view_only,
-            )
-            .await
-            {
+            None => match try_connect(addr, password.clone(), args).await {
                 Ok(client) => {
                     backoff = RECONNECT_BACKOFF;
                     client
@@ -186,27 +178,13 @@ async fn connect(
     password: Option<String>,
     args: &Args,
 ) -> Result<(VncClient, Option<String>)> {
-    match try_connect(
-        addr,
-        password.clone(),
-        args.quality,
-        args.compression,
-        !args.view_only,
-    )
-    .await
-    {
+    match try_connect(addr, password.clone(), args).await {
         Ok(client) => Ok((client, password)),
         Err(VncError::NoPassword) => {
             let password = crate::prompt_password(addr)?;
-            let client = try_connect(
-                addr,
-                Some(password.clone()),
-                args.quality,
-                args.compression,
-                !args.view_only,
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+            let client = try_connect(addr, Some(password.clone()), args)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
             Ok((client, Some(password)))
         }
         Err(err) => Err(anyhow::anyhow!("{err}")).with_context(|| format!("connecting to {addr}")),
@@ -216,10 +194,12 @@ async fn connect(
 async fn try_connect(
     addr: &str,
     password: Option<String>,
-    quality: Option<u8>,
-    compression: Option<u8>,
-    local_cursor: bool,
+    args: &Args,
 ) -> Result<VncClient, VncError> {
+    // Not in a view-only session: there is no local pointer worth drawing there, and
+    // letting the server composite its own is the only way to see where the real one
+    // is.
+    let local_cursor = !args.view_only;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| VncError::General(format!("timed out connecting to {addr}")))?
@@ -248,16 +228,22 @@ async fn try_connect(
         .add_encoding(VncEncoding::QemuLedStatePseudo)
         // Asking for the cursor shape stops the server drawing the pointer into the
         // framebuffer, which is what lets it move at local speed instead of waiting for
-        // a round trip. Not asked for in a view-only session: there is no local pointer
-        // worth drawing there, and letting the server composite its own is the only way
-        // to see where the real one is.
+        // a round trip.
         .add_encodings(if local_cursor {
             &[VncEncoding::CursorPseudo][..]
         } else {
             &[]
         })
-        .set_quality(quality)
-        .set_compression(compression)
+        // The clipboard in UTF-8 rather than Latin-1, and announced rather than pushed.
+        // Left out entirely with --no-clipboard: the encoding is a standing offer to
+        // exchange clipboards, and a session that wants none should not make it.
+        .add_encodings(if args.no_clipboard {
+            &[]
+        } else {
+            &[VncEncoding::ExtendedClipboardPseudo][..]
+        })
+        .set_quality(args.quality)
+        .set_compression(args.compression)
         .allow_shared(true)
         // BGRA is what an x86 server produces natively, so this is the format
         // that costs neither side a swizzle on the wire. The pack to RGB happens
@@ -319,6 +305,16 @@ struct Session {
 
     view_only: bool,
     no_clipboard: bool,
+    /// What the server accepts on the extended clipboard, once its `caps` message has
+    /// arrived. `None` means the extension is not in play, and the Latin-1 `CutText`
+    /// messages are all there is.
+    clipboard_caps: Option<ClipboardCaps>,
+    /// Text we have told the server we hold and have not been asked for yet.
+    ///
+    /// The extension moves ownership before it moves data: a local paste announces
+    /// itself, and the bytes go over when something on the remote side pastes. Kept
+    /// rather than taken when that happens, because it can be pasted more than once.
+    announced_clipboard: Option<String>,
     /// Which palette the chrome wears. Dark to start, the bar having been that colour
     /// before there was a choice.
     theme: Theme,
@@ -384,6 +380,8 @@ impl Session {
             remote_num_lock: None,
             view_only: args.view_only,
             no_clipboard: args.no_clipboard,
+            clipboard_caps: None,
+            announced_clipboard: None,
             theme: Theme::Dark,
             menu: Menu::new(args.prefix_char()),
             show_menu: false,
@@ -480,6 +478,33 @@ impl Session {
             VncEvent::Text(text) => {
                 if !self.no_clipboard {
                     self.copy_to_local_clipboard(&text);
+                }
+            }
+            VncEvent::ClipboardCaps(caps) => {
+                // The extension is live from here: the clipboard is UTF-8 in both
+                // directions, and a remote selection arrives as an announcement rather
+                // than as a copy of itself.
+                tracing::debug!("extended clipboard negotiated: {caps:?}");
+                self.clipboard_caps = Some(caps);
+            }
+            VncEvent::ClipboardNotify { text } => {
+                // Nothing has been transferred yet -- that is the point of a notify --
+                // so ask for it. With --no-clipboard the extension was never
+                // advertised, so this cannot arrive; the check is belt and braces
+                // around a server that sends one anyway.
+                if text && !self.no_clipboard {
+                    self.send(X11Event::ClipboardRequest).await?;
+                }
+            }
+            VncEvent::ClipboardRequest => {
+                // Something on the remote side pasted, so the text we announced is
+                // wanted now.
+                match self.announced_clipboard.clone() {
+                    Some(text) if !self.view_only && !self.no_clipboard => {
+                        tracing::debug!("sending the announced clipboard, {} bytes", text.len());
+                        self.send(X11Event::ClipboardProvide(text)).await?;
+                    }
+                    _ => tracing::debug!("server asked for a clipboard we never announced"),
                 }
             }
             VncEvent::Bell => {
@@ -851,21 +876,7 @@ impl Session {
             }
             Event::Paste(text) => {
                 if !self.view_only && !self.no_clipboard {
-                    // RFB clipboard traffic is Latin-1 only. Substitute rather than
-                    // drop: deleting characters silently shortens the text and moves
-                    // everything after them, where a question mark leaves the shape
-                    // intact and is visibly a substitution. noVNC does the same.
-                    let dropped = text.chars().filter(|c| (*c as u32) > 0xff).count();
-                    let latin1: String = text
-                        .chars()
-                        .map(|c| if (c as u32) > 0xff { '?' } else { c })
-                        .collect();
-                    self.send(X11Event::CopyText(latin1)).await?;
-                    self.set_note(if dropped > 0 {
-                        format!("pasted; {dropped} character(s) are not Latin-1 and became '?'")
-                    } else {
-                        "pasted to the remote clipboard".into()
-                    });
+                    self.paste_to_remote(text).await?;
                 }
             }
             Event::Resize(cols, rows) => {
@@ -1356,6 +1367,52 @@ impl Session {
         if let Some(pointer) = self.input.release_buttons() {
             let _ = self.client.input(X11Event::PointerEvent(pointer)).await;
         }
+    }
+
+    /// Put locally pasted text on the remote clipboard.
+    ///
+    /// Over the extension the text goes as UTF-8 and arrives whole. Without it the
+    /// payload is Latin-1 and everything outside it has to be substituted, which is
+    /// why a server that negotiated the extension is worth the extra round trip.
+    async fn paste_to_remote(&mut self, text: String) -> Result<()> {
+        if let Some(caps) = self
+            .clipboard_caps
+            .filter(|caps: &ClipboardCaps| caps.takes_text() && caps.takes_provide())
+        {
+            // The size the server's limit applies to is the text as it goes on the
+            // wire: CRLF line endings, and the terminating null that the length counts.
+            let wire_len = text.len() + text.matches('\n').count() + 1;
+            if wire_len as u64 <= u64::from(caps.unsolicited_text()) || !caps.takes_notify() {
+                // Either small enough to push unasked, or a server that offered no way
+                // to announce it, which leaves pushing it the only thing left to try.
+                self.send(X11Event::ClipboardProvide(text)).await?;
+            } else {
+                // Announce it and keep it. The server asks when something over there
+                // pastes, which is the point: a clipboard nobody reads costs one small
+                // message instead of the whole text.
+                self.send(X11Event::ClipboardNotify).await?;
+                self.announced_clipboard = Some(text);
+            }
+            self.set_note("pasted to the remote clipboard".into());
+            return Ok(());
+        }
+
+        // Legacy `ClientCutText` is Latin-1 only. Substitute rather than drop:
+        // deleting characters silently shortens the text and moves everything after
+        // them, where a question mark leaves the shape intact and is visibly a
+        // substitution. noVNC does the same.
+        let dropped = text.chars().filter(|c| (*c as u32) > 0xff).count();
+        let latin1: String = text
+            .chars()
+            .map(|c| if (c as u32) > 0xff { '?' } else { c })
+            .collect();
+        self.send(X11Event::CopyText(latin1)).await?;
+        self.set_note(if dropped > 0 {
+            format!("pasted; {dropped} character(s) are not Latin-1 and became '?'")
+        } else {
+            "pasted to the remote clipboard".into()
+        });
+        Ok(())
     }
 
     /// Put the server's clipboard on the local one, with OSC 52.
