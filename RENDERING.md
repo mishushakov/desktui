@@ -23,7 +23,7 @@ Every design decision below follows from one of these.
 | `a=d,d=I` frees one image and its placements | a tile the grid no longer reaches is dropped by name, not by erasing the screen |
 | at equal `z`, the higher image id composites above | the cursor and the overlay backdrops sit above the picture without a second z-layer |
 | `z=-1` is below text and above the cell background | the status line and the menu stay legible over the picture, and a blank cell does not hide it |
-| `t=s` takes `O=` and `S=`, an offset and a length | one object could hold a whole frame -- except that Ghostty draws nothing for a placement carrying them, so it is an object per tile |
+| `t=s` takes `O=` and `S=`, an offset and a length | nothing, as it turns out: the terminal unlinks an object once it has read it, so it is an object per tile -- see [the finding](#the-o-finding) |
 | DEC 2026 brackets an atomic update | a frame is one write, and the screen never shows half of one |
 | `Fence` synchronises, and `EnableContinuousUpdates` takes a flag | the server's pushing can be turned off and on rather than only declined, and encode time can be told from wire time |
 
@@ -159,8 +159,9 @@ about how far the grid was filled.
    margin for the filter's support -- not the whole screen because one tile changed.
 3. **Pack** each send straight into the shared memory object the terminal will read, so a
    frame is one pass over its pixels rather than a pack followed by a copy. An object per
-   tile: the protocol would allow one per frame with an offset per tile, five system calls
-   instead of five per tile, but see [the offset finding](#the-o-finding).
+   tile, because the terminal unlinks an object once it has read it -- one object for the
+   frame is worth 0.2 ms/frame and needs a different shape to get at, see
+   [the offset finding](#the-o-finding).
 4. **Emit**, in this order, into one buffer: drops, the screen erase if this frame adopts a
    new geometry, the chrome's diff, the re-placements that erase owes, then moves and sends.
    Anything that clears cells precedes the placements on them, because a terminal may treat
@@ -271,7 +272,7 @@ Built:
 - resize rate limit, leading edge (`src/session.rs`)
 - tiles packed straight into the shared memory object the terminal reads, rather than into
   a buffer for a copy to follow (`src/term/shm.rs`, `src/render/framebuffer.rs`) --
-  1.5 ms/frame to 0.9 on a full-screen update, measured by `make perf`
+  1.6 ms/frame to 0.9 on a full-screen update, measured by `make perf`
 - shared memory swept by presence and a byte budget rather than a deadline
   (`src/term/shm.rs`)
 - resampling only the region a frame is about to send, grown by the filter's reach
@@ -328,35 +329,53 @@ policy behind a flag, default off, until it has been watched for a while.
 
 ### The `O=` finding
 
-One object per frame, with every tile placed out of it at an offset, was built and then
-taken out again. It is worth writing down so it is not built a second time by accident.
+One object per frame, with every tile placed out of it at an offset, was built twice and
+taken out twice. The second attempt is what produced the explanation, so the finding is
+closed now rather than open: **an object can be placed once, not once per tile.**
 
 The protocol has the keys. The spec says a client "can also specify a size and offset to
 tell the terminal emulator to only read a part of the specified file... using the `S` and
 `O` keys", and its own example uses them with `t=s`:
 `_Gs=10,v=2,t=s,S=80,O=10;<encoded name>`. What was emitted matched that shape, with
-`S = w * h * 3` for `f=24`.
+`S = w * h * 3` for `f=24`. So the keys were right and the shape was wrong.
 
-Ghostty drew nothing for it. The screen was black with the occasional tile appearing as
-the pointer moved -- consistent with the one placement per frame that carries `O=0` being
-accepted and every other one being dropped, though that was not confirmed. And it was
-silent, because `q=2` suppresses the reply that would have said why.
+What the same spec says about the medium is why the shape was wrong: a terminal "must read
+the data from the memory object and then unlink and close it". One read is all an object
+gets. A frame that places ninety-one tiles out of one object makes ninety-one commands of
+it, and the first one consumes the name, so every later `shm_open` finds nothing.
 
-To take it up again, in this order:
+That predicts a black screen with the frame's first tile drawing and nothing else, which is
+what Ghostty showed, and then what kitty showed too -- two implementations of a rule rather
+than one implementation's gap. The prediction was never confirmed against an error reply:
+`q=2` suppressed those on both. Anyone who wants it nailed down can reproduce it with `q=0`
+against a hand-made object and read the answer, which is two lines of shell.
 
-1. Reproduce it deliberately with `q=0` and read what the terminal answers. That turns a
-   guess into a fact, and it is two lines of shell against a hand-made object.
-2. Try kitty as well. If it works there, this is a Ghostty gap worth reporting rather than
-   a misreading of the spec.
-3. Whatever the answer, gate it on the capability probe rather than on the terminal's name.
-   `src/term/caps.rs` already probes `t=s` with `a=q`, which validates a transmission
-   without storing anything -- the same probe with `S=` and `O=` set answers this question
-   at startup, and the answer decides whether a frame is one object or one per tile.
+That the unlink rule was the mechanism should have been obvious from this codebase, which
+depends on it elsewhere: `src/term/shm.rs` sweeps by presence precisely because "an object
+that still exists is one the terminal has not read". The same sentence that makes the sweep
+work makes one object per frame impossible.
 
-The prize, measured by `make perf` on a full-screen update: 0.9 ms/frame against 0.6, most
-of it system calls. Worth having, not worth guessing at.
+**What is not worth doing.** Probing for it. Gating on a terminal's name. Trying a third
+terminal. The rule is in the spec and both implementations follow it.
+
+**What would work**, if the 0.7 ms row is ever worth the complexity: one *transmission* per
+frame rather than one per tile. Pack the frame's tiles into a single rectangular atlas in
+one object, transmit it once with `a=t` -- one read, one unlink, five system calls -- and
+then place each tile with `a=p` and a source rectangle (`x=`/`y=`/`w=`/`h=`) out of the
+stored image. What that costs, and why it is not free: a tile's image id is how the grid
+addresses it today, and this makes the frame the unit instead, so the `a=d,d=i` release
+before each placement, the id-per-tile scheme in `TileGrid` and the z-order the cursor and
+the overlays rely on all have to be reworked -- and an image store that grows a frame at a
+time needs its own deletes, which is the shape of leak this protocol has already produced
+once (see the `a=d,d=i` note in `src/term/kitty.rs`).
+
+The prize, measured by `make perf` on a full-screen update: 0.7 ms/frame against 0.9, most
+of it system calls -- and it is the smaller half of what the second attempt was worth. The
+larger half, packing into the mapping rather than into a buffer to be copied in, is 1.6 to
+0.9 and is in. The benchmark keeps the one-object row so the remaining 0.2 ms stays a
+number rather than a memory, and
 `pixels_travel_through_shared_memory_when_the_terminal_offers_it` asserts that no `O=`
-appears in a placement, so this cannot come back without someone reading this first.
+appears in a placement, so this cannot come back a third time by accident.
 
 ### Considered and rejected
 
@@ -370,6 +389,7 @@ fold-in policy. It profiles well on the case we are already fast at.
 **Tile size as a constant.** `TILE_TARGET_PX = 128` is a tuning parameter dressed as a law:
 whole-screen scrolling wants larger tiles to amortise the escape and syscall overhead, a
 caret wants smaller. Choosing it from the layout, or from the damage pattern, is a real
-improvement -- but measure first, and note that the per-tile system calls are still there,
-so the argument for larger tiles is stronger than it looked when one object per frame
-seemed to be on the table.
+improvement -- but measure first, and note that the per-tile system calls are here to stay
+unless a frame becomes one transmission (see [the offset finding](#the-o-finding)), so the
+argument for larger tiles is stronger than it looked when one object per frame seemed to be
+on the table.

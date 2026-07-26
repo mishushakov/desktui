@@ -192,9 +192,12 @@ impl KittyEncoder {
     ///
     /// The object holds exactly this tile and nothing else, so there are no `O=`/`S=`
     /// keys. The protocol has them, and one object per frame with an offset per tile
-    /// would be five system calls a frame rather than five a tile -- but Ghostty draws
-    /// nothing for a placement carrying them, and with `q=2` it does not say why. Until
-    /// that is understood, a frame is an object per tile.
+    /// would be five system calls a frame rather than five a tile -- but a terminal
+    /// "must read the data from the memory object and then unlink and close it", so an
+    /// object can only be placed *once*: the first tile of the frame consumes the name
+    /// and every later one opens nothing. Tried against Ghostty and kitty, and neither
+    /// draws it. One transmission per frame is the shape that would work; see
+    /// RENDERING.md.
     pub fn place_shm(&mut self, out: &mut Vec<u8>, at: Placement, name: &str) {
         let Placement { id, col, row, w, h } = at;
         if w == 0 || h == 0 {
