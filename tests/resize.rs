@@ -134,6 +134,51 @@ fn a_resize_never_blanks_the_screen() {
 }
 
 #[test]
+fn growing_the_window_sends_the_new_tiles_and_not_the_rest() {
+    // A desktop bigger than the window is cropped, and the crop starts at the same corner
+    // however big the window is: growing it exposes tiles and moves none. Every other tile
+    // is already in the terminal's image store, under the id it still answers to, so the
+    // resize is worth a strip of tiles rather than a screenful.
+    //
+    // 200x50 cells of 8x17 crops 1600x833 out of the desktop, in a grid of 13x7 tiles of
+    // 128x136 -- 91 of them, all but the clipped last row and column full size. Grown to
+    // 210x55 the crop is 1680x918, a grid of 14x7, of which the 12x6 that were full size
+    // and did not move are kept: 26 to send, where it used to be all 98.
+    let (_server, mut term) = start_with(Extensions::default(), (2000, 2000), &["--scale", "1:1"]);
+    assert_drew(&term, Duration::from_secs(10));
+    // The whole first screen has to be out before there is anything to keep. A cropped 1:1
+    // window is pixel-exact, so the bar does not name a scaled size to wait for -- but it
+    // is on the last row, and no tile is placed there.
+    assert!(
+        term.wait_for(b"\x1b[50;1H", Duration::from_secs(10)),
+        "no bar on the last row: {}",
+        tail(&term.output())
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    let before = tiles_drawn(&term);
+    term.resize(210, 55, 1680, 935);
+    assert!(
+        term.wait_for(b"\x1b[55;1H", Duration::from_secs(10)),
+        "the bar never reached the new last row: {}",
+        tail(&term.output())
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let sent = tiles_drawn(&term) - before;
+
+    assert!(sent > 0, "the new tiles were never drawn");
+    assert!(
+        sent <= 40,
+        "a resize sent {sent} tiles; the grid is 98, and the tiles that neither moved \
+         nor changed size were supposed to be kept: {}",
+        tail(&term.output())
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
+#[test]
 fn a_refused_resize_falls_back_and_says_why() {
     let (server, mut term) = start(Resize::Refuse, (1024, 768));
 

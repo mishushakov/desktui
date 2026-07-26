@@ -458,10 +458,11 @@ impl Menu {
     /// the backdrop is an image of ours that outranks every tile and would otherwise
     /// stay on top of them for ever. The cells go back to default attributes, which
     /// is what makes them transparent to the tiles again.
-    pub fn clear(&self, out: &mut Vec<u8>, metrics: &Metrics) {
-        let Some(area) = self.area(metrics) else {
-            return;
-        };
+    ///
+    /// Returns the cells it blanked, which the caller owes a redraw: a terminal may treat
+    /// clearing a cell as dropping the placement under it.
+    pub fn clear(&self, out: &mut Vec<u8>, metrics: &Metrics) -> Option<Rect> {
+        let area = self.area(metrics)?;
 
         // Text first, then images, as a relayout does it: an erase may take the
         // placements under it along too.
@@ -472,6 +473,7 @@ impl Menu {
         }
         kitty::delete_image(out, kitty::OVERLAY_IMAGE_ID);
         kitty::delete_image(out, kitty::MENU_HIGHLIGHT_IMAGE_ID);
+        Some(area)
     }
 }
 

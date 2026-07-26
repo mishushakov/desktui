@@ -49,8 +49,11 @@ const CHUNK: usize = 4096;
 /// screen content, and we are spending that CPU every frame.
 const ZLIB_LEVEL: Compression = Compression::new(1);
 
-/// First image id we use. Tiles take `IMAGE_ID_BASE + index`, well away from
-/// the low ids other programs tend to pick.
+/// First image id we use, well away from the low ids other programs tend to pick.
+///
+/// A tile takes `IMAGE_ID_BASE` plus an offset for where it sits in the grid, which
+/// `render::TileGrid` works out. Its stride is what the distance to
+/// [`OVERLAY_IMAGE_ID`] has to clear.
 pub const IMAGE_ID_BASE: u32 = 0x7600;
 
 /// Placement id carried by every image we place.
@@ -63,12 +66,14 @@ const PLACEMENT_ID: u32 = 1;
 
 /// Image id for an overlay's backdrop, above every id a tile can take.
 ///
-/// Tiles are around 128px square, so even a 4K terminal uses a few hundred of
-/// them and could never reach this. The distance is the point: at equal
-/// z-index the higher id is composited on top, which is the only way an overlay
-/// can cover the remote screen. A cell background cannot, being painted below
-/// the image.
-pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x10000;
+/// The distance is the point: at equal z-index the higher id is composited on
+/// top, which is the only way an overlay can cover the remote screen. A cell
+/// background cannot, being painted below the image.
+///
+/// A tile is addressed by its place in the grid rather than by a running count, so
+/// what has to be cleared is the whole coordinate space and not the number of tiles
+/// on screen -- `render::TILE_ID_STRIDE` squared, which this is comfortably past.
+pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x40000;
 
 /// Image id for the menu row under the pointer, one above the backdrop it is drawn
 /// on so it is composited over it rather than under.

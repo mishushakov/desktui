@@ -186,11 +186,12 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     // cell erased here is one a tile is free to be placed under after.
                     // Only a window that grew: a bar on the row it is already on overwrites
                     // itself, and one that shrank went with the rows the terminal dropped.
+                    let mut erased = Vec::new();
                     if was.rows < metrics.rows {
-                        status::clear(&mut pending_cleanup, &was);
+                        erased.extend(status::clear(&mut pending_cleanup, &was));
                     }
                     if show_menu || clear_menu {
-                        menu.clear(&mut pending_cleanup, &was);
+                        erased.extend(menu.clear(&mut pending_cleanup, &was));
                         clear_menu = false;
                     }
 
@@ -200,6 +201,12 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     // relayout names the tiles it has dropped, and a second one before
                     // that frame goes out names different ones.
                     pending_cleanup.extend_from_slice(&cleanup);
+                    // After the relayout, which is what decides which tiles it keeps: a
+                    // terminal that dropped the placements under the erased cells has to be
+                    // given them again, and the relayout was not going to.
+                    for cells in erased {
+                        renderer.mark_cells(cells.x, cells.y, cells.width, cells.height);
+                    }
                 }
                 _ => {}
             }

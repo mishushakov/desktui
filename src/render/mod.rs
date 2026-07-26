@@ -25,6 +25,20 @@ use scale::{Filter, Scaler};
 /// the per-tile escape overhead stays in the noise.
 const TILE_TARGET_PX: u32 = 128;
 
+/// Tiles per row of the image id space.
+///
+/// A tile's id is `IMAGE_ID_BASE + ty * TILE_ID_STRIDE + tx`, which is what makes an
+/// id mean the same rectangle before and after a resize. Numbering them in the order
+/// they are drawn -- `ty * nx + tx` -- renumbers every tile on the row below whenever
+/// the grid changes width, so an id would name different pixels either side of a
+/// resize and none of what the terminal already holds could be kept.
+///
+/// A tile is never narrower than [`TILE_TARGET_PX`], and no terminal reports a pixel
+/// size that does not fit a `u16`, so 512 of them is past any grid a real window can
+/// ask for. [`TileGrid::new`] refuses to exceed it rather than let two tiles collide
+/// on one id.
+pub const TILE_ID_STRIDE: u16 = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: u32,
@@ -164,6 +178,27 @@ impl Layout {
         }
     }
 
+    /// Do two layouts put the same source pixels on the same cells?
+    ///
+    /// Not whether they are equal -- the grid either side may be wider or taller. This is
+    /// the question a tile the terminal already holds turns on: whether the pixels under
+    /// its id are still the pixels it would be sent. Cells of another size, a crop that
+    /// starts somewhere else, or an image that begins on another cell all mean no.
+    ///
+    /// So does scaling, either side. The resampled copy is made from the whole visible
+    /// source to the whole destination, so a destination of another size changes every
+    /// pixel in it, including the pixels of tiles that did not move.
+    pub fn maps_alike(&self, other: &Self) -> bool {
+        self.cell_w == other.cell_w
+            && self.cell_h == other.cell_h
+            && self.origin_col == other.origin_col
+            && self.origin_row == other.origin_row
+            && self.src.x == other.src.x
+            && self.src.y == other.src.y
+            && !self.needs_scaling()
+            && !other.needs_scaling()
+    }
+
     /// True when the source has to be resampled to reach the destination.
     pub fn needs_scaling(&self) -> bool {
         self.dst_w != self.src.w || self.dst_h != self.src.h
@@ -276,8 +311,11 @@ impl TileGrid {
 
         let tile_px_w = u32::from(tile_cols) * cell_w;
         let tile_px_h = u32::from(tile_rows) * cell_h;
-        let nx = layout.dst_w.div_ceil(tile_px_w) as u16;
-        let ny = layout.dst_h.div_ceil(tile_px_h) as u16;
+        // Clamped rather than allowed to wrap around the id space, where two tiles far
+        // apart would take the same id and fight over one image. It costs the far edge of
+        // a window that no terminal can be asked to open, which is the better failure.
+        let nx = grid_side(layout.dst_w.div_ceil(tile_px_w), "columns");
+        let ny = grid_side(layout.dst_h.div_ceil(tile_px_h), "rows");
 
         Self {
             tile_cols,
@@ -293,6 +331,15 @@ impl TileGrid {
 
     fn len(&self) -> usize {
         usize::from(self.nx) * usize::from(self.ny)
+    }
+
+    /// Image id for the tile at `(tx, ty)`.
+    ///
+    /// A place in the grid rather than a place in the drawing order, so the id survives
+    /// a resize: whatever the grid's width becomes, this tile is still the tile that was
+    /// there before, and the image the terminal holds under that id is still its pixels.
+    fn id(&self, tx: u16, ty: u16) -> u32 {
+        IMAGE_ID_BASE + u32::from(ty) * u32::from(TILE_ID_STRIDE) + u32::from(tx)
     }
 
     /// Destination-pixel rectangle covered by a tile, clipped at the edges.
@@ -316,6 +363,18 @@ impl TileGrid {
             ((r.bottom().saturating_sub(1)) / th).min(u32::from(self.ny.saturating_sub(1))) as u16;
         (x0, y0, x1, y1)
     }
+}
+
+/// One side of the tile grid, refused past what the id space has room for.
+fn grid_side(tiles: u32, what: &str) -> u16 {
+    if tiles > u32::from(TILE_ID_STRIDE) {
+        tracing::warn!(
+            "a grid of {tiles} tile {what} is past the {TILE_ID_STRIDE} the image ids \
+             have room for; the far edge of the screen will not be drawn"
+        );
+        return TILE_ID_STRIDE;
+    }
+    tiles as u16
 }
 
 /// A mouse cursor, drawn by us rather than by the server.
@@ -368,9 +427,11 @@ pub struct Renderer {
     scaler: Scaler,
     scaled: Framebuffer,
     scratch: Vec<u8>,
-    /// Tiles present in the terminal's image store, so a shrinking grid can
-    /// clean up after itself.
-    placed: usize,
+    /// How far across and down the grid the terminal has been given tiles, so a
+    /// shrinking grid can clean up after itself and a growing one knows which
+    /// coordinates it has never sent. Every tile inside it has been transmitted:
+    /// a frame reaches the terminal whole or not at all.
+    placed: (u16, u16),
     cursor: Option<Cursor>,
     /// Where the cursor's hotspot is, in destination pixels.
     cursor_at: Option<(u32, u32)>,
@@ -393,7 +454,7 @@ impl Renderer {
             scaler: Scaler::new(),
             scaled: Framebuffer::new(0, 0),
             scratch: Vec::with_capacity(TILE_TARGET_PX as usize * TILE_TARGET_PX as usize * 3),
-            placed: 0,
+            placed: (0, 0),
             cursor: None,
             cursor_at: None,
             transfer,
@@ -406,21 +467,29 @@ impl Renderer {
         &self.layout
     }
 
-    /// Adopt a new layout, redrawing everything.
+    /// Adopt a new layout, keeping whatever it has not changed.
     ///
     /// Returns escape bytes to write before the next frame: the tiles the new grid has
     /// no place for. Placements belong to the cells they were made at rather than to
     /// the tile that made one, so a tile the grid has dropped stays on screen until it
     /// is deleted by id.
     ///
-    /// The tiles the grid *does* have a place for need nothing. Every one of them is
-    /// retransmitted immediately after this, and a transmission replaces the image and
-    /// moves its placement, so none is left where it used to be. Erasing the screen to
-    /// be sure of that is what a resize used to cost: an erase takes the chrome with it
-    /// and every pixel has to travel again to put it back.
+    /// What the terminal already holds is worth keeping. A window that grew by two cells
+    /// has the same pixels in almost every tile, and they are already there: a tile is
+    /// addressed by where it sits in the grid, so the id still names its rectangle, and
+    /// only the tiles whose rectangle actually moved or changed size have anything new to
+    /// say. Retransmitting the lot is what made a resize cost a whole screen, and erasing
+    /// the screen first is what made it blank.
+    ///
+    /// The whole grid is redrawn when the picture itself is laid out differently --
+    /// another scale, another crop, cells of another size. There every destination pixel
+    /// comes from somewhere new, so there is nothing to keep. [`Layout::maps_alike`] is
+    /// that question.
     ///
     /// The stale *text* is not this layer's to erase -- it has drawn none -- and belongs
-    /// to whoever owns the chrome. `ui::status::clear` and `Menu::clear` are that.
+    /// to whoever owns the chrome. `ui::status::clear` and `Menu::clear` are that. What
+    /// they erase, they have to say, because a terminal may treat clearing a cell as
+    /// dropping the placement under it: [`Renderer::mark_cells`].
     ///
     /// A layout equal to the one in force is left alone. One resize settles through
     /// several paths -- the debounce, the request that follows it, the server's reply,
@@ -432,19 +501,42 @@ impl Renderer {
             return Vec::new();
         }
         let grid = TileGrid::new(&layout);
+        let (was, was_grid) = (self.layout, self.grid);
+        let was_dirty = std::mem::take(&mut self.dirty);
+
+        // Everything the new grid does not reach, of what the terminal has been given.
         let mut cleanup = Vec::new();
-        for idx in grid.len()..self.placed {
-            delete_image(&mut cleanup, IMAGE_ID_BASE + idx as u32);
+        for ty in 0..self.placed.1 {
+            for tx in 0..self.placed.0 {
+                if tx >= grid.nx || ty >= grid.ny {
+                    delete_image(&mut cleanup, was_grid.id(tx, ty));
+                }
+            }
         }
-        // What is left in the terminal's image store: the ids the new grid covers,
-        // whether or not they have been drawn at their new size yet.
-        self.placed = self.placed.min(grid.len());
+        self.placed = (self.placed.0.min(grid.nx), self.placed.1.min(grid.ny));
+
+        // A tile is left alone only if the pixels the terminal holds for it are the ones
+        // it would be sent: the same rectangle of the same picture, and nothing owing on
+        // it from before. Anything else -- a tile that was clipped at the edge and is not
+        // any more, one the grid has only just reached, one still waiting on damage that
+        // arrived before the resize -- is drawn again.
+        let alike = was.maps_alike(&layout);
+        self.dirty = Vec::with_capacity(grid.len());
+        self.dirty_count = 0;
+        for ty in 0..grid.ny {
+            for tx in 0..grid.nx {
+                let held = tx < self.placed.0 && ty < self.placed.1;
+                let clean = held
+                    && alike
+                    && was_grid.tile_rect(tx, ty) == grid.tile_rect(tx, ty)
+                    && !was_dirty[usize::from(ty) * usize::from(was_grid.nx) + usize::from(tx)];
+                self.dirty.push(!clean);
+                self.dirty_count += usize::from(!clean);
+            }
+        }
 
         self.layout = layout;
         self.grid = grid;
-        self.dirty.clear();
-        self.dirty.resize(self.grid.len(), true);
-        self.dirty_count = self.grid.len();
         if self.layout.needs_scaling() {
             self.scaled.resize(self.layout.dst_w, self.layout.dst_h);
         } else {
@@ -484,6 +576,25 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Mark the tiles under a rectangle of terminal cells, zero-based and absolute.
+    ///
+    /// For chrome that has been erased. A terminal may treat clearing a cell as dropping
+    /// the placement under it, and a relayout that keeps most of its tiles has nothing
+    /// else coming to put those back.
+    pub fn mark_cells(&mut self, col: u16, row: u16, cols: u16, rows: u16) {
+        let (cell_w, cell_h) = (self.layout.cell_w, self.layout.cell_h);
+        // Cells left of or above the image clamp to its corner, which marks more than was
+        // erased. The other direction would leave a tile out.
+        let x = u32::from(col.saturating_sub(self.layout.origin_col)) * cell_w;
+        let y = u32::from(row.saturating_sub(self.layout.origin_row)) * cell_h;
+        self.mark_dst(Rect::new(
+            x,
+            y,
+            u32::from(cols) * cell_w,
+            u32::from(rows) * cell_h,
+        ));
     }
 
     /// Adopt a new cursor shape. The old one has to be repaired over.
@@ -576,6 +687,11 @@ impl Renderer {
         self.dirty_count
     }
 
+    #[cfg(test)]
+    fn is_dirty(&self, tx: u16, ty: u16) -> bool {
+        self.dirty[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)]
+    }
+
     pub fn tile_count(&self) -> usize {
         self.grid.len()
     }
@@ -642,7 +758,7 @@ impl Renderer {
                 let col = self.layout.origin_col + tx * self.grid.tile_cols;
                 let row = self.layout.origin_row + ty * self.grid.tile_rows;
                 let at = Placement {
-                    id: IMAGE_ID_BASE + idx as u32,
+                    id: self.grid.id(tx, ty),
                     col,
                     row,
                     w: tile.w,
@@ -670,7 +786,6 @@ impl Renderer {
 
                 stats.tiles += 1;
                 stats.pixels += tile.area();
-                self.placed = self.placed.max(idx + 1);
             }
         }
 
@@ -679,11 +794,19 @@ impl Renderer {
     }
 
     /// Called once a composed frame has actually reached the terminal.
+    ///
+    /// Which is where the terminal's image store is caught up with, rather than in
+    /// `compose`: a frame the writer was too busy for never arrived, and a tile counted as
+    /// held that was never sent is a hole in the next resize that keeps it.
+    ///
+    /// Every tile in the grid is now there. The dirty ones have just been transmitted, and
+    /// a tile that was not dirty was one the terminal already held.
     pub fn commit(&mut self) {
         for slot in &mut self.dirty {
             *slot = false;
         }
         self.dirty_count = 0;
+        self.placed = (self.grid.nx, self.grid.ny);
     }
 }
 
@@ -1108,12 +1231,11 @@ mod tests {
     }
 
     #[test]
-    fn a_grid_that_only_grows_has_nothing_to_clean_up() {
-        // A resize used to erase the screen and delete every image, which is a blank
-        // terminal for as long as the frame that fills it back in takes to compose. The
-        // tiles a growing grid keeps need neither: each is retransmitted at its new size
-        // immediately after, and a transmission replaces the image and moves its
-        // placement, so none of them is left where it used to be.
+    fn a_grid_that_only_grows_keeps_the_tiles_that_did_not_move() {
+        // The whole point of addressing a tile by where it sits rather than by when it is
+        // drawn. A window that grew has the same pixels in every tile the edge did not
+        // reach, and the terminal is already holding them under the same ids -- so a resize
+        // is the new tiles and the tiles that changed size, not a whole screen.
         let m = ghostty();
         let (w, h) = m.image_area();
         let mut r = Renderer::new(
@@ -1125,14 +1247,92 @@ mod tests {
         let mut out = Vec::new();
         r.compose(&fb, &mut out);
         r.commit();
+        let (was_nx, was_ny) = (r.grid.nx, r.grid.ny);
 
         let bigger = metrics(240, 70, 8, 17);
         let (bw, bh) = bigger.image_area();
         let cleanup = r.relayout(Layout::compute(&bigger, ScaleMode::Native, bw, bh, (0, 0)));
-        let text = String::from_utf8(cleanup).unwrap();
-        assert_eq!(text, "", "a bigger grid drops no tiles");
-        assert!(r.has_work(), "everything has to be redrawn afterwards");
-        assert_eq!(r.dirty_tiles(), r.tile_count());
+        assert_eq!(
+            String::from_utf8(cleanup).unwrap(),
+            "",
+            "a bigger grid drops no tiles"
+        );
+
+        assert!(
+            !r.is_dirty(0, 0),
+            "an interior tile has the pixels it had before"
+        );
+        assert!(
+            r.is_dirty(was_nx, 0) && r.is_dirty(0, was_ny),
+            "the tiles the grid has only just reached have never been sent"
+        );
+        assert!(
+            r.is_dirty(was_nx - 1, 0) && r.is_dirty(0, was_ny - 1),
+            "the tiles that were clipped at the edge are a different size now"
+        );
+        // Everything but the last row and column either way, which is what is left when
+        // the two edges that changed size and the two the grid has just reached are taken
+        // out of it.
+        let kept = usize::from(was_nx - 1) * usize::from(was_ny - 1);
+        assert_eq!(r.dirty_tiles(), r.tile_count() - kept);
+        assert!(
+            r.dirty_tiles() < r.tile_count() / 2,
+            "most of the grid should have been kept: {} of {}",
+            r.dirty_tiles(),
+            r.tile_count()
+        );
+    }
+
+    #[test]
+    fn a_grid_laid_out_differently_keeps_nothing() {
+        // Another scale means every destination pixel comes from somewhere new, tiles that
+        // did not move included: the resampled copy is made whole, from the visible source
+        // to the whole destination.
+        let m = ghostty();
+        let mut r = Renderer::new(
+            Layout::compute(&m, ScaleMode::Fit, 800, 600, (0, 0)),
+            true,
+            Transfer::Direct,
+        );
+        let fb = Framebuffer::new(800, 600);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out);
+        r.commit();
+
+        let bigger = metrics(240, 70, 8, 17);
+        r.relayout(Layout::compute(&bigger, ScaleMode::Fit, 800, 600, (0, 0)));
+        assert_eq!(
+            r.dirty_tiles(),
+            r.tile_count(),
+            "a rescaled picture has to be sent again in full"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_never_reached_the_terminal_leaves_its_tiles_owing() {
+        // `placed` is what a later relayout trusts when it decides to keep a tile, so it
+        // moves on the commit rather than on the compose. A frame the writer was too busy
+        // for was composed and thrown away, and a tile counted as held that was never sent
+        // is a hole that survives every resize that keeps it.
+        let m = ghostty();
+        let (w, h) = m.image_area();
+        let mut r = Renderer::new(
+            Layout::compute(&m, ScaleMode::Native, w, h, (0, 0)),
+            true,
+            Transfer::Direct,
+        );
+        let fb = Framebuffer::new(w, h);
+        let mut out = Vec::new();
+        r.compose(&fb, &mut out); // ... and no commit: the frame was dropped.
+
+        let bigger = metrics(240, 70, 8, 17);
+        let (bw, bh) = bigger.image_area();
+        r.relayout(Layout::compute(&bigger, ScaleMode::Native, bw, bh, (0, 0)));
+        assert_eq!(
+            r.dirty_tiles(),
+            r.tile_count(),
+            "nothing reached the terminal, so nothing can be kept"
+        );
     }
 
     #[test]
@@ -1173,28 +1373,38 @@ mod tests {
         assert_eq!(stats.tiles, before);
         r.commit();
 
+        let was = r.grid;
         let small = Layout::compute(&m, ScaleMode::Fit, 64, 64, (0, 0));
         let cleanup = r.relayout(small);
         let text = String::from_utf8(cleanup).unwrap();
-        let after = r.tile_count();
-        assert!(after < before, "the grid was supposed to shrink");
+        assert!(r.tile_count() < before, "the grid was supposed to shrink");
         assert!(
             !text.contains("d=A") && !text.contains("\x1b[2J"),
             "the screen must not be erased wholesale: {text:?}"
         );
-        for idx in after..before {
-            let id = IMAGE_ID_BASE + idx as u32;
-            assert!(
-                text.contains(&format!("a=d,d=I,i={id},")),
-                "tile {idx} was left on the screen: {text:?}"
-            );
+
+        let mut dropped = 0;
+        for ty in 0..was.ny {
+            for tx in 0..was.nx {
+                let id = was.id(tx, ty);
+                let named = text.contains(&format!("a=d,d=I,i={id},"));
+                if tx >= r.grid.nx || ty >= r.grid.ny {
+                    assert!(named, "tile {tx},{ty} was left on the screen: {text:?}");
+                    dropped += 1;
+                } else {
+                    assert!(
+                        !named,
+                        "tile {tx},{ty} is still in the grid and was deleted: {text:?}"
+                    );
+                }
+            }
         }
         assert_eq!(
             text.matches("a=d").count(),
-            before - after,
+            dropped,
             "only the dropped tiles are deleted: {text:?}"
         );
-        assert!(r.has_work(), "a relayout must redraw everything");
+        assert!(r.has_work(), "and what is left has to be drawn again");
     }
 
     #[test]

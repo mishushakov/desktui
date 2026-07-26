@@ -16,6 +16,9 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
+// A rectangle of cells, which is what the chrome measures itself in. Named apart from
+// the renderer's `Rect`, which is pixels.
+use ratatui::layout::Rect as Cells;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::app::{FpsMeter, describe, human_bytes};
@@ -947,8 +950,15 @@ impl<B: Backend> Session<B> {
                 self.metrics.px_w,
                 self.metrics.px_h
             );
-            self.clear_chrome_drawn_with(&was);
+            let erased = self.clear_chrome_drawn_with(&was);
             self.relayout();
+            // After the relayout, which is what decides which tiles it is keeping: a
+            // terminal that dropped the placements under those cells has to be given them
+            // again, and the relayout was not going to.
+            for cells in erased {
+                self.renderer
+                    .mark_cells(cells.x, cells.y, cells.width, cells.height);
+            }
             if self.mode == ScaleMode::Native
                 || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
             {
@@ -1232,25 +1242,34 @@ impl<B: Backend> Session<B> {
     /// The notification popup takes itself off: it remembers the rectangle it drew in
     /// absolute cells and blanks that on the next frame, and being told it has moved is
     /// all it needs to treat the old one as stale.
-    fn clear_chrome_drawn_with(&mut self, was: &Metrics) {
+    ///
+    /// Returns the cells it blanked, for the caller to have redrawn once the new layout
+    /// has decided which tiles it is keeping.
+    fn clear_chrome_drawn_with(&mut self, was: &Metrics) -> Vec<Cells> {
         let mut cleanup = Vec::new();
+        let mut erased = Vec::new();
         // Only a window that grew. A bar redrawn on the row it is already on overwrites
         // itself, every cell of it, and one that shrank took the row the bar was on with
         // it -- where a cursor move would clamp to the row the new bar is about to be
         // drawn on and erase that instead.
         if was.rows < self.metrics.rows {
-            status::clear(&mut cleanup, was);
+            erased.extend(status::clear(&mut cleanup, was));
         }
         if self.show_menu || self.clear_menu {
-            self.menu.clear(&mut cleanup, was);
+            erased.extend(self.menu.clear(&mut cleanup, was));
             // Cleared where it was; a menu still up is redrawn where it now belongs in
             // the same frame, and one on its way out is now off the screen for good.
             self.clear_menu = false;
         }
         self.pending_cleanup.extend_from_slice(&cleanup);
-        // The relayout that follows marks every tile, so the repair it asks for is
-        // already coming.
-        let _ = self.toast.moved();
+        // A note that was up has its own blanking to do on the next frame, and where it
+        // used to be is not a rectangle it hands out. Rare enough during a resize -- a
+        // plain drag on a server that resizes says nothing -- to be worth a whole redraw
+        // rather than a seam between this and the popup's own bookkeeping.
+        if self.toast.moved() {
+            self.renderer.mark_all();
+        }
+        erased
     }
 
     async fn send(&self, input: Input) -> Result<()> {

@@ -73,11 +73,21 @@ pub fn draw(
 /// The reset comes first because an erase fills with the current background, and the
 /// background in force is the bar's own: without it the row would be blanked in the
 /// colour that makes it look like a bar.
-pub fn clear(out: &mut Vec<u8>, metrics: &Metrics) {
+///
+/// Returns the cells it blanked, which the caller owes a redraw: a terminal may treat
+/// clearing a cell as dropping the placement under it, and this row is an interior one
+/// now, with tiles of its own.
+pub fn clear(out: &mut Vec<u8>, metrics: &Metrics) -> Option<Rect> {
     if metrics.cols == 0 || metrics.rows == 0 {
-        return;
+        return None;
     }
     let _ = write!(out, "\x1b[0m\x1b[{};1H\x1b[2K", metrics.rows);
+    Some(Rect {
+        x: 0,
+        y: metrics.rows - 1,
+        width: metrics.cols,
+        height: 1,
+    })
 }
 
 #[cfg(test)]
