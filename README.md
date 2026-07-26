@@ -35,7 +35,10 @@ stops input reaching the remote and leaves the pointer for the server to draw.
 
 **Tuned for the link you are on.** `--quality` and `--compression` trade sharpness and
 server CPU against bandwidth, and `--fps` caps the frame rate. The defaults are
-lossless at 60 fps; turn quality down only when the link cannot afford it.
+lossless at 60 fps; turn quality down only when the link cannot afford it — a screen
+that changes wholesale, like a page being scrolled, is where lossless gets expensive,
+and it is the server paying. `--no-push` goes further and takes the pace back from the
+server; see below.
 
 **Your keys reach the remote, not the terminal.** Everything is passed through,
 including `Ctrl+C`. Local commands live behind `Ctrl+A`, which `--prefix` moves when it
@@ -204,6 +207,13 @@ answering `SetEncodings` with `EndOfContinuousUpdates`; from then on no requests
 at all, and a fence is echoed back with the request bit cleared and any flag we do not
 implement stripped. TigerVNC negotiates this, so `make test-live` covers it against a
 real server rather than only a cooperative fake.
+
+What it costs is the pace. A server pushing as fast as it can encode decides how hard
+both ends work, and every update has to be decoded to keep the stream in sync whether or
+not there is time to draw it — so `--fps` bounds the drawing and not the work. On a busy
+screen that can saturate the server, this end, or both. `--no-push` never offers the
+encoding, and ignores the announcement from a server that sends it unbidden: frames go
+back to one request at a time, a round trip each.
 
 **Lock-key state** (`QEMULedEvent`, -261). A remote caps lock that disagrees with the
 local keyboard turns every keystroke into the wrong case, and nothing in the keystroke

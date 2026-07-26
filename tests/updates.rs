@@ -200,6 +200,78 @@ fn requests_the_encodings_it_can_actually_decode() {
     term.wait(Duration::from_secs(10));
 }
 
+#[test]
+fn no_push_never_offers_the_extension_and_keeps_asking() {
+    // Pushed frames are cheaper by a round trip and unbounded: the server decides how
+    // hard both ends work, and every update has to be decoded whether or not there is
+    // time to draw it. `--no-push` puts the pace back here.
+    //
+    // Declined by never offering it. A server announces the extension by answering
+    // `SetEncodings`, and only a client that asked may enable it, so leaving the encoding
+    // out is what stops the whole arrangement rather than turning it down afterwards.
+    let ext = Extensions {
+        continuous_updates: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit", "--no-push"]);
+
+    let request = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetEncodings(_))
+        })
+        .expect("no encodings were negotiated");
+    match request {
+        Request::SetEncodings(encodings) => {
+            assert!(
+                !encodings.contains(&-313),
+                "ContinuousUpdates must not be offered: {encodings:?}"
+            );
+            assert!(
+                encodings.contains(&-312),
+                "Fence is a separate extension and the latency probe needs it: \
+                 {encodings:?}"
+            );
+        }
+        other => panic!("unexpected request {other:?}"),
+    }
+
+    // So it is never turned on, and the frames stay something this end asks for. The
+    // watchdog is what keeps asking here, the fake server having nothing to answer an
+    // incremental request with, so give it longer than its second.
+    assert_drew(&term, Duration::from_secs(10));
+    let before = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::FramebufferUpdate { .. }))
+        .count();
+    std::thread::sleep(Duration::from_secs(2));
+    let asked = server
+        .requests()
+        .iter()
+        .filter(|r| matches!(r, Request::FramebufferUpdate { .. }))
+        .count();
+    assert!(
+        asked > before,
+        "stopped asking for frames without anything pushing them"
+    );
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::EnableContinuousUpdates { .. })),
+        "asked the server to push frames anyway: {:?}",
+        server.requests()
+    );
+    assert!(
+        !contains(&term.output(), b"pushing frames"),
+        "said the remote was pushing frames: {}",
+        tail(&term.output())
+    );
+
+    quit(&mut term);
+    term.wait(Duration::from_secs(10));
+}
+
 /// Live counterpart: `live::a_real_server_negotiates_continuous_updates`.
 #[test]
 fn continuous_updates_are_enabled_and_stop_the_request_traffic() {

@@ -56,6 +56,16 @@ pub struct Args {
     #[arg(long)]
     pub no_clipboard: bool,
 
+    /// Ask for each frame instead of letting the server push them.
+    ///
+    /// Pushed frames save a round trip each, and cost the pace: a server pushing as
+    /// fast as it can encode decides how hard both ends work, and every update has to
+    /// be decoded whether or not there is time to draw it. On a busy screen -- a page
+    /// being scrolled -- that can saturate the server, this end, or both. Asking for
+    /// one frame at a time gives the pace back, at a round trip per frame.
+    #[arg(long)]
+    pub no_push: bool,
+
     /// Local command prefix key, as a single character interpreted as Ctrl+<char>.
     #[arg(long, default_value = "a", value_name = "CHAR")]
     pub prefix: char,
