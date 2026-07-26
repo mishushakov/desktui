@@ -126,7 +126,7 @@ impl Decoder {
                 let control = reader.read_u8()?;
                 let is_rle = control & 0x80 > 0;
                 let palette_size = control & 0x7f;
-                palette.truncate(0);
+                palette.clear();
 
                 for _ in 0..palette_size {
                     copy_true_color(
@@ -194,7 +194,7 @@ impl Decoder {
                         let mut count = 0;
                         let mut pixel = Vec::new();
                         while count < pixel_count {
-                            pixel.truncate(0);
+                            pixel.clear();
                             copy_true_color(
                                 &mut reader,
                                 &mut pixel,

@@ -130,13 +130,18 @@ impl FakeTerm {
         let mut rc = -1;
         for attempt in 0..20 {
             // SAFETY: out-params are valid locals; the termios argument is optional.
+            //
+            // `winp` is a raw pointer rather than `&mut ws` because the two platforms
+            // disagree about it: Apple declares it `*mut winsize` and Linux
+            // `*const winsize`. A `*mut` coerces to either, where `&mut` satisfies
+            // only Apple and `&` only Linux.
             rc = unsafe {
                 libc::openpty(
                     &mut master_fd,
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut ws,
+                    &raw mut ws,
                 )
             };
             if rc == 0 {

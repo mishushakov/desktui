@@ -116,10 +116,7 @@ fn read_until_da1(timeout: Duration) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 1024];
 
-    loop {
-        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
-            break;
-        };
+    while let Some(remaining) = timeout.checked_sub(start.elapsed()) {
         let ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
 
         let mut pfd = libc::pollfd {
