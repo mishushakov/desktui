@@ -252,12 +252,24 @@ Replaces `blend_cursor`, `cursor_rect` and the cursor's dirty-marking in
 `src/render/mod.rs` with one image whose id is above every tile's, placed with sub-cell
 `X`/`Y` offsets and moved with `a=p`.
 
-**Answer this first.** The protocol says semi-transparent placements that overlap are
-blended, and that at equal `z` the higher id is on top. Whether Ghostty actually blends an
-RGBA (`f=32`) placement over another placement -- rather than compositing it against the
-cell background, or drawing it opaque -- is not something the docs settle, and getting it
-wrong means a black rectangle over the pointer. Test it with a two-line script against
-Ghostty and kitty before writing any of the rest.
+**Answer this first: `make blend-probe`.** The protocol says semi-transparent placements
+that overlap are blended, and that at equal `z` the higher id is on top. Whether Ghostty
+actually blends an RGBA (`f=32`) placement over another placement -- rather than compositing
+it against the cell background, or drawing it opaque, or dropping it -- is not something the
+docs settle, and getting it wrong means a black or solid rectangle where the pointer should
+be.
+
+`docker/blend-probe.sh` draws a green square with a half-transparent red one over its
+middle, at the same `z` and a higher id, positioned with the `X`/`Y` sub-cell offsets this
+plan also depends on. An olive middle means blended and the plan is sound. Solid red means
+opaque, black means composited against the cell background, and nothing means the placement
+was dropped -- all three mean the cursor stays blended into tiles and this needs rethinking
+rather than writing. Run it on Ghostty and on kitty; a difference between them is a bug
+report rather than a misreading of the spec.
+
+This is not caution for its own sake. One shared memory object per frame was built from the
+spec without a terminal to try it against, and the answer was a black screen -- see
+[the offset finding](#the-o-finding).
 
 If it holds, the rest is small. `X`/`Y` must be smaller than the cell, so the placement
 cell is `hotspot / cell_size` and the offset is the remainder.

@@ -90,7 +90,7 @@ desktop-status:
 
 ## run: connect to the desktop (needs Ghostty, kitty or WezTerm)
 run:
-	VNC_PASSWORD='$(VNC_PASSWORD)' cargo run --release -- $(SERVER)
+	VNC_PASSWORD='$(VNC_PASSWORD)' cargo run --release -- --quality 6 --compression 2 $(SERVER)
 
 ## caps: report what the current terminal supports
 caps:
@@ -99,6 +99,10 @@ caps:
 ## pattern: render the test pattern, no server needed
 pattern:
 	cargo run --release -- --test-pattern
+
+## blend-probe: does this terminal blend one placement over another? (see RENDERING.md)
+blend-probe:
+	@sh docker/blend-probe.sh
 
 # ------------------------------------------------------------------------- checks
 
