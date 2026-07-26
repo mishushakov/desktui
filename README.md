@@ -127,12 +127,6 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | `c` | toggle statistics (fps, tiles, bytes per frame, server RTT) |
 | `Ctrl+A` | send a literal `Ctrl+A` |
 
-`Ctrl+A p` is the only one worth remembering, because the rest are listed in what it
-opens, each beside the keys that reach it. The row under the pointer lights up and a
-click runs it, so nothing in there needs a binding to be reachable. The scaling row is
-a select: the mode in force is bracketed, and clicking another goes straight to it,
-where the key can only step to the next one.
-
 Clipboard works in both directions: paste into the terminal and it reaches the
 remote clipboard; the remote clipboard arrives locally through OSC 52.
 
