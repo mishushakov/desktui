@@ -225,7 +225,6 @@ on — what you want on a link too slow for lossless, and not otherwise.
 ```
 make test           # no server or terminal needed
 make check          # fmt, clippy, tests
-make test-timing    # the wall-clock sensitive tests
 make test-live      # against the real desktop container
 make perf           # time the compose pipeline
 ```

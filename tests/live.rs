@@ -83,8 +83,7 @@ fn a_real_desktop_decodes_and_keeps_drawing() {
         term.send(format!("\x1b[<35;{x};300M").as_bytes());
         std::thread::sleep(Duration::from_millis(40));
     }
-    std::thread::sleep(Duration::from_millis(500));
-    assert_kept_drawing(&term, before, "moving the pointer");
+    assert_kept_drawing(&term, before, "moving the pointer", Duration::from_secs(15));
 
     // And no decoder gave up along the way.
     let out = term.output();
@@ -246,9 +245,16 @@ fn a_real_server_negotiates_the_extended_clipboard() {
     // And the server was happy with it. A malformed extended message is a protocol
     // error to TigerVNC, which drops the connection -- so still drawing a second later
     // is the assertion that our message was well formed.
+    // The second is the server's chance to object, so it stays a sleep; only the waiting
+    // for a frame afterwards is the assertion's business.
     let before = tiles_drawn(&term);
     std::thread::sleep(Duration::from_secs(1));
-    assert_kept_drawing(&term, before, "announcing the clipboard");
+    assert_kept_drawing(
+        &term,
+        before,
+        "announcing the clipboard",
+        Duration::from_secs(15),
+    );
 
     quit(&mut term);
     let status = term.wait(Duration::from_secs(15)).expect("did not exit");

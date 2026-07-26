@@ -384,18 +384,18 @@ fn growing_the_window_does_not_leave_stale_status_lines() {
     );
 
     // And after the last resize, the only status row still being written is the new
-    // one: nothing should be repainting rows 24 or 36 any more.
-    let after = out.len();
-    std::thread::sleep(Duration::from_millis(400));
-    let latest = term.output();
-    let tail = &latest[after.min(latest.len())..];
+    // one: nothing should be repainting rows 24 or 36 any more. Whole frames, so that the
+    // rest of one composed at the old size cannot be read as a repaint at it.
+    let since = term
+        .drawn_after(out.len(), 3, Duration::from_secs(10))
+        .expect("the client stopped drawing after the last resize");
     assert!(
-        contains(tail, b"\x1b[50;1H"),
+        contains(&since, b"\x1b[50;1H"),
         "the status line stopped being drawn on the new last row"
     );
     for stale in [&b"\x1b[24;1H"[..], b"\x1b[36;1H"] {
         assert!(
-            !contains(tail, stale),
+            !contains(&since, stale),
             "still writing to an old status row: {}",
             String::from_utf8_lossy(stale)
         );
