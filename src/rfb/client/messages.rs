@@ -541,3 +541,246 @@ impl ServerMsg {
         }
     }
 }
+
+#[cfg(test)]
+mod server_msg_tests {
+    use super::*;
+
+    /// Parse one message, and hand back whatever is left on the stream.
+    ///
+    /// The leftovers are half the point: several of these messages carry a length the
+    /// server chose, and the contract is that the whole message is consumed even when
+    /// it is refused. A parser that stops early leaves the next read starting
+    /// mid-message, and from there every later message is garbage -- which looks
+    /// nothing like the bug that caused it.
+    async fn read(bytes: &[u8]) -> (Result<ServerMsg, VncError>, Vec<u8>) {
+        let mut input = bytes;
+        let result = ServerMsg::read(&mut input).await;
+        (result, input.to_vec())
+    }
+
+    /// A `Bell`, as something recognisable to put after a message under test.
+    const NEXT_MESSAGE: [u8; 1] = [2];
+
+    #[tokio::test]
+    async fn a_framebuffer_update_carries_its_rectangle_count() {
+        let (msg, rest) = read(&[0, 0, 0x01, 0x2c]).await;
+
+        assert!(
+            matches!(msg, Ok(ServerMsg::FramebufferUpdate(300))),
+            "{msg:?}"
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bell_is_just_its_type_byte() {
+        let (msg, rest) = read(&[2, 0xff]).await;
+
+        assert!(matches!(msg, Ok(ServerMsg::Bell)), "{msg:?}");
+        assert_eq!(rest, vec![0xff], "read past the end of a Bell");
+    }
+
+    #[tokio::test]
+    async fn end_of_continuous_updates_is_just_its_type_byte() {
+        let (msg, rest) = read(&[150, 0xff]).await;
+
+        assert!(
+            matches!(msg, Ok(ServerMsg::EndOfContinuousUpdates)),
+            "{msg:?}"
+        );
+        assert_eq!(rest, vec![0xff]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_message_type_is_refused() {
+        // There is no length to skip, so the stream cannot be recovered and saying so
+        // is all that is left.
+        let (msg, _) = read(&[99]).await;
+
+        assert!(matches!(msg, Err(VncError::WrongServerMessage)), "{msg:?}");
+    }
+
+    #[tokio::test]
+    async fn cut_text_arrives_as_a_string() {
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&5i32.to_be_bytes());
+        bytes.extend_from_slice(b"hello");
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        match msg {
+            Ok(ServerMsg::ServerCutText(text)) => assert_eq!(text, "hello"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rest, NEXT_MESSAGE.to_vec());
+    }
+
+    #[tokio::test]
+    async fn cut_text_that_is_not_utf8_is_substituted_rather_than_refused() {
+        // RFB says Latin-1 and servers send whatever they like. Losing the clipboard is
+        // better than losing the session.
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        bytes.extend_from_slice(&[0xff, 0xfe, b'a']);
+
+        let (msg, _) = read(&bytes).await;
+
+        match msg {
+            Ok(ServerMsg::ServerCutText(text)) => {
+                assert!(text.ends_with('a'), "got {text:?}");
+                assert!(text.contains('\u{fffd}'), "expected replacements: {text:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_negative_cut_text_length_is_refused_rather_than_read_as_four_billion() {
+        // The length is signed and a negative one announces the extended clipboard
+        // extension, which we never request. Read as unsigned, -8 becomes 4294967288 and
+        // the client spends the rest of the session trying to skip that many bytes.
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&(-8i32).to_be_bytes());
+
+        let (msg, _) = read(&bytes).await;
+
+        match msg {
+            Err(VncError::General(text)) => assert!(
+                text.contains("extended clipboard"),
+                "should name the extension: {text}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_implausible_cut_text_length_is_refused_before_allocating() {
+        // Past MAX_PAYLOAD there is no way back to a message boundary that does not mean
+        // reading tens of megabytes, so this one gives up on the stream deliberately.
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&((MAX_PAYLOAD + 1) as i32).to_be_bytes());
+
+        let (msg, _) = read(&bytes).await;
+
+        match msg {
+            Err(VncError::General(text)) => {
+                assert!(text.contains(&(MAX_PAYLOAD + 1).to_string()), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cut_text_past_the_text_cap_is_clipped_but_still_consumed() {
+        // Between MAX_CUT_TEXT and MAX_PAYLOAD the payload is too big to be clipboard
+        // text but small enough to skip, so the excess is read past rather than
+        // allocated -- and the next message has to still line up afterwards.
+        let extra = 100;
+        let len = MAX_CUT_TEXT + extra;
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&(len as i32).to_be_bytes());
+        bytes.extend(std::iter::repeat_n(b'x', len));
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        match msg {
+            Ok(ServerMsg::ServerCutText(text)) => {
+                assert_eq!(text.len(), MAX_CUT_TEXT, "should keep exactly the cap");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            rest,
+            NEXT_MESSAGE.to_vec(),
+            "the skipped tail left the stream misaligned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_colour_map_is_drained_before_it_is_refused() {
+        // We always ask for true colour, so a colour map means the server ignored that
+        // and nothing after it can be interpreted. Upstream had `unimplemented!()` here.
+        // The message is still drained, because the error is reported to the user rather
+        // than ending the session outright.
+        let colours = 3u16;
+        let mut bytes = vec![1, 0];
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&colours.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(0u8, usize::from(colours) * 6));
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        match msg {
+            Err(VncError::General(text)) => assert!(text.contains("colour map"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            rest,
+            NEXT_MESSAGE.to_vec(),
+            "six bytes per colour have to be drained or the stream desynchronises"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fence_carries_its_flags_and_payload() {
+        let mut bytes = vec![248, 0, 0, 0];
+        bytes.extend_from_slice(&0b11u32.to_be_bytes());
+        bytes.push(4);
+        bytes.extend_from_slice(b"hail");
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        match msg {
+            Ok(ServerMsg::ServerFence { flags, payload }) => {
+                assert_eq!(flags, 0b11);
+                assert_eq!(payload, b"hail");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rest, NEXT_MESSAGE.to_vec());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_fence_payload_is_clipped_but_still_consumed() {
+        // The spec caps a fence payload at 64 bytes. A server sending more is broken,
+        // but the bytes are on the stream either way and have to come off it.
+        let mut bytes = vec![248, 0, 0, 0];
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.push(200);
+        bytes.extend(std::iter::repeat_n(b'z', 200));
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let (msg, rest) = read(&bytes).await;
+
+        match msg {
+            Ok(ServerMsg::ServerFence { payload, .. }) => {
+                assert_eq!(payload.len(), 64, "should be clipped to the spec's cap")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            rest,
+            NEXT_MESSAGE.to_vec(),
+            "all 200 bytes have to be read even though only 64 are kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_message_is_an_error() {
+        // A fence that promises four bytes of payload and supplies one, which is what a
+        // connection dropped mid-message looks like.
+        let mut bytes = vec![248, 0, 0, 0];
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.push(4);
+        bytes.push(b'x');
+
+        let (msg, _) = read(&bytes).await;
+
+        assert!(matches!(msg, Err(VncError::IoError(_))), "{msg:?}");
+    }
+}

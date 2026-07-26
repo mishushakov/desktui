@@ -346,3 +346,362 @@ where
         Ok(VncState::Handshake(self))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rfb::VncEncoding;
+    use std::collections::VecDeque;
+    use std::future::Ready;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncWrite, ReadBuf};
+
+    /// A server that says only what the test scripts, and remembers what the client
+    /// said back.
+    ///
+    /// Running out of script is end-of-stream rather than pending, so a client that
+    /// wants more than the test provided fails instead of hanging. That is what lets
+    /// these tests stop at the end of the handshake: whatever the client does next
+    /// -- `ClientInit`, then waiting for `ServerInit` -- errors, and by then the bytes
+    /// worth asserting on have already been written.
+    #[derive(Clone, Default)]
+    struct Script {
+        inbound: Arc<Mutex<VecDeque<u8>>>,
+        outbound: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Script {
+        fn new(inbound: Vec<u8>) -> Self {
+            Self {
+                inbound: Arc::new(Mutex::new(inbound.into())),
+                outbound: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.outbound.lock().unwrap().clone()
+        }
+
+        /// What the client never got round to reading.
+        fn unread(&self) -> Vec<u8> {
+            self.inbound.lock().unwrap().iter().copied().collect()
+        }
+    }
+
+    impl AsyncRead for Script {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let mut inbound = self.inbound.lock().unwrap();
+            while buf.remaining() > 0 {
+                match inbound.pop_front() {
+                    Some(byte) => buf.put_slice(&[byte]),
+                    None => break,
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Script {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.outbound.lock().unwrap().extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A password that is already available, so the connector's generic future has a
+    /// concrete type these tests can name.
+    type Password = Ready<Result<String, VncError>>;
+
+    fn client(
+        script: &Script,
+        ours: VncVersion,
+        password: Option<&str>,
+    ) -> VncState<Script, Password> {
+        let mut connector = VncConnector::new(script.clone())
+            .add_encoding(VncEncoding::Raw)
+            .set_version(ours);
+        if let Some(password) = password {
+            connector = connector.set_auth_method(std::future::ready(Ok(password.to_string())));
+        }
+        connector.build().unwrap()
+    }
+
+    /// The version string a server announces itself with.
+    fn version(v: VncVersion) -> Vec<u8> {
+        <VncVersion as Into<&[u8; 12]>>::into(v).to_vec()
+    }
+
+    /// The shared-desktop flag, the first thing written after the handshake finishes.
+    const CLIENT_INIT: u8 = 1;
+
+    // ------------------------------------------------------ version negotiation
+
+    #[tokio::test]
+    async fn the_lower_of_the_two_versions_is_agreed_and_echoed() {
+        // Whichever side is older decides, and the agreed version is written back so the
+        // server knows which handshake follows. Sending our own version regardless would
+        // put a 3.3 server into a handshake it does not implement.
+        for (server, ours, expected) in [
+            (VncVersion::RFB38, VncVersion::RFB38, VncVersion::RFB38),
+            (VncVersion::RFB33, VncVersion::RFB38, VncVersion::RFB33),
+            (VncVersion::RFB37, VncVersion::RFB38, VncVersion::RFB37),
+            (VncVersion::RFB38, VncVersion::RFB33, VncVersion::RFB33),
+            (VncVersion::RFB38, VncVersion::RFB37, VncVersion::RFB37),
+        ] {
+            let script = Script::new(version(server));
+            // The script stops after the version, so the security handshake fails --
+            // by which point the version has been written.
+            let _ = client(&script, ours, None).try_start().await;
+
+            assert_eq!(
+                script.written(),
+                version(expected),
+                "server {server:?} with ours {ours:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_version_is_treated_as_33() {
+        // RFC 6143 7.1.1: other version numbers are reported by some servers, and are
+        // to be read as 3.3 because they do not implement the later handshakes. Assuming
+        // the newest instead would hang waiting for a security list that never comes.
+        for announced in [&b"RFB 004.001\n"[..], b"RFB 999.999\n", b"NOT A VERSION"] {
+            let script = Script::new(announced.to_vec());
+            let _ = client(&script, VncVersion::RFB38, None).try_start().await;
+
+            assert_eq!(
+                script.written(),
+                version(VncVersion::RFB33),
+                "{:?} should be read as 3.3",
+                String::from_utf8_lossy(announced)
+            );
+        }
+    }
+
+    // ------------------------------------------------- the security handshake
+
+    #[tokio::test]
+    async fn no_auth_on_33_sends_nothing_and_goes_straight_to_client_init() {
+        // 3.3 has no two-way negotiation at all: the server sends one word and the
+        // client answers nothing. Echoing the type here would be read as the shared flag
+        // and put every later message one byte out.
+        let mut inbound = version(VncVersion::RFB33);
+        inbound.extend_from_slice(&u32::from(SecurityType::None as u8).to_be_bytes());
+        let script = Script::new(inbound);
+
+        let _ = client(&script, VncVersion::RFB38, None).try_start().await;
+
+        let mut expected = version(VncVersion::RFB33);
+        expected.push(CLIENT_INIT);
+        assert_eq!(script.written(), expected);
+    }
+
+    #[tokio::test]
+    async fn no_auth_on_37_echoes_the_type_but_reads_no_result() {
+        // 3.7 added the client's choice but not the SecurityResult that follows it, so
+        // waiting for one would hang against a server that is behaving correctly.
+        let mut inbound = version(VncVersion::RFB37);
+        inbound.extend_from_slice(&[1, SecurityType::None as u8]);
+        let script = Script::new(inbound);
+
+        let _ = client(&script, VncVersion::RFB38, None).try_start().await;
+
+        let mut expected = version(VncVersion::RFB37);
+        expected.push(SecurityType::None as u8);
+        expected.push(CLIENT_INIT);
+        assert_eq!(script.written(), expected);
+    }
+
+    #[tokio::test]
+    async fn no_auth_on_38_echoes_the_type_and_consumes_the_security_result() {
+        // 3.8 sends a SecurityResult even when no authentication happened. Leaving those
+        // four bytes on the stream would make them the start of ServerInit.
+        let mut inbound = version(VncVersion::RFB38);
+        inbound.extend_from_slice(&[1, SecurityType::None as u8]);
+        inbound.extend_from_slice(&0u32.to_be_bytes());
+        let script = Script::new(inbound);
+
+        let _ = client(&script, VncVersion::RFB38, None).try_start().await;
+
+        let mut expected = version(VncVersion::RFB38);
+        expected.push(SecurityType::None as u8);
+        expected.push(CLIENT_INIT);
+        assert_eq!(script.written(), expected);
+        assert!(
+            script.unread().is_empty(),
+            "the SecurityResult was left on the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn vnc_auth_on_33_is_not_echoed_either() {
+        // The same asymmetry as no-auth, on the path that actually matters: a 3.3 server
+        // has already decided, so answering would desynchronise the stream. Stopping at
+        // the missing password keeps the assertion to the bytes under test.
+        let mut inbound = version(VncVersion::RFB33);
+        inbound.extend_from_slice(&u32::from(SecurityType::VncAuth as u8).to_be_bytes());
+        let script = Script::new(inbound);
+
+        let result = client(&script, VncVersion::RFB38, None)
+            .try_start()
+            .await
+            .map(|_| ());
+
+        assert!(matches!(result, Err(VncError::NoPassword)), "{result:?}");
+        assert_eq!(
+            script.written(),
+            version(VncVersion::RFB33),
+            "3.3 must not answer with a security type"
+        );
+    }
+
+    #[tokio::test]
+    async fn vnc_auth_on_38_is_echoed_before_the_password_is_needed() {
+        let mut inbound = version(VncVersion::RFB38);
+        inbound.extend_from_slice(&[1, SecurityType::VncAuth as u8]);
+        let script = Script::new(inbound);
+
+        let result = client(&script, VncVersion::RFB38, None)
+            .try_start()
+            .await
+            .map(|_| ());
+
+        assert!(matches!(result, Err(VncError::NoPassword)), "{result:?}");
+        let mut expected = version(VncVersion::RFB38);
+        expected.push(SecurityType::VncAuth as u8);
+        assert_eq!(script.written(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_server_offering_nothing_we_implement_says_so() {
+        // VeNCrypt-only servers exist and this client does not do TLS. The message has to
+        // name the problem, because "connection failed" sends the user looking at the
+        // network instead of at the server's configuration.
+        let mut inbound = version(VncVersion::RFB38);
+        inbound.extend_from_slice(&[2, SecurityType::VeNCrypt as u8, SecurityType::Tls as u8]);
+        let script = Script::new(inbound);
+
+        let result = client(&script, VncVersion::RFB38, Some("pw"))
+            .try_start()
+            .await
+            .map(|_| ());
+
+        match result {
+            Err(VncError::General(msg)) => {
+                assert!(
+                    msg.contains("Vnc Auth"),
+                    "should name what is missing: {msg}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------- the DES exchange
+
+    #[tokio::test]
+    async fn the_challenge_response_goes_out_before_the_result_is_read() {
+        // The full VNC auth exchange: type, then sixteen bytes of encrypted challenge,
+        // then the result. Sixteen is two DES blocks, one per half of the challenge.
+        let mut inbound = version(VncVersion::RFB38);
+        inbound.extend_from_slice(&[1, SecurityType::VncAuth as u8]);
+        inbound.extend_from_slice(&[0x5a; 16]); // challenge
+        inbound.extend_from_slice(&0u32.to_be_bytes()); // accepted
+        let script = Script::new(inbound);
+
+        let _ = client(&script, VncVersion::RFB38, Some("secret"))
+            .try_start()
+            .await;
+
+        let written = script.written();
+        assert_eq!(
+            written.len(),
+            12 + 1 + 16 + 1,
+            "expected version, type, response and client init: {written:?}"
+        );
+        let response = &written[13..29];
+        assert!(
+            response.iter().any(|&b| b != 0),
+            "the response should be the encrypted challenge, not zeros"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_password_on_38_reports_the_servers_reason() {
+        // 3.8 follows a failure with a length-prefixed explanation, and that string is
+        // the only thing that distinguishes a wrong password from a locked account.
+        let mut inbound = version(VncVersion::RFB38);
+        inbound.extend_from_slice(&[1, SecurityType::VncAuth as u8]);
+        inbound.extend_from_slice(&[0; 16]);
+        inbound.extend_from_slice(&1u32.to_be_bytes()); // failed
+        inbound.extend_from_slice(&18u32.to_be_bytes());
+        inbound.extend_from_slice(b"too many attempts");
+        let script = Script::new(inbound);
+
+        let result = client(&script, VncVersion::RFB38, Some("wrong"))
+            .try_start()
+            .await
+            .map(|_| ());
+
+        match result {
+            Err(VncError::General(msg)) => assert!(msg.contains("too many"), "got {msg:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_password_on_37_does_not_wait_for_a_reason() {
+        // 3.7 closes the connection after the failure without sending an explanation, so
+        // reading one would block until the server hung up rather than reporting the
+        // wrong password.
+        let mut inbound = version(VncVersion::RFB37);
+        inbound.extend_from_slice(&[1, SecurityType::VncAuth as u8]);
+        inbound.extend_from_slice(&[0; 16]);
+        inbound.extend_from_slice(&1u32.to_be_bytes()); // failed
+        // Bytes a 3.8 client would have read as a reason. They must be left alone.
+        inbound.extend_from_slice(b"NOT A REASON");
+        let script = Script::new(inbound);
+
+        let result = client(&script, VncVersion::RFB37, Some("wrong"))
+            .try_start()
+            .await
+            .map(|_| ());
+
+        assert!(matches!(result, Err(VncError::WrongPassword)), "{result:?}");
+        assert_eq!(
+            script.unread(),
+            b"NOT A REASON".to_vec(),
+            "3.7 should not read an explanation that was never sent"
+        );
+    }
+
+    // ------------------------------------------------------------------ builder
+
+    #[test]
+    fn a_client_with_no_encodings_is_refused() {
+        // Raw is mandatory, so an empty list is a programming error rather than
+        // something to negotiate.
+        let script = Script::default();
+        let result = VncConnector::<Script, Password>::new(script).build();
+
+        assert!(matches!(result, Err(VncError::NoEncoding)), "unexpected");
+    }
+}
