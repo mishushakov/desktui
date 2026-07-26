@@ -370,18 +370,12 @@ impl Menu {
             usize::from(area.height),
             PAPER_RGB,
         );
-        // The bar is deleted before it is placed, every frame, and the delete is not
-        // conditional on there being one. Re-sending the id is all a tile needs,
-        // because a tile is placed on the same cells every time -- but this one
-        // follows the pointer, and the placement it had a row up outlives the
-        // retransmit. Without the delete, every row the pointer touched keeps its
-        // stripe: only the rows that are not commands were ever clearing them,
-        // which is why it showed up between two items of one section and nowhere
-        // else. The backdrop needs no such thing, moving only on a resize, and a
-        // relayout drops every image before redrawing.
-        kitty::delete_image(out, kitty::MENU_HIGHLIGHT_IMAGE_ID);
-        if let Some(bar) = self.hover_bar(area) {
-            kitty::place_solid(
+        // The bar moves with the pointer, and every placement releases the one it
+        // replaces (see `term::kitty`), so a row the pointer has left keeps nothing.
+        // Only the case with no bar at all needs saying here: nothing is placed, so
+        // nothing releases the last one, and it would sit there until the menu closed.
+        match self.hover_bar(area) {
+            Some(bar) => kitty::place_solid(
                 out,
                 kitty::MENU_HIGHLIGHT_IMAGE_ID,
                 usize::from(bar.x) + 1,
@@ -389,7 +383,8 @@ impl Menu {
                 usize::from(bar.width),
                 usize::from(bar.height),
                 HOVER_RGB,
-            );
+            ),
+            None => kitty::delete_image(out, kitty::MENU_HIGHLIGHT_IMAGE_ID),
         }
 
         let mut buf = Buffer::empty(area);
@@ -887,7 +882,7 @@ mod tests {
         // backdrop's: a cell background would be buried, and a lower id would put
         // the bar under the very thing it has to be seen on.
         assert!(
-            text.contains(&format!("i={},s=2,v=2,c=", kitty::MENU_HIGHLIGHT_IMAGE_ID)),
+            bar_command(&text, "a=T").is_some(),
             "the highlight must be an image; a cell background is buried"
         );
         assert!(
@@ -909,15 +904,16 @@ mod tests {
             text.contains(&format!(",c={},r=1;", area.width)),
             "the bar must be one row tall and the width of the box"
         );
-        // The old bar goes before the new one is placed. Re-sending the id is not
-        // enough for a placement that moves: the row above would keep its stripe,
-        // which is the bug this guards.
+        // The placement releases the one it replaces, which is what stops the row the
+        // pointer came from keeping its stripe. `term::kitty` emits it and tests it;
+        // this only asks that the bar go through the path that does.
         assert!(
-            deletion(&text) < placement(&text),
-            "the bar must be deleted before it is placed again"
+            bar_command(&text, "a=d").is_some_and(|release| release < placement(&text)),
+            "the bar must release its last placement before making another"
         );
 
-        // Pointing at nothing takes it away and puts nothing back.
+        // Pointing at nothing takes it away and puts nothing back. Nothing is placed,
+        // so nothing releases the last placement either, and only this delete does.
         let mut out = Vec::new();
         menu.set_hover(Hit::Outside);
         menu.draw(&mut out, &m, ScaleMode::Fit);
@@ -928,28 +924,33 @@ mod tests {
             "a bar that is no longer wanted has to be deleted, not just left off"
         );
         assert!(
-            !text.contains(&format!("i={},s=2", kitty::MENU_HIGHLIGHT_IMAGE_ID)),
+            bar_command(&text, "a=T").is_none(),
             "nothing to highlight, so nothing to place"
         );
     }
 
-    /// Where the highlight bar is placed, and where the one before it is deleted.
-    /// Both commands name the same id, so the transmit keys tell them apart.
-    fn placement(text: &str) -> usize {
-        text.find(&format!("i={},s=2", kitty::MENU_HIGHLIGHT_IMAGE_ID))
-            .expect("the bar was never placed")
+    /// Where the graphics command that does `action` to the highlight bar starts.
+    ///
+    /// Matched on the keys rather than by substring, because the placement and the
+    /// release that precedes it both name the same image id, and the keys between
+    /// them are `term::kitty`'s business to order.
+    fn bar_command(text: &str, action: &str) -> Option<usize> {
+        text.match_indices("\x1b_G").find_map(|(at, _)| {
+            let keys = text[at..].split_once(';')?.0;
+            let names_the_bar = keys.contains(&format!("i={},", kitty::MENU_HIGHLIGHT_IMAGE_ID));
+            (keys.contains(action) && names_the_bar).then_some(at)
+        })
     }
 
-    fn deletion(text: &str) -> usize {
-        text.find(&format!("a=d,d=I,i={}", kitty::MENU_HIGHLIGHT_IMAGE_ID))
-            .expect("the bar was never deleted")
+    fn placement(text: &str) -> usize {
+        bar_command(text, "a=T").expect("the bar was never placed")
     }
 
     #[test]
     fn moving_the_highlight_leaves_no_stripe_behind() {
-        // Two entries of one section, which is where this went wrong: the pointer
-        // crosses no heading between them, so nothing but the delete below clears the
-        // row it came from.
+        // Three entries of one section, which is where this went wrong: the pointer
+        // crosses no heading between them, so nothing clears the row it came from
+        // except the release the new placement carries.
         let m = metrics(100, 40);
         let mut menu = Menu::new('a');
         let col = m.cols / 2;
@@ -962,14 +963,15 @@ mod tests {
             menu.draw(&mut out, &m, ScaleMode::Fit);
             let text = String::from_utf8(out).unwrap();
             assert!(
-                deletion(&text) < placement(&text),
-                "{label}: the bar has to be deleted before it is placed again"
+                bar_command(&text, "a=d").is_some_and(|release| release < placement(&text)),
+                "{label}: the last placement has to be released before the next is made"
             );
             // One bar per frame, on this row and no other.
             assert_eq!(
-                text.matches(&format!("i={},s=2", kitty::MENU_HIGHLIGHT_IMAGE_ID))
+                text.matches(&format!("i={},p=", kitty::MENU_HIGHLIGHT_IMAGE_ID))
                     .count(),
-                1
+                2,
+                "{label}: expected one release and one placement"
             );
             let cup = positions(&text.as_bytes()[..placement(&text)])
                 .pop()
