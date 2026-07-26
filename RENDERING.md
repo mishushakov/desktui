@@ -195,10 +195,11 @@ per motion event, where a placement is forty bytes.
 ## What to measure
 
 Tiles sent, moved and dropped per frame; bytes and system calls per frame; resample, pack
-and emit in milliseconds; and the one number still missing -- how long the *server* spent
-encoding. Without it, a slow session looks like a rendering problem, and the first thing
-to reach for is `--quality`, which decides how hard the server works and is invisible
-unless you read `--help`.
+and emit in milliseconds -- and, the half that is missing, what the *other* end is doing.
+Without it a slow session looks like a rendering problem whichever end is slow, and the
+first thing to reach for is `--quality`, which decides how hard the server works and is
+invisible unless you read `--help`. See
+[Server delivery in the statistics](#1-server-delivery-in-the-statistics).
 
 ## Where this stands
 
@@ -220,10 +221,98 @@ Built:
 
 ## Not built yet
 
-Four things, in the order worth doing. What each one *is* is above; what follows is what
-it costs to build and the parts that are not obvious from the design.
+Five things, ordered by what each is worth rather than by how tidy it would be. What each
+one *is* is above; what follows is what it costs to build and the parts that are not
+obvious from the design.
 
-### 1. The plane
+Two of them are felt immediately -- the cursor, and Fence -- and two are structural, worth
+building for the bugs they make impossible rather than for anything measurable. The one
+ordering constraint is that the cursor is easier before the plane, not after: it deletes two
+of the marking paths the plane would otherwise have to convert.
+
+### 1. Server delivery in the statistics
+
+Nothing on screen says which end is slow. The bar reports our frame rate, tiles, bytes and
+round trip -- all of it this side -- so a session that crawls because the server is
+re-encoding a whole screen losslessly looks exactly like a session that crawls because we
+are. That question cost most of a working session once already, and the answer was
+`--quality`.
+
+No protocol work is needed, because the update boundary is already known: `mid_update` in
+`src/session.rs` opens on the first rectangle of an update and closes at `FrameEnd`. Three
+numbers fall out of it.
+
+- **Updates per second**, counted at `FrameEnd`. With frames being pushed this *is* the
+  server's frame rate, and next to our own it says immediately who is behind: six updates
+  arriving while we could draw sixty is not a rendering problem.
+- **Delivery time**, from an update's first rectangle to its `FrameEnd`. How long the server
+  took to get one picture out, encoding and wire together.
+- **Bytes per update**, which turns the two above into a rate and separates "a big screen"
+  from "a slow server".
+
+The one thing genuinely not separable without more work is encode time from wire time. The
+round trip already conflates them -- in a request-paced session `rtt` is measured from the
+request to `FrameEnd`, so it contains the server's encoding. Splitting them wants a fence
+sent behind the update request, whose reply says the server reached that point in its
+stream; the gap to `FrameEnd` is then encoding and transmission alone. Worth doing after
+[Fence as flow control](#3-fence-as-flow-control), which has to solve the same
+probe-versus-flow-control problem anyway.
+
+Smallest of the five, and the one that tells you whether the others are worth building.
+
+### 2. The cursor as a placement
+
+Replaces `blend_cursor`, `cursor_rect` and the cursor's dirty-marking in
+`src/render/mod.rs` with one image whose id is above every tile's, placed with sub-cell
+`X`/`Y` offsets and moved with `a=p`.
+
+**Answer this first.** The protocol says semi-transparent placements that overlap are
+blended, and that at equal `z` the higher id is on top. Whether Ghostty actually blends an
+RGBA (`f=32`) placement over another placement -- rather than compositing it against the
+cell background, or drawing it opaque -- is not something the docs settle, and getting it
+wrong means a black rectangle over the pointer. Test it with a two-line script against
+Ghostty and kitty before writing any of the rest.
+
+If it holds, the rest is small. `X`/`Y` must be smaller than the cell, so the placement
+cell is `hotspot / cell_size` and the offset is the remainder.
+
+What it is worth: moving the pointer marks the tile it left and the tile it arrived at, and
+a cursor straddling a boundary touches four. So a frame while the mouse is moving
+retransmits two to four tiles, at fifty-odd kilobytes packed each, up to sixty times a
+second -- **six to twelve megabytes a second of shared memory traffic, and hundreds of
+system calls, for moving a pointer over a picture that has not changed**. As a placement it
+is one release and one `a=p`: about forty bytes. It also takes the cursor out of the tile
+hot path, where `blend_cursor` currently runs over every tile it touches on every frame.
+
+It also fixes a wart nobody has reported: `cursor_at` is in destination pixels, and a
+resize changes what a given screen position maps to, but nothing re-derives it -- so after
+a resize the pointer is drawn at a stale spot until it next moves. A placement is
+re-placed from the new map as a matter of course.
+
+### 3. Fence as flow control
+
+`--no-push` declines continuous updates wholesale, at a round trip per frame. Fence exists
+to bound in-flight work without giving that up: the server answers one when it reaches that
+point in its stream, so a client can hold a frame's worth of credit and let the server run
+exactly as far ahead as it can draw.
+
+This is the principled version of a problem already met and worked around. `--quality`
+reduces how expensive a frame is to *encode*; this bounds how many the server *attempts*.
+Today the choice is binary -- pushed frames with no back-pressure at all, or `--no-push` at
+a round trip each, which the README puts at the difference between twenty frames a second
+and forty on a 25 ms link. With credit, a server that can only encode ten full screens a
+second is asked for ten, instead of encoding flat out while this end decodes frames it will
+never have time to draw.
+
+Needs a real server to tune against, and one trap: fences are already used for the latency
+probe, marked by `RTT_PROBE_MARKER` in `src/remote/vnc.rs`. A flow-control fence has to be
+distinguishable from a probe, or the round-trip figure becomes a measurement of the frame
+queue.
+
+`--no-push` stays regardless -- it is the fallback for a server without Fence, and the
+thing to reach for when the question is "is the server the problem?".
+
+### 4. The plane
 
 Replaces three mechanisms with the one [Plane](#plane) describes: `dirty: Vec<bool>`,
 `placed: (u16, u16)` and `Layout::maps_alike`, all in `src/render/mod.rs`.
@@ -242,51 +331,32 @@ computing keys. So the plane keeps its out-of-date count the way the dirty bitma
 today, maintained where the marks happen rather than recomputed: `mark`, `mark_dst`,
 `mark_cells`, `mark_all`, `move_cursor`, `set_cursor`, `relayout`. Those are the paths to
 change, and they are the same paths that carry today's bitmap -- the change is what a mark
-*writes*, not where marks come from.
+*writes*, not where marks come from. Two of them go away entirely if the cursor becomes a
+placement first, which is one reason to do that one before this one.
 
 The padding in `Layout::src_to_dst` stays as it is: it answers which tiles a source pixel
 can reach, which is still the question a damage rectangle asks.
 
-Two behaviours change, both improvements:
+One behaviour changes, and it is the point of the exercise: the density invariant becomes
+structural. `placed` as a rectangle is only correct because frames arrive whole -- a per-tile
+key cannot be wrong that way, so "a frame dropped mid-resize leaves a hole" stops being
+something to reason about and becomes something that cannot happen.
 
-- A scaled resize can keep tiles. `maps_alike` refuses all scaling because it compares
-  layouts and cannot tell a tile whose pixels survived from one whose did not; comparing
-  keys can, so a `fit` resize keeps whatever genuinely did not move.
-- The density invariant becomes structural. `placed` as a rectangle is only correct because
-  frames arrive whole; a per-tile key cannot be wrong that way, and a frame that half
-  arrived cannot leave a tile counted as held.
+What it does *not* buy, despite an earlier claim here: tile reuse across a scaled resize.
+Comparing keys rather than layouts would allow it in principle, but a resize in `fit` changes
+the scale, which changes every tile's destination size, which changes every key. The case
+where a scaled tile's source *and* size both survive is real but rare -- a mode switch that
+happens to land on the same geometry -- and not a reason to do this.
 
 Verification is the existing suite, which is why this is worth doing carefully rather than
 quickly: `growing_the_window_sends_the_new_tiles_and_not_the_rest`,
 `moving_the_picture_costs_placements_and_not_pixels`,
 `a_frame_that_never_reached_the_terminal_leaves_its_tiles_owing` and
 `a_grid_that_only_grows_keeps_the_tiles_that_did_not_move` are the four that would catch a
-mistake. Add one for the case that only the plane can do: a scaled resize where a tile's
-source and size survive is kept.
+mistake. Add one for the invariant itself: a frame composed and dropped, then a resize,
+must not leave a tile counted as held.
 
-### 2. The cursor as a placement
-
-Replaces `blend_cursor`, `cursor_rect` and the cursor's dirty-marking in
-`src/render/mod.rs` with one image whose id is above every tile's, placed with sub-cell
-`X`/`Y` offsets and moved with `a=p`.
-
-**Answer this first.** The protocol says semi-transparent placements that overlap are
-blended, and that at equal `z` the higher id is on top. Whether Ghostty actually blends an
-RGBA (`f=32`) placement over another placement -- rather than compositing it against the
-cell background, or drawing it opaque -- is not something the docs settle, and getting it
-wrong means a black rectangle over the pointer. Test it with a two-line script against
-Ghostty and kitty before writing any of the rest.
-
-If it holds, the rest is small. `X`/`Y` must be smaller than the cell, so the placement
-cell is `hotspot / cell_size` and the offset is the remainder. Motion becomes one release
-plus one `a=p`, about forty bytes, against two tile retransmissions today.
-
-It also fixes a wart nobody has reported: `cursor_at` is in destination pixels, and a
-resize changes what a given screen position maps to, but nothing re-derives it -- so after
-a resize the pointer is drawn at a stale spot until it next moves. A placement is
-re-placed from the new map as a matter of course.
-
-### 3. The chrome as one diffed plane
+### 5. The chrome as one diffed plane
 
 Replaces `Toast::drawn`/`stale`/`moved`, `Session::clear_menu`, `status::clear` and
 `Menu::clear` with a private cell buffer, double buffered and diffed per frame.
@@ -304,21 +374,6 @@ order the emit does it in, rather than because three call sites each remember to
 
 The overlay backdrops stay as images. A cell background cannot serve -- it is painted below
 the picture, so a colour set there is never seen.
-
-### 4. Fence as flow control
-
-`--no-push` declines continuous updates wholesale, at a round trip per frame. Fence exists
-to bound in-flight work without giving that up: the server answers one when it reaches that
-point in its stream, so a client can hold a frame's worth of credit and let the server run
-exactly as far ahead as it can draw.
-
-Needs a real server to tune against, and one trap: fences are already used for the latency
-probe, marked by `RTT_PROBE_MARKER` in `src/remote/vnc.rs`. A flow-control fence has to be
-distinguishable from a probe, or the round-trip figure becomes a measurement of the frame
-queue.
-
-`--no-push` stays regardless -- it is the fallback for a server without Fence, and the
-thing to reach for when the question is "is the server the problem?".
 
 ### The `O=` finding
 
